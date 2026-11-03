@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f0d">
+<title>Pushup RPG</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700;800&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ===== camp (home) ===== -->
+<section id="camp" class="screen">
+  <div class="wrap">
+    <header class="hero panel">
+      <div class="lvl"><span class="label">Level</span><span id="campLevel">1</span></div>
+      <div class="who">
+        <p class="eyebrow">Pushup RPG</p>
+        <h1 id="campTitle">Wanderer</h1>
+        <div class="xpbar"><div id="campXpFill"></div></div>
+        <p class="fine" id="campXpText"></p>
+      </div>
+    </header>
+    <p id="campStatus" class="status panel"></p>
+    <nav class="menu">
+      <button type="button" data-action="goto" data-to="map"><b>World map</b><span>Fight monsters one at a time</span></button>
+      <button type="button" data-action="goto" data-to="dungeon"><b>The Old Mine</b><span>Rooms in a row. Reach the safe room.</span></button>
+      <button type="button" data-action="goto" data-to="records"><b>Records</b><span>Your stats, monsters and last fights</span></button>
+      <button type="button" data-action="goto" data-to="settings"><b>Settings</b><span>Strictness, camera, sound</span></button>
+    </nav>
+    <div class="tiles" id="campTiles"></div>
+    <p class="fine" id="syncStatus">Checking where your progress is saved…</p>
+  </div>
+</section>
+
+<!-- ===== world map ===== -->
+<section id="map" class="screen" hidden>
+  <div class="wrap">
+    <div class="topbar"><button class="back" type="button" data-action="goto" data-to="camp">← Camp</button><h1>World map</h1></div>
+    <p id="mapNote" class="status panel"></p>
+    <div id="mapSpecial" class="specials"></div>
+    <div id="mapZones" class="wrap"></div>
+  </div>
+</section>
+
+<!-- ===== dungeon ===== -->
+<section id="dungeon" class="screen" hidden>
+  <div class="wrap">
+    <div class="topbar"><button class="back" type="button" data-action="goto" data-to="camp">← Camp</button><h1>The Old Mine</h1></div>
+    <p id="dgStatus" class="status panel"></p>
+    <div id="dgFloor" class="card-block panel"></div>
+    <div class="card-block panel">
+      <h2>How the mine works</h2>
+      <ul class="rules" id="dgRules"></ul>
+    </div>
+    <div class="card-block panel">
+      <h2>Floors</h2>
+      <div class="ladder" id="dgLadder"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== records ===== -->
+<section id="records" class="screen" hidden>
+  <div class="wrap">
+    <div class="topbar"><button class="back" type="button" data-action="goto" data-to="camp">← Camp</button><h1>Records</h1></div>
+    <div class="tiles" id="recTiles"></div>
+    <div class="card-block panel">
+      <h2>Monsters</h2>
+      <div class="table-wrap"><table id="recBeasts"></table></div>
+    </div>
+    <div class="card-block panel">
+      <h2>Last fights</h2>
+      <ul class="history" id="recHistory"></ul>
+    </div>
+  </div>
+</section>
+
+<!-- ===== settings ===== -->
+<section id="settings" class="screen" hidden>
+  <div class="wrap">
+    <div class="topbar"><button class="back" type="button" data-action="goto" data-to="camp">← Camp</button><h1>Settings</h1></div>
+    <div class="card-block panel">
+      <h2>Strictness</h2>
+      <div class="field">
+        <label for="sDepth">Bottom: elbow angle at most <output id="oDepth" for="sDepth"></output></label>
+        <input type="range" id="sDepth" min="40" max="120" step="1">
+        <p class="fine">Lower number = you must go deeper.</p>
+      </div>
+      <div class="field">
+        <label for="sTop">Top: elbow angle at least <output id="oTop" for="sTop"></output></label>
+        <input type="range" id="sTop" min="140" max="178" step="1">
+        <p class="fine">Higher number = arms must be straighter.</p>
+      </div>
+      <div class="field">
+        <label for="sBend">Body line: bend allowed <output id="oBend" for="sBend"></output></label>
+        <input type="range" id="sBend" min="8" max="40" step="1">
+        <p class="fine">Lower number = stricter about sagging hips or butt up.</p>
+      </div>
+      <div class="field">
+        <label for="sKnee">Legs: knee angle at least <output id="oKnee" for="sKnee"></output></label>
+        <input type="range" id="sKnee" min="120" max="175" step="1">
+        <p class="fine">Higher number = legs must be straighter.</p>
+      </div>
+      <div class="row"><button type="button" id="btnDefaults">Back to tested defaults</button></div>
+    </div>
+    <div class="card-block panel">
+      <h2>Camera and sound</h2>
+      <div class="field">
+        <label for="sCamera">Camera</label>
+        <select id="sCamera"><option value="user">Front camera</option><option value="environment">Back camera</option></select>
+      </div>
+      <div class="field">
+        <label for="sModel">Body tracking</label>
+        <select id="sModel"><option value="full">Accurate</option><option value="lite">Fast (for slow phones)</option></select>
+      </div>
+      <label class="check" for="sVoice"><input type="checkbox" id="sVoice"> Say the count out loud</label>
+    </div>
+    <div class="card-block panel">
+      <h2>Backup</h2>
+      <p class="fine">Copy a backup code and keep it somewhere safe, for example in a note on your phone. Paste it here to get your progress back on any link or phone.</p>
+      <div class="row"><button type="button" id="btnBackup" class="primary">Copy backup code</button></div>
+      <textarea id="backupText" readonly hidden aria-label="Your backup code"></textarea>
+      <div class="field">
+        <label for="restoreText">Restore from a backup code</label>
+        <textarea id="restoreText" placeholder="Paste a backup code here"></textarea>
+      </div>
+      <div class="row"><button type="button" id="btnRestore">Restore</button></div>
+      <p class="fine" id="backupMsg" role="status"></p>
+    </div>
+    <div class="card-block panel">
+      <h2>Progress</h2>
+      <p class="fine">Start again from level 1. Your settings stay. This cannot be undone.</p>
+      <div class="row"><button type="button" id="btnWipe" class="danger-btn">Reset all progress</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== fight ===== -->
+<section id="fight" hidden>
+  <div id="stage">
+    <div id="frame">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+  </div>
+  <header class="hud-top">
+    <div class="count-box panel"><span class="label">Hits</span><span id="fHits">0</span></div>
+    <div class="monster panel" id="fMonster">
+      <p class="fine" id="fWhere"></p>
+      <div class="m-row"><span id="fName"></span><span id="fHp"></span></div>
+      <div class="hpbar"><div id="fHpFill"></div></div>
+      <div class="threat" id="threat" hidden><div class="threat-bar"><div id="threatFill"></div></div><span id="threatText"></span></div>
+    </div>
+  </header>
+  <div id="banner" class="panel"></div>
+  <div id="restPanel" hidden>
+    <div class="card">
+      <p class="eyebrow" id="restTitle">Room cleared</p>
+      <p id="restTime">1:30</p>
+      <p id="restNext"></p>
+      <div class="row center">
+        <button type="button" id="btnFightNow" class="primary">Fight now</button>
+        <button type="button" id="btnQuitRun">Leave the mine</button>
+      </div>
+      <p class="fine" id="restWarn"></p>
+    </div>
+  </div>
+  <footer class="hud-bottom">
+    <div id="debug" class="panel">Starting camera…</div>
+    <div class="controls">
+      <button type="button" id="btnFlee">Run away</button>
+      <button type="button" id="btnSound" aria-pressed="true">Sound on</button>
+      <button type="button" id="dbgRep" hidden>Fake rep</button>
+      <button type="button" id="dbgNoRep" hidden>Fake no-rep</button>
+    </div>
+  </footer>
+</section>
+
+<div id="modal" class="sheet" hidden><div class="card" id="modalCard" role="dialog" aria-modal="true"></div></div>
+
+<script type="module" src="game.js"></script>
+</body>
+</html>

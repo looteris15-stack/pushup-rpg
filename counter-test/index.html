@@ -1,0 +1,929 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0f0d">
+<title>Pushup Counter Test</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700;800&display=swap">
+<style>
+/* Layout: full-screen camera view, game HUD on top (reps + monster), status banner above the controls. */
+:root {
+  --bg: #0b0f0d;
+  --panel: rgba(11, 15, 13, 0.76);
+  --panel-solid: #141a17;
+  --fg: #eef3ec;
+  --muted: #a3b2a7;
+  --line: rgba(238, 243, 236, 0.16);
+  --torch: #f0a83c;
+  --torch-ink: #1d1406;
+  --good: #6fe08a;
+  --bad: #ff6a57;
+  --warn: #f5c451;
+  --hp: #d9443a;
+  --display: "Oxanium", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
+  --body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.45 var(--body);
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+[hidden] { display: none !important; }
+
+/* camera + skeleton */
+#stage { position: fixed; inset: 0; display: grid; place-items: center; background: #000; }
+#frame {
+  position: relative;
+  aspect-ratio: var(--ar, 16 / 9);
+  width: min(100vw, calc(100vh * var(--ar-num, 1.7778)));
+  width: min(100vw, calc(100dvh * var(--ar-num, 1.7778)));
+}
+#frame.mirror { transform: scaleX(-1); }
+#video, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+#video { object-fit: fill; }
+
+/* HUD */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+.hud-top {
+  position: fixed; top: 0; left: 0; right: 0;
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
+  padding-top: calc(env(safe-area-inset-top, 0px) + 10px);
+  padding-left: max(14px, env(safe-area-inset-left, 0px));
+  padding-right: max(14px, env(safe-area-inset-right, 0px));
+  pointer-events: none;
+}
+.label {
+  display: block;
+  font: 600 11px/1 var(--display);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.count-box { padding: 8px 18px 10px; text-align: center; min-width: 100px; }
+#count {
+  display: block;
+  font: 800 clamp(44px, 13vmin, 112px)/1 var(--display);
+  font-variant-numeric: tabular-nums;
+}
+#xp { display: block; margin-top: 4px; font: 600 12px/1 var(--display); color: var(--torch); letter-spacing: 0.06em; }
+.monster { width: min(46vw, 320px); padding: 10px 12px 12px; }
+.m-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+#mName { font: 700 clamp(14px, 3.6vmin, 20px)/1.1 var(--display); min-width: 0; }
+#mHp { font: 600 13px/1 var(--display); color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.hpbar { margin-top: 8px; height: 12px; border-radius: 6px; background: rgba(238, 243, 236, 0.1); overflow: hidden; }
+#hpFill { height: 100%; width: 100%; background: var(--hp); transition: width 0.25s ease-out; }
+.monster.dead #hpFill { background: var(--muted); }
+
+#banner {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 100px);
+  width: max-content; max-width: calc(100vw - 28px);
+  padding: 10px 18px;
+  text-align: center;
+  font: 700 clamp(17px, 4.6vmin, 34px)/1.15 var(--display);
+  text-wrap: balance;
+  pointer-events: none;
+}
+#banner.good { color: var(--good); }
+#banner.bad { color: var(--bad); }
+#banner.warn { color: var(--warn); }
+
+.hud-bottom {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px;
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 10px);
+  padding-left: max(14px, env(safe-area-inset-left, 0px));
+  padding-right: max(14px, env(safe-area-inset-right, 0px));
+}
+#debug { font: 12px/1.3 var(--mono); color: var(--muted); padding: 7px 10px; min-width: 0; font-variant-numeric: tabular-nums; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; }
+
+button, .btn {
+  font: 600 14px/1 var(--body);
+  color: var(--fg);
+  background: rgba(20, 26, 23, 0.88);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 11px 15px;
+  min-height: 42px;
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+button:hover, .btn:hover { border-color: rgba(238, 243, 236, 0.4); }
+button:focus-visible, .btn:focus-within { outline: 2px solid var(--torch); outline-offset: 2px; }
+.primary { background: var(--torch); color: var(--torch-ink); border-color: transparent; }
+.primary:hover { border-color: transparent; filter: brightness(1.08); }
+.btn input { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+
+/* sheets (start, settings, log) */
+.sheet {
+  position: fixed; inset: 0; z-index: 20;
+  overflow-y: auto;
+  background: rgba(6, 9, 8, 0.9);
+  display: flex; justify-content: center; align-items: flex-start;
+  padding-top: calc(env(safe-area-inset-top, 0px) + 20px);
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 20px);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.card {
+  width: 100%; max-width: 640px;
+  background: var(--panel-solid);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 22px 22px 20px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+h1 { font: 800 clamp(26px, 5vw, 36px)/1.05 var(--display); margin: 0; text-wrap: balance; }
+h2 { font: 700 15px/1.2 var(--display); margin: 0 0 8px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--torch); }
+p { margin: 0; }
+.lead { color: var(--muted); max-width: 60ch; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; }
+ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.fine { font-size: 13px; color: var(--muted); }
+.diagram { width: 100%; max-width: 360px; height: auto; display: block; }
+.d-mat { fill: rgba(238, 243, 236, 0.05); stroke: var(--line); }
+.d-body { fill: var(--muted); }
+.d-view { fill: rgba(240, 168, 60, 0.16); }
+.d-phone { fill: var(--torch); }
+.d-text { fill: var(--muted); font: 12px var(--body); }
+.field { display: flex; flex-direction: column; gap: 6px; }
+.field label { font-weight: 600; }
+select {
+  font: 15px var(--body); color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; max-width: 100%;
+}
+#loadStatus { font: 13px/1.4 var(--mono); color: var(--muted); }
+#loadStatus.ok { color: var(--good); }
+#loadStatus.err { color: var(--bad); }
+#lastResult { color: var(--torch); font-weight: 600; }
+input[type="range"] { width: 100%; accent-color: var(--torch); }
+output { color: var(--torch); font-family: var(--display); font-weight: 700; font-variant-numeric: tabular-nums; }
+.check { display: flex; gap: 10px; align-items: center; font-weight: 600; }
+.check input { width: 20px; height: 20px; accent-color: var(--torch); }
+#logList { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+#logList li { padding: 8px 10px; border-radius: 8px; background: rgba(238, 243, 236, 0.04); }
+#logList .ok b { color: var(--good); }
+#logList .no b { color: var(--bad); }
+#logText { width: 100%; min-height: 160px; font: 12px/1.4 var(--mono); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+
+@keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.18); } 100% { transform: scale(1); } }
+@keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-6px); } 50% { transform: translateX(5px); } 75% { transform: translateX(-3px); } }
+#count.bump { animation: bump 0.35s ease-out; }
+.monster.hit { animation: shake 0.3s; }
+@media (prefers-reduced-motion: reduce) {
+  #count.bump, .monster.hit { animation: none; }
+  #hpFill { transition: none; }
+}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div id="frame">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+</div>
+
+<div id="hud" hidden>
+  <header class="hud-top">
+    <div class="count-box panel">
+      <span class="label">Reps</span>
+      <span id="count">0</span>
+      <span id="xp">XP 0</span>
+    </div>
+    <div class="monster panel" id="monster">
+      <div class="m-row"><span id="mName">Cave Rat</span><span id="mHp">5 / 5 HP</span></div>
+      <div class="hpbar"><div id="hpFill"></div></div>
+    </div>
+  </header>
+
+  <div id="banner" class="panel">Get into plank, arms straight</div>
+
+  <footer class="hud-bottom">
+    <div id="debug" class="panel">elbow – · body – · knee –</div>
+    <div class="controls">
+      <button id="btnReset" type="button">Reset</button>
+      <button id="btnLog" type="button">Log</button>
+      <button id="btnSettings" type="button">Settings</button>
+      <button id="btnSound" type="button" aria-pressed="true">Sound on</button>
+      <button id="btnStop" type="button">Stop</button>
+    </div>
+  </footer>
+</div>
+
+<section id="start" class="sheet" aria-labelledby="startTitle">
+  <div class="card">
+    <div>
+      <h1 id="startTitle">Pushup Counter Test</h1>
+      <p class="lead">Step 1 of your pushup RPG. Do some pushups and check that only strict reps are counted.</p>
+    </div>
+
+    <div class="cols">
+      <div>
+        <h2>Set up the phone</h2>
+        <ul>
+          <li>Phone on the floor, 1.5–2.5 m to your side, turned sideways.</li>
+          <li>Your whole body, head to feet, in the picture.</li>
+          <li>Good light. A plain background helps.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>A rep counts when</h2>
+        <ul>
+          <li>Arms are straight at the top</li>
+          <li>Elbows bend to 60° or less at the bottom</li>
+          <li>Body stays in a straight line</li>
+          <li>Knees stay off the floor</li>
+        </ul>
+      </div>
+    </div>
+
+    <svg class="diagram" viewBox="0 0 320 132" role="img" aria-label="Seen from above: you in plank on the floor, the phone 1.5 to 2.5 metres to your side, turned sideways and pointing at you.">
+      <rect class="d-mat" x="28" y="12" width="236" height="48" rx="8"/>
+      <polygon class="d-view" points="150,102 34,64 266,64"/>
+      <circle class="d-body" cx="56" cy="36" r="10"/>
+      <rect class="d-body" x="68" y="28" width="164" height="16" rx="8"/>
+      <circle class="d-body" cx="86" cy="20" r="4"/>
+      <circle class="d-body" cx="86" cy="52" r="4"/>
+      <rect class="d-phone" x="130" y="102" width="40" height="20" rx="4"/>
+      <text class="d-text" x="178" y="117">phone, sideways</text>
+      <text class="d-text" x="214" y="90">1.5–2.5 m</text>
+    </svg>
+
+    <p class="fine">You hear a click when you are low enough, a hit for each rep, and a buzz with the reason when a rep does not count.</p>
+
+    <div class="field">
+      <label for="model">Body tracking</label>
+      <select id="model">
+        <option value="full">Accurate (try this first)</option>
+        <option value="lite">Fast (for slow phones)</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <button id="btnFront" class="primary" type="button">Start with front camera</button>
+      <button id="btnBack" type="button">Back camera</button>
+      <label class="btn" for="fileInput">Test a recorded video<input id="fileInput" type="file" accept="video/*"></label>
+    </div>
+
+    <p id="loadStatus" role="status">Loading body tracking…</p>
+    <p id="lastResult" hidden></p>
+    <p class="fine">The video stays on your phone. Nothing is uploaded or saved.</p>
+  </div>
+</section>
+
+<section id="settings" class="sheet" hidden aria-labelledby="settingsTitle">
+  <div class="card">
+    <h1 id="settingsTitle">Strictness</h1>
+    <div class="field">
+      <label for="sDepth">Bottom: elbow angle at most <output id="oDepth" for="sDepth"></output></label>
+      <input type="range" id="sDepth" min="40" max="120" step="1">
+      <p class="fine">Lower number = you must go deeper.</p>
+    </div>
+    <div class="field">
+      <label for="sTop">Top: elbow angle at least <output id="oTop" for="sTop"></output></label>
+      <input type="range" id="sTop" min="140" max="178" step="1">
+      <p class="fine">Higher number = arms must be straighter.</p>
+    </div>
+    <div class="field">
+      <label for="sBend">Body line: bend allowed <output id="oBend" for="sBend"></output></label>
+      <input type="range" id="sBend" min="8" max="40" step="1">
+      <p class="fine">Lower number = stricter about sagging hips or butt up.</p>
+    </div>
+    <div class="field">
+      <label for="sKnee">Legs: knee angle at least <output id="oKnee" for="sKnee"></output></label>
+      <input type="range" id="sKnee" min="120" max="175" step="1">
+      <p class="fine">Higher number = legs must be straighter.</p>
+    </div>
+    <label class="check" for="sVoice"><input type="checkbox" id="sVoice"> Say the count out loud</label>
+    <div class="row">
+      <button id="btnDefaults" type="button">Back to defaults</button>
+      <button id="btnSettingsDone" class="primary" type="button">Done</button>
+    </div>
+  </div>
+</section>
+
+<section id="logSheet" class="sheet" hidden aria-labelledby="logTitle">
+  <div class="card">
+    <h1 id="logTitle">Rep log</h1>
+    <p class="fine">Newest first. Copy it and paste it to Claude if the counting feels wrong.</p>
+    <ol id="logList"></ol>
+    <textarea id="logText" readonly hidden aria-label="Log text"></textarea>
+    <div class="row">
+      <button id="btnCopy" class="primary" type="button">Copy log</button>
+      <button id="btnLogDone" type="button">Close</button>
+    </div>
+  </div>
+</section>
+
+<script type="module">
+const LIB = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODELS = {
+  full: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+  lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+};
+const DEFAULTS = { depth: 60, top: 160, bend: 20, knee: 140, voice: true };
+// bump the key when defaults change, so old saved sliders don't hide the new defaults
+const SETTINGS_KEY = "pushupTest.settings.v2";
+const MONSTERS = [
+  { name: "Cave Rat", hp: 5 },
+  { name: "Forest Goblin", hp: 10 },
+  { name: "Grey Wolf", hp: 15 },
+  { name: "Bog Troll", hp: 20 },
+];
+
+// MediaPipe pose landmark indexes for each body side
+const IDX = {
+  L: { sh: 11, el: 13, wr: 15, hip: 23, kn: 25, an: 27 },
+  R: { sh: 12, el: 14, wr: 16, hip: 24, kn: 26, an: 28 },
+};
+const CONN = [[11,12],[11,23],[12,24],[23,24],[11,13],[13,15],[12,14],[14,16],[23,25],[25,27],[24,26],[26,28],[27,31],[28,32]];
+
+// ---------- pose math (pure) ----------
+
+function angleAt(a, b, c) {
+  const v1x = a.x - b.x, v1y = a.y - b.y, v2x = c.x - b.x, v2y = c.y - b.y;
+  const d = Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y);
+  if (!d) return 180;
+  return Math.acos(Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / d))) * 180 / Math.PI;
+}
+
+// lm: normalized landmarks, w/h: video size in pixels (angles must be measured in pixels)
+function analyzePose(lm, w, h, prevSide) {
+  const vis = l => l.visibility ?? 1;
+  const sideVis = s => { const i = IDX[s]; return (vis(lm[i.sh]) + vis(lm[i.el]) + vis(lm[i.wr]) + vis(lm[i.hip]) + vis(lm[i.kn]) + vis(lm[i.an])) / 6; };
+  const vL = sideVis("L"), vR = sideVis("R");
+  // use the side facing the camera; only switch when the other side is clearly better
+  let side = prevSide || (vL >= vR ? "L" : "R");
+  if (side === "L" && vR > vL + 0.15) side = "R";
+  else if (side === "R" && vL > vR + 0.15) side = "L";
+  const i = IDX[side];
+  const P = k => ({ x: lm[i[k]].x * w, y: lm[i[k]].y * h });
+  const sh = P("sh"), el = P("el"), wr = P("wr"), hip = P("hip"), kn = P("kn"), an = P("an");
+
+  const elbow = angleAt(sh, el, wr);
+  const bodyBend = 180 - angleAt(sh, hip, an);
+  // is the hip below (sag) or above (pike) the shoulder–ankle line? image y grows downward
+  const t = an.x === sh.x ? 0.5 : (hip.x - sh.x) / (an.x - sh.x);
+  const bendDir = hip.y > sh.y + (an.y - sh.y) * t ? "sag" : "pike";
+  const knee = angleAt(hip, kn, an);
+  const tilt = Math.abs(Math.atan2(an.y - sh.y, an.x - sh.x) * 180 / Math.PI);
+  const fromHorizontal = Math.min(tilt, 180 - tilt);
+  return {
+    side, elbow, bodyBend, bendDir, knee, fromHorizontal,
+    horizontal: fromHorizontal < 40,
+    visible: (side === "L" ? vL : vR) >= 0.5,
+  };
+}
+
+// Rep = arms locked out -> elbows at depth -> locked out again, with body and legs straight the whole way.
+function createRepCounter(getCfg) {
+  let state = "idle", cycle = null, count = 0, lostSince = 0;
+  const summary = (c, t) => ({
+    minElbow: Math.round(c.minElbow), maxBend: Math.round(c.maxBend), bendDir: c.bendDir,
+    minKnee: Math.round(c.minKnee), secs: +((t - c.t0) / 1000).toFixed(1),
+  });
+
+  function update(m, t) {
+    const cfg = getCfg();
+    const ev = [];
+    const setState = s => { state = s; ev.push({ type: "state", state: s }); };
+
+    if (!m || !m.visible) {
+      if (!lostSince) lostSince = t;
+      if (t - lostSince > 800 && state !== "lost") {
+        if (cycle && cycle.depth) ev.push({ type: "norep", reasons: ["Lost sight of you"], ...summary(cycle, t) });
+        cycle = null;
+        setState("lost");
+      }
+      return ev;
+    }
+    lostSince = 0;
+    if (state === "lost") setState("idle");
+
+    if (state === "idle") {
+      if (m.horizontal && m.knee >= cfg.knee && m.elbow >= cfg.top) setState("up");
+    } else if (state === "up") {
+      if (!m.horizontal) setState("idle");
+      else if (m.elbow < cfg.top - 15) {
+        cycle = { t0: t, minElbow: m.elbow, maxBend: m.bodyBend, bendDir: m.bendDir, minKnee: m.knee, depth: false };
+        setState("down");
+      }
+    } else if (state === "down") {
+      const c = cycle;
+      c.minElbow = Math.min(c.minElbow, m.elbow);
+      if (m.bodyBend > c.maxBend) { c.maxBend = m.bodyBend; c.bendDir = m.bendDir; }
+      c.minKnee = Math.min(c.minKnee, m.knee);
+      if (!c.depth && m.elbow <= cfg.depth) { c.depth = true; ev.push({ type: "depth" }); }
+
+      if (!m.horizontal) {
+        if (c.depth) ev.push({ type: "norep", reasons: ["Left plank position"], ...summary(c, t) });
+        cycle = null;
+        setState("idle");
+      } else if (m.elbow >= cfg.top) {
+        const reasons = [];
+        if (!c.depth) reasons.push("Go lower");
+        if (c.maxBend > cfg.bend) reasons.push(c.bendDir === "sag" ? "Hips sagging" : "Hips too high");
+        if (c.minKnee < cfg.knee) reasons.push("Keep legs straight");
+        const s = summary(c, t);
+        if (!c.depth && c.minElbow > cfg.top - 30) {
+          // small wobble at the top, not a rep attempt
+        } else if (reasons.length === 0) {
+          count++;
+          ev.push({ type: "rep", count, ...s });
+        } else {
+          ev.push({ type: "norep", reasons, ...s });
+        }
+        cycle = null;
+        setState("up");
+      }
+    }
+    return ev;
+  }
+
+  return {
+    update,
+    reset() { state = "idle"; cycle = null; count = 0; lostSince = 0; },
+    get count() { return count; },
+    get state() { return state; },
+    get cycle() { return cycle; },
+  };
+}
+
+// ---------- page ----------
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d"), frame = $("frame");
+const hud = $("hud"), banner = $("banner"), debugEl = $("debug"), countEl = $("count"), xpEl = $("xp");
+const monsterEl = $("monster"), mNameEl = $("mName"), mHpEl = $("mHp"), hpFill = $("hpFill");
+const startSheet = $("start"), settingsSheet = $("settings"), logSheet = $("logSheet");
+const loadStatus = $("loadStatus"), modelSel = $("model");
+
+const css = getComputedStyle(document.documentElement);
+const C = Object.fromEntries(["fg", "good", "bad", "warn", "torch"].map(k => [k, css.getPropertyValue("--" + k).trim()]));
+
+let cfg = loadSettings();
+function loadSettings() {
+  try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") }; }
+  catch { return { ...DEFAULTS }; }
+}
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(cfg)); } catch {}
+}
+
+const counter = createRepCounter(() => cfg);
+
+// ----- sound -----
+let actx = null, soundOn = true;
+function initAudio() {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    actx.resume();
+  } catch {}
+}
+function tone(freq, dur, type = "sine", gain = 0.25, when = 0, slideTo = 0) {
+  if (!actx || !soundOn) return;
+  const t = actx.currentTime + when;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+  g.gain.setValueAtTime(gain, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g).connect(actx.destination);
+  o.start(t);
+  o.stop(t + dur + 0.02);
+}
+const sfx = {
+  hit() { tone(190, 0.18, "square", 0.2, 0, 55); tone(950, 0.06, "triangle", 0.14); },
+  depth() { tone(1500, 0.05, "sine", 0.12); },
+  norep() { tone(140, 0.16, "sawtooth", 0.16); tone(105, 0.24, "sawtooth", 0.16, 0.17); },
+  win() { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.2, "triangle", 0.2, i * 0.11)); },
+};
+function say(text) {
+  if (!soundOn || !cfg.voice || !("speechSynthesis" in window)) return;
+  try {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.15;
+    u.lang = "en-US";
+    speechSynthesis.speak(u);
+  } catch {}
+}
+
+// ----- monster -----
+let mIndex = 0, mHp = MONSTERS[0].hp, xp = 0, respawnTimer = 0;
+function renderMonster() {
+  const M = MONSTERS[mIndex];
+  mNameEl.textContent = M.name;
+  mHpEl.textContent = `${mHp} / ${M.hp} HP`;
+  hpFill.style.width = (mHp / M.hp * 100) + "%";
+}
+function replay(el, cls) { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+function hitMonster() {
+  if (mHp <= 0) return null;
+  mHp--;
+  replay(monsterEl, "hit");
+  renderMonster();
+  if (mHp > 0) return null;
+  const M = MONSTERS[mIndex];
+  xp += M.hp;
+  xpEl.textContent = `XP ${xp}`;
+  monsterEl.classList.add("dead");
+  sfx.win();
+  flash(`${M.name} defeated! +${M.hp} XP`, "good", 2600);
+  clearTimeout(respawnTimer);
+  respawnTimer = setTimeout(nextMonster, 2600);
+  return M.name;
+}
+function nextMonster() {
+  mIndex = (mIndex + 1) % MONSTERS.length;
+  mHp = MONSTERS[mIndex].hp;
+  monsterEl.classList.remove("dead");
+  renderMonster();
+}
+
+// ----- banner -----
+const STATE_TEXT = {
+  lost: ["Can't see you. Show your whole body from the side.", "warn"],
+  idle: ["Get into plank, arms straight", ""],
+  up: ["Ready. Go down", ""],
+  down: ["Lower…", ""],
+  depth: ["Push up!", "good"],
+};
+let flashUntil = 0, flashTimer = 0;
+function setBanner(text, kind) {
+  if (banner.textContent !== text) banner.textContent = text;
+  const cls = "panel " + (kind || "");
+  if (banner.className !== cls) banner.className = cls;
+}
+function renderBanner() {
+  if (performance.now() < flashUntil) return;
+  const key = counter.state === "down" && counter.cycle?.depth ? "depth" : counter.state;
+  const [text, kind] = STATE_TEXT[key] || STATE_TEXT.idle;
+  setBanner(text, kind);
+}
+function flash(text, kind, ms) {
+  flashUntil = performance.now() + ms;
+  setBanner(text, kind);
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { flashUntil = 0; renderBanner(); }, ms);
+}
+
+// ----- log -----
+let log = [], noReps = 0, sourceLabel = "";
+function logLine(e) {
+  const head = e.ok ? `✓ Rep ${e.count}` : `✗ No rep: ${e.reasons.join(", ")}`;
+  return { head, detail: `lowest elbow ${e.minElbow}°, body bend ${e.maxBend}° (${e.bendDir}), knee ${e.minKnee}°, ${e.secs} s` };
+}
+function addLog(ok, ev) {
+  const e = { ok, ...ev, reasons: ev.reasons || [] };
+  log.push(e);
+  const { head, detail } = logLine(e);
+  const li = document.createElement("li");
+  li.className = ok ? "ok" : "no";
+  const b = document.createElement("b");
+  b.textContent = head;
+  li.append(b, " — " + detail);
+  $("logList").prepend(li);
+}
+function logAsText() {
+  const lines = [
+    `Pushup counter test, ${new Date().toLocaleString()}`,
+    `Source: ${sourceLabel}, tracking: ${modelName} (${delegate})`,
+    `Settings: bottom <= ${cfg.depth}°, top >= ${cfg.top}°, body bend <= ${cfg.bend}°, knee >= ${cfg.knee}°`,
+    `Counted: ${counter.count}, no-reps: ${noReps}`,
+    "",
+    ...log.map((e, i) => { const { head, detail } = logLine(e); return `${i + 1}. ${head} | ${detail}`; }),
+  ];
+  return lines.join("\n");
+}
+
+function handle(ev) {
+  if (ev.type === "depth") {
+    sfx.depth();
+  } else if (ev.type === "rep") {
+    countEl.textContent = ev.count;
+    replay(countEl, "bump");
+    sfx.hit();
+    const killed = hitMonster();
+    say(killed ? `${ev.count}. ${killed} defeated!` : String(ev.count));
+    if (!killed) flash(`✓ Rep ${ev.count}`, "good", 1100);
+    addLog(true, ev);
+  } else if (ev.type === "norep") {
+    noReps++;
+    sfx.norep();
+    say(ev.reasons[0]);
+    flash("✗ No rep: " + ev.reasons.join(" · "), "bad", 2000);
+    addLog(false, ev);
+  }
+}
+
+// ----- tracking -----
+let landmarker = null, loading = null, modelName = "", delegate = "";
+function setLoad(text, kind = "") { loadStatus.textContent = text; loadStatus.className = kind; }
+
+async function loadTracker(name) {
+  const { PoseLandmarker, FilesetResolver } = await import(LIB);
+  const files = await FilesetResolver.forVisionTasks(WASM);
+  const opts = d => ({
+    baseOptions: { modelAssetPath: MODELS[name], delegate: d },
+    runningMode: "VIDEO",
+    numPoses: 1,
+    minPoseDetectionConfidence: 0.5,
+    minPosePresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+  try {
+    return { lm: await PoseLandmarker.createFromOptions(files, opts("GPU")), used: "GPU" };
+  } catch (e) {
+    console.warn("GPU tracking failed, using CPU", e);
+    return { lm: await PoseLandmarker.createFromOptions(files, opts("CPU")), used: "CPU" };
+  }
+}
+function ensureTracker() {
+  const name = modelSel.value;
+  if (loading && name === modelName) return loading;
+  modelName = name;
+  try { landmarker?.close(); } catch {}
+  landmarker = null;
+  setLoad(`Loading body tracking (${name === "full" ? "accurate" : "fast"})… first time can take a while.`);
+  loading = loadTracker(name).then(({ lm, used }) => {
+    landmarker = lm;
+    delegate = used;
+    setLoad(`Body tracking ready (${used === "GPU" ? "using graphics chip" : "using CPU, may be slow"}).`, "ok");
+    return lm;
+  }).catch(err => {
+    console.error(err);
+    loading = null;
+    setLoad("Could not load body tracking. Check the internet connection and reload the page.", "err");
+    throw err;
+  });
+  return loading;
+}
+
+let stream = null, objectUrl = "", running = false, rafId = 0, lastVideoTime = -1, side = null;
+let frames = 0, fpsT = 0, fps = 0;
+const sm = {};
+function smooth(m) {
+  for (const k of ["elbow", "bodyBend", "knee"]) {
+    sm[k] = sm[k] == null ? m[k] : sm[k] + 0.5 * (m[k] - sm[k]);
+    m[k] = sm[k];
+  }
+}
+function resetSmooth() { sm.elbow = sm.bodyBend = sm.knee = null; }
+
+function setDims() {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return;
+  canvas.width = w;
+  canvas.height = h;
+  frame.style.setProperty("--ar", `${w} / ${h}`);
+  frame.style.setProperty("--ar-num", String(w / h));
+}
+video.addEventListener("loadedmetadata", setDims);
+video.addEventListener("resize", setDims);
+video.addEventListener("ended", () => flash(`Video finished: ${counter.count} reps counted, ${noReps} no-reps`, "good", 8000));
+
+function loop() {
+  rafId = requestAnimationFrame(loop);
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const now = performance.now();
+  let res;
+  try { res = landmarker.detectForVideo(video, now); } catch (e) { console.error(e); return; }
+  const lm = res.landmarks && res.landmarks[0];
+  let m = null;
+  if (lm) {
+    m = analyzePose(lm, video.videoWidth, video.videoHeight, side);
+    if (m.side !== side) resetSmooth();
+    side = m.side;
+    smooth(m);
+  } else {
+    resetSmooth();
+  }
+  counter.update(m, now).forEach(handle);
+  renderBanner();
+  draw(lm, m);
+
+  frames++;
+  if (now - fpsT > 1000) { fps = Math.round(frames * 1000 / (now - fpsT)); frames = 0; fpsT = now; }
+  debugEl.textContent = m
+    ? `elbow ${Math.round(m.elbow)}° · body ${Math.round(m.bodyBend)}° ${m.bendDir} · knee ${Math.round(m.knee)}° · side ${m.side} · ${fps} fps`
+    : `no body found · ${fps} fps`;
+}
+
+function draw(lm, m) {
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!lm) return;
+  const lw = Math.max(2, W / 320);
+  const p = i => [lm[i].x * W, lm[i].y * H];
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "rgba(238, 243, 236, 0.35)";
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  for (const [a, b] of CONN) { ctx.moveTo(...p(a)); ctx.lineTo(...p(b)); }
+  ctx.stroke();
+  if (!m) return;
+  const s = IDX[m.side];
+  const path = (ids, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lw * 2.4;
+    ctx.beginPath();
+    ids.forEach((id, n) => n ? ctx.lineTo(...p(id)) : ctx.moveTo(...p(id)));
+    ctx.stroke();
+    ctx.fillStyle = color;
+    for (const id of ids) { ctx.beginPath(); ctx.arc(...p(id), lw * 2.2, 0, Math.PI * 2); ctx.fill(); }
+  };
+  path([s.sh, s.hip, s.kn, s.an], m.bodyBend > cfg.bend || m.knee < cfg.knee ? C.bad : C.good);
+  path([s.sh, s.el, s.wr], m.elbow <= cfg.depth ? C.good : m.elbow >= cfg.top ? C.fg : C.warn);
+}
+
+// ----- sessions -----
+let wakeLock = null;
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && running) keepAwake();
+});
+
+function stopSource() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = ""; }
+  video.pause();
+  video.removeAttribute("src");
+  video.srcObject = null;
+}
+
+function resetGame() {
+  counter.reset();
+  log = [];
+  noReps = 0;
+  $("logList").replaceChildren();
+  countEl.textContent = "0";
+  clearTimeout(respawnTimer);
+  mIndex = 0;
+  mHp = MONSTERS[0].hp;
+  xp = 0;
+  xpEl.textContent = "XP 0";
+  monsterEl.classList.remove("dead");
+  renderMonster();
+  flashUntil = 0;
+  renderBanner();
+}
+
+function beginSession(label) {
+  sourceLabel = label;
+  resetGame();
+  side = null;
+  resetSmooth();
+  lastVideoTime = -1;
+  startSheet.hidden = true;
+  hud.hidden = false;
+  running = true;
+  keepAwake();
+  cancelAnimationFrame(rafId);
+  fpsT = performance.now();
+  frames = 0;
+  loop();
+}
+
+function endSession() {
+  running = false;
+  cancelAnimationFrame(rafId);
+  stopSource();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  try { wakeLock?.release(); } catch {}
+  wakeLock = null;
+  try { speechSynthesis.cancel(); } catch {}
+  hud.hidden = true;
+  if (sourceLabel) {
+    const last = $("lastResult");
+    last.textContent = `Last test: ${counter.count} reps counted, ${noReps} no-reps.`;
+    last.hidden = false;
+  }
+  startSheet.hidden = false;
+}
+
+async function startCamera(facing) {
+  initAudio();
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setLoad(window.isSecureContext
+      ? "This browser cannot use the camera. Try Chrome."
+      : "The camera only works on an https:// link. Open the https address.", "err");
+    return;
+  }
+  try {
+    setLoad("Starting camera…");
+    const s = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    });
+    stopSource();
+    stream = s;
+    video.srcObject = s;
+    frame.classList.toggle("mirror", facing === "user");
+    await video.play();
+    await ensureTracker();
+    beginSession(facing === "user" ? "front camera" : "back camera");
+  } catch (e) {
+    console.error(e);
+    stopSource();
+    if (e.name === "NotAllowedError") setLoad("Camera permission was blocked. Allow the camera for this site in the browser settings, then reload.", "err");
+    else if (e.name === "NotFoundError" || e.name === "OverconstrainedError") setLoad("No camera found.", "err");
+    else if (!landmarker) { /* ensureTracker already showed the error */ }
+    else setLoad("Could not start the camera: " + (e.message || e.name), "err");
+  }
+}
+
+async function startVideo(src, label) {
+  initAudio();
+  try {
+    await ensureTracker();
+    setLoad("Loading video…");
+    stopSource();
+    if (src.startsWith("blob:")) objectUrl = src;
+    video.crossOrigin = "anonymous";
+    video.loop = false;
+    video.src = src;
+    frame.classList.remove("mirror");
+    await video.play();
+    beginSession(label);
+    setLoad("Body tracking ready.", "ok");
+  } catch (e) {
+    console.error(e);
+    if (landmarker) setLoad("Could not play that video: " + (e.message || e.name), "err");
+  }
+}
+
+// ----- controls -----
+$("btnFront").addEventListener("click", () => startCamera("user"));
+$("btnBack").addEventListener("click", () => startCamera("environment"));
+$("fileInput").addEventListener("change", e => {
+  const f = e.target.files && e.target.files[0];
+  if (f) startVideo(URL.createObjectURL(f), "video file: " + f.name);
+  e.target.value = "";
+});
+modelSel.addEventListener("change", () => ensureTracker().catch(() => {}));
+$("btnStop").addEventListener("click", endSession);
+$("btnReset").addEventListener("click", resetGame);
+$("btnSound").addEventListener("click", e => {
+  soundOn = !soundOn;
+  e.currentTarget.textContent = soundOn ? "Sound on" : "Sound off";
+  e.currentTarget.setAttribute("aria-pressed", String(soundOn));
+  if (soundOn) initAudio(); else try { speechSynthesis.cancel(); } catch {}
+});
+
+const SLIDERS = [["sDepth", "oDepth", "depth"], ["sTop", "oTop", "top"], ["sBend", "oBend", "bend"], ["sKnee", "oKnee", "knee"]];
+function renderSettings() {
+  for (const [s, o, k] of SLIDERS) { $(s).value = cfg[k]; $(o).textContent = cfg[k] + "°"; }
+  $("sVoice").checked = cfg.voice;
+}
+for (const [s, o, k] of SLIDERS) {
+  $(s).addEventListener("input", e => { cfg[k] = Number(e.target.value); $(o).textContent = cfg[k] + "°"; saveSettings(); });
+}
+$("sVoice").addEventListener("change", e => { cfg.voice = e.target.checked; saveSettings(); });
+$("btnDefaults").addEventListener("click", () => { cfg = { ...DEFAULTS }; saveSettings(); renderSettings(); });
+$("btnSettings").addEventListener("click", () => { renderSettings(); settingsSheet.hidden = false; });
+$("btnSettingsDone").addEventListener("click", () => { settingsSheet.hidden = true; });
+
+$("btnLog").addEventListener("click", () => { $("logText").hidden = true; $("btnCopy").textContent = "Copy log"; logSheet.hidden = false; });
+$("btnLogDone").addEventListener("click", () => { logSheet.hidden = true; });
+$("btnCopy").addEventListener("click", () => {
+  const text = logAsText();
+  const showText = () => { const t = $("logText"); t.value = text; t.hidden = false; t.select(); $("btnCopy").textContent = "Select and copy the text above"; };
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => { $("btnCopy").textContent = "Copied"; }, showText);
+  else showText();
+});
+
+renderMonster();
+renderSettings();
+ensureTracker().catch(() => {});
+
+// for debugging from the browser console
+window.PushupTest = { analyzePose, createRepCounter, playUrl: url => startVideo(url, "video url") };
+</script>
+</body>
+</html>

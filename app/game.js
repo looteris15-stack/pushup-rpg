@@ -1,0 +1,1094 @@
+import { createTracker, initAudio, sfx, say, hush, audio } from "./core.js";
+import { RULES, ZONES, DUNGEON, WANDERERS, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs } from "./data.js";
+
+const DEBUG = new URLSearchParams(location.search).has("debug");
+const SAVE_KEY = "pushupRPG.save.v1";
+const SCREENS = ["camp", "map", "dungeon", "records", "settings", "fight"];
+const TESTED_STRICTNESS = { depth: 63, top: 160, bend: 20, knee: 135 };
+// bump when TESTED_STRICTNESS changes: old saves then get the new strictness once
+const STRICT_V = 3;
+const DEFAULT_SETTINGS = { ...TESTED_STRICTNESS, strictV: STRICT_V, voice: true, camera: "user", model: "full" };
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+let timeOffset = 0; // debug only: pretend time has passed
+const now = () => Date.now() + timeOffset;
+
+// ---------- save ----------
+
+function freshState(settings = DEFAULT_SETTINGS) {
+  return {
+    v: 1, rev: 0, savedAt: 0,
+    xp: 0, restUntil: 0, dungeonLockedUntil: 0, dungeonFloor: 1, run: null, unlockedZones: 1,
+    tested: false, testResult: 0, wandererDone: "",
+    kills: {}, losses: {}, history: [],
+    stats: { pushups: 0, fights: 0, wins: 0, bestSet: 0, biggestKill: 0, deepestFloor: 0 },
+    settings: { ...settings },
+  };
+}
+let needsSave = false;
+function normalize(s) {
+  const f = freshState();
+  const out = { ...f, ...s, stats: { ...f.stats, ...(s.stats || {}) }, settings: { ...f.settings, ...(s.settings || {}) } };
+  if ((s.settings || {}).strictV !== STRICT_V) {
+    Object.assign(out.settings, TESTED_STRICTNESS, { strictV: STRICT_V });
+    needsSave = true;
+  }
+  return out;
+}
+function saveIfMigrated() {
+  if (needsSave) { needsSave = false; save(); }
+}
+function loadLocal() {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    return raw ? normalize(JSON.parse(raw)) : freshState();
+  } catch {
+    return freshState();
+  }
+}
+let state = loadLocal();
+function storeLocal() {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(state)); } catch {}
+}
+
+// Run from the PC (start.ps1), the server keeps a copy in save\save.json, so progress survives a new phone link.
+// On a fixed web address (GitHub Pages) there is no PC copy: the save lives on the phone, plus backup codes.
+// rev counts saves: the copy with the higher rev wins. Nothing is sent before the PC copy was checked,
+// so a fresh phone link can never overwrite real progress.
+const PC_SAVE = !location.hostname.endsWith("github.io");
+let pcChecked = false;
+const asciiJson = s => JSON.stringify(s).replace(/[\u007f-￿]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+function save() {
+  state.rev = (state.rev || 0) + 1;
+  state.savedAt = Date.now();
+  storeLocal();
+  pushToPc();
+}
+let saveTimer = 0;
+function saveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 500); }
+
+function pushToPc() {
+  if (!PC_SAVE || !pcChecked) return;
+  fetch("/api/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: asciiJson(state) })
+    .then(r => setSync(r.ok), () => setSync(false));
+}
+async function syncFromPc() {
+  if (!PC_SAVE) {
+    $("syncStatus").textContent = "Progress is saved on this phone. Copy a backup code in Settings now and then.";
+    // ask the browser not to clear this site's storage when space runs low
+    try { navigator.storage?.persist?.(); } catch {}
+    return;
+  }
+  try {
+    const r = await fetch("/api/save", { cache: "no-store" });
+    pcChecked = true;
+    if (r.status === 404) { pushToPc(); return; }
+    if (!r.ok) throw new Error("status " + r.status);
+    const remote = normalize(await r.json());
+    setSync(true);
+    if (remote.rev > state.rev) {
+      state = remote;
+      storeLocal();
+      applySettings();
+      renderCurrent();
+      saveIfMigrated();
+    } else if (state.rev > remote.rev) {
+      pushToPc();
+    }
+  } catch {
+    pcChecked = true;
+    setSync(false);
+  }
+}
+function setSync(ok) {
+  $("syncStatus").textContent = ok
+    ? "Progress is saved on your PC too, so a new phone link keeps it."
+    : "Progress is saved on this phone only. The PC copy could not be reached.";
+}
+
+// ---------- time ----------
+
+function fmtLeft(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d} d ${h} h`;
+  if (h) return `${h} h ${m} min`;
+  if (m) return `${m} min ${s % 60} s`;
+  return `${s} s`;
+}
+function fmtClock(ms) {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+const fmtAt = ts => new Date(ts).toLocaleString([], { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const until = ts => `<b data-until="${ts}">${fmtLeft(ts - now())}</b>`;
+
+let modalRefresh = null;
+function tickCountdowns() {
+  let expired = false;
+  document.querySelectorAll("[data-until]").forEach(el => {
+    if (el.closest("[hidden]")) return;
+    const left = Number(el.dataset.until) - now();
+    if (left <= 0) expired = true;
+    else el.textContent = fmtLeft(left);
+  });
+  if (expired) {
+    renderCurrent();
+    if (modalRefresh) modalRefresh();
+  }
+}
+setInterval(tickCountdowns, 1000);
+
+// ---------- special monsters ----------
+
+const TEST = { id: "test", name: "Strength test", hp: 0 };
+const champion = () => ({ id: "champion", name: "The Champion", hp: state.stats.bestSet + 1, boss: true });
+
+const dayKey = () => { const d = new Date(now()); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
+function hash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+// Shows up on about 2 of 3 days, the same one all day. HP comes from your highest open area.
+function todaysWanderer() {
+  const key = dayKey(), h = hash(key);
+  if (h % 3 === 0) return null;
+  const w = WANDERERS[(h >>> 4) % WANDERERS.length];
+  let zi = 0;
+  for (let i = 0; i < Math.min(state.unlockedZones, ZONES.length); i++) {
+    if (ZONES[i].monsters.some(m => !m.slow && !m.rounds)) zi = i;
+  }
+  const hps = ZONES[zi].monsters.filter(m => !m.slow && !m.rounds).map(m => m.hp);
+  const lo = Math.min(...hps), hi = Math.max(...hps);
+  const hp = lo + ((h >>> 8) % (hi - lo + 1));
+  // a slow-rep wanderer gets fewer HP, like the other slow monsters (3 s from Frost Peaks on)
+  const slow = w.slow ? (zi >= 4 ? RULES.slowHardSec : RULES.slowDownSec) : 0;
+  return { ...w, id: `wanderer-${w.id}`, slow, hp: slow ? Math.round(hp * RULES.specialHpMult) : hp, key };
+}
+
+// everything you can fight from the map: { m, where, label, zone }
+function resolveMonster(id) {
+  if (id === "test") return { m: TEST, where: "test", label: "Strength test" };
+  if (id === "champion") return state.tested ? { m: champion(), where: "champion", label: "Champion's Ring" } : null;
+  if (id.startsWith("wanderer-")) {
+    const w = todaysWanderer();
+    return w && w.id === id && state.wandererDone !== w.key ? { m: w, where: "wander", label: "Wandering monster" } : null;
+  }
+  const f = findMonster(id);
+  return f && f.zone ? { m: f.m, where: "world", label: f.zone.name, zone: f.zone } : null;
+}
+// for the records table
+function describeMonster(id) {
+  const f = findMonster(id);
+  if (f) return { name: f.m.name, where: f.zone ? f.zone.name : `Mine floor ${f.floor}`, hp: f.m.hp };
+  if (id === "champion") return { name: "The Champion", where: "Champion's Ring", hp: "–" };
+  const w = WANDERERS.find(x => `wanderer-${x.id}` === id);
+  return w ? { name: w.name, where: "Wandering", hp: "–" } : null;
+}
+
+// a boss opens when every other monster in its area was beaten once
+function bossLock(m, zone) {
+  if (!m.boss || !zone) return null;
+  const others = zone.monsters.filter(x => !x.boss);
+  const done = others.filter(x => state.kills[x.id]).length;
+  return done < others.length ? { done, total: others.length } : null;
+}
+
+function rewardFor(m, where) {
+  if (where === "wander") return Math.round(m.hp * RULES.wandererXpMult * (m.slow ? RULES.specialXpMult : 1));
+  if (where === "champion") return m.hp * RULES.championXpPerRep;
+  return xpReward(m, where);
+}
+
+// ---------- screens ----------
+
+let current = "camp";
+function show(name) {
+  for (const s of SCREENS) $(s).hidden = s !== name;
+  current = name;
+  if (name !== "fight") $(name).scrollTop = 0;
+  renderCurrent();
+}
+function renderCurrent() {
+  const render = { camp: renderCamp, map: renderMap, dungeon: renderDungeon, records: renderRecords, settings: renderSettings }[current];
+  if (render) render();
+}
+
+function openModal(html, refresh = null) {
+  $("modalCard").innerHTML = html;
+  $("modal").hidden = false;
+  modalRefresh = refresh;
+}
+function closeModal() {
+  $("modal").hidden = true;
+  modalRefresh = null;
+}
+
+function levelInfo() {
+  const L = levelFromXp(state.xp), base = xpForLevel(L), next = xpForLevel(L + 1);
+  return { L, into: state.xp - base, need: next - base, title: titleFor(L) };
+}
+const tile = ([label, value]) => `<div class="tile panel"><span class="label">${label}</span><b>${value}</b></div>`;
+const chips = m => [
+  m.boss ? '<span class="chip boss">Boss</span>' : "",
+  m.rounds ? `<span class="chip">${m.rounds.length} rounds</span>` : "",
+  m.slow ? `<span class="chip slow">Slow reps · ${slowSecs(m)} s</span>` : "",
+].join(" ");
+
+function renderCamp() {
+  const { L, into, need, title } = levelInfo();
+  $("campLevel").textContent = L;
+  $("campTitle").textContent = title;
+  $("campXpFill").style.width = (into / need) * 100 + "%";
+  $("campXpText").textContent = `${state.xp} XP · ${need - into} XP to level ${L + 1}`;
+  const t = now();
+  const status =
+    state.restUntil > t ? `<span class="chip warn">Recovering</span> Your muscles are resting after a hard set. Fights open in ${until(state.restUntil)} (${fmtAt(state.restUntil)}).`
+    : state.run ? `<span class="chip warn">In the mine</span> Your run on floor ${state.run.floor} is not finished. Go to The Old Mine to continue it.`
+    : `<span class="chip good">Ready</span> You are rested. Pick a fight.`;
+  const test = state.tested ? ""
+    : `<div class="row"><button type="button" class="primary" data-action="prefight" data-id="test">Take the strength test</button><span class="fine">It picks the area where you start.</span></div>`;
+  $("campStatus").innerHTML = status + test;
+  const s = state.stats;
+  $("campTiles").innerHTML = [["Pushups done", s.pushups], ["Best set", s.bestSet], ["Monsters slain", s.wins], ["Deepest floor", s.deepestFloor]].map(tile).join("");
+}
+
+function renderMap() {
+  $("mapNote").innerHTML = state.restUntil > now()
+    ? `<span class="chip warn">Recovering</span> You can look around, but fights open in ${until(state.restUntil)}.`
+    : "1 strict pushup = 1 hit. Beat every monster in an area once to open its boss. The boss opens the next area.";
+
+  const cards = [];
+  if (!state.tested) {
+    cards.push(`<button type="button" class="special panel" data-action="prefight" data-id="test">
+      <span class="eyebrow">Start here</span><b>Strength test</b>
+      <span>Do as many strict pushups as you can. It picks your starting area.</span></button>`);
+  } else {
+    cards.push(`<button type="button" class="special panel" data-action="prefight" data-id="champion">
+      <span class="eyebrow">Champion's Ring</span><b>The Champion · ${state.stats.bestSet + 1} HP</b>
+      <span>Your best set + 1. Beat it for a new record, then keep going.</span></button>`);
+  }
+  const w = todaysWanderer();
+  if (w && state.wandererDone === w.key) {
+    cards.push(`<div class="special panel done"><span class="eyebrow">Wandering monster</span><b>${esc(w.name)} is gone</b>
+      <span>You already fought it today. Another one may come tomorrow.</span></div>`);
+  } else if (w) {
+    cards.push(`<button type="button" class="special panel" data-action="prefight" data-id="${w.id}">
+      <span class="eyebrow">Wandering monster · today only</span><b>${esc(w.name)} · ${w.hp} HP ${chips(w)}</b>
+      <span>Double XP (${rewardFor(w, "wander")}). Gone at midnight.</span></button>`);
+  }
+  $("mapSpecial").innerHTML = cards.join("");
+
+  $("mapZones").innerHTML = ZONES.map((z, zi) => {
+    const hp = z.monsters.map(m => m.hp);
+    const open = zi < state.unlockedZones;
+    const prevBoss = zi > 0 ? ZONES[zi - 1].monsters.find(m => m.boss) : null;
+    return `<section class="zone panel${open ? "" : " locked"}">
+      <header><div><h2>${esc(z.name)}</h2><p class="fine">${esc(z.blurb)}</p></div><span class="hp-range">${Math.min(...hp)}–${Math.max(...hp)} HP</span></header>
+      ${open ? `<div class="mlist">${z.monsters.map(m => monsterRow(m, z)).join("")}</div>` : `<p class="fine">Locked. Beat the ${esc(prevBoss.name)} to open it.</p>`}
+    </section>`;
+  }).join("");
+}
+function monsterRow(m, zone) {
+  const k = state.kills[m.id] || 0;
+  const lock = bossLock(m, zone);
+  const note = lock ? `beat the others first (${lock.done}/${lock.total})` : k ? `✓ slain ×${k}` : "new";
+  return `<button type="button" class="mrow${lock ? " locked" : ""}" data-action="prefight" data-id="${m.id}">
+    <span class="mname">${esc(m.name)} ${chips(m)}</span>
+    <span class="mhp">${m.hp} HP</span>
+    <span class="mkills">${note}</span>
+  </button>`;
+}
+
+function openPrefight(id) {
+  const r = resolveMonster(id);
+  if (!r) { closeModal(); renderCurrent(); return; }
+  const { m, where, label, zone } = r;
+  const recovering = state.restUntil > now();
+  const lock = bossLock(m, zone);
+  let body, start = "Fight";
+  if (where === "test") {
+    start = "Start the test";
+    body = `<p>Do <b>as many strict pushups as you can</b> in one set. Your result picks the area where you start.</p>
+      <ul class="rules">
+        <li>Take your time getting into position. The timer starts with your first strict rep.</li>
+        <li>After that, it ends when you stop for ${RULES.maxPauseSec} seconds, stand up, or tap Finish.</li>
+        <li>This is not a fight: no rest time afterwards.</li>
+      </ul>`;
+  } else {
+    const rounds = m.rounds || [m.hp];
+    // special rules go in highlighted boxes so nobody misses them
+    const special = [];
+    if (m.slow) special.push(["slow", `<b>Slow reps:</b> take at least <b>${slowSecs(m)} seconds going down</b>. Faster reps don't count. The way up can be normal speed. Fewer HP and ${RULES.specialXpMult}× XP to make up for it.`]);
+    if (rounds.length > 1) special.push(["torch", `<b>${rounds.length} rounds:</b> ${rounds.join(" + ")} pushups, with <b>${RULES.roundRestSec} s rest</b> between rounds. Each round is one set.`]);
+    if (where === "champion") special.push(["torch", `<b>Record fight:</b> it has your best set + 1 HP. After it falls, <b>keep going</b> for a bigger record, then tap Finish.`]);
+    if (where === "wander") special.push(["torch", `<b>Today only:</b> double XP. It's gone at midnight.`]);
+    const rules = [];
+    if (rounds.length === 1) rules.push(`Do <b>${m.hp} strict pushups in one set</b> to win. Each rep is 1 hit.`);
+    rules.push("Take your time getting into position. The timer starts with your first strict rep.");
+    rules.push(`After that: no strict rep for ${RULES.maxPauseSec} seconds, or you stand up, and the monster wins.`);
+    rules.push(`If it wins, you recover ${RULES.restHoursAfterLoss} hours before the next fight.`);
+    const xp = rewardFor(m, where) + (where === "champion" ? " or more" : "");
+    body = `<p class="hpbig">${m.hp}<span>HP</span></p>
+      ${special.map(([kind, text]) => `<p class="callout ${kind}">${text}</p>`).join("")}
+      <ul class="rules">${rules.map(x => `<li>${x}</li>`).join("")}</ul>
+      <p class="fine">Win: +${xp} XP. Your best set so far: ${state.stats.bestSet}.${state.kills[m.id] ? ` Slain ×${state.kills[m.id]}.` : ""}</p>`;
+  }
+  const button = state.run ? `<button type="button" disabled>Finish your mine run first</button>`
+    : lock ? `<button type="button" disabled>Beat the other ${lock.total - lock.done} first</button>`
+    : recovering && where !== "test" ? `<button type="button" disabled>Recovering: ${until(state.restUntil)}</button>`
+    : `<button type="button" class="primary" data-action="fight" data-id="${m.id}">${start}</button>`;
+  openModal(`
+    <p class="eyebrow">${esc(label)}</p>
+    <h2 class="big">${esc(m.name)}</h2>
+    ${m.boss || m.slow || m.rounds ? `<p>${chips(m)}</p>` : ""}
+    ${body}
+    <div class="row">${button}<button type="button" data-action="closeModal">Back</button></div>`,
+    () => openPrefight(id));
+}
+
+function renderDungeon() {
+  const t = now(), F = state.dungeonFloor, run = state.run, total = DUNGEON.floors.length;
+  let status, button = "";
+  if (run) {
+    status = `<span class="chip warn">Run not finished</span> You are on floor ${run.floor}, room ${run.room + 1}. You get a short break first.`;
+    button = `<button type="button" class="primary" data-action="continueRun">Continue the run</button>`;
+  } else if (state.dungeonLockedUntil > t) {
+    status = `<span class="chip bad">Closed</span> You lost in the mine. It opens again in ${until(state.dungeonLockedUntil)} (${fmtAt(state.dungeonLockedUntil)}).`;
+  } else if (state.restUntil > t) {
+    status = `<span class="chip warn">Recovering</span> Your muscles are resting. You can enter in ${until(state.restUntil)}.`;
+  } else if (F > total) {
+    status = `<span class="chip good">Conquered</span> You beat all ${total} floors.`;
+  } else {
+    status = `<span class="chip good">Open</span> Floor ${F} is waiting.`;
+    button = `<button type="button" class="primary" data-action="enterFloor">Enter floor ${F}</button>`;
+  }
+  $("dgStatus").innerHTML = status;
+
+  const shown = run ? run.floor : Math.min(F, total);
+  const rooms = DUNGEON.floors[shown - 1];
+  const done = run ? run.room : 0;
+  const sum = rooms.reduce((a, m) => a + m.hp, 0);
+  $("dgFloor").innerHTML = `
+    <div class="m-row"><h2>Floor ${shown} of ${total}</h2><span class="hp-range">${sum} pushups in total</span></div>
+    <ol class="rooms">
+      ${rooms.map((m, i) => `<li class="${i < done ? "done" : i === done ? "next" : ""}"><span>Room ${i + 1}: <b>${esc(m.name)}</b> ${chips(m)}</span><span class="mhp">${m.hp} HP</span></li>`).join("")}
+      <li class="safe"><span>Safe room</span><span>progress saved</span></li>
+    </ol>
+    ${button ? `<div class="row">${button}</div>` : ""}`;
+  $("dgRules").innerHTML = `
+    <li>Fight ${rooms.length} rooms in a row. Each monster is one set.</li>
+    <li>You get ${RULES.restBetweenRoomsSec} seconds of rest between rooms. Then do your first rep within ${RULES.dungeonStartSec} seconds.</li>
+    <li>Reach the safe room to save the floor and get +${RULES.floorBonusXp} XP times the floor number.</li>
+    <li>Lose or leave before the safe room: the mine closes for ${RULES.dungeonLockDays} days and you recover ${RULES.restHoursAfterLoss} hours.</li>`;
+  const here = run ? run.floor : F;
+  $("dgLadder").innerHTML = DUNGEON.floors.map((_, i) => {
+    const f = i + 1;
+    return `<span class="${f < F ? "done" : f === here ? "here" : ""}" title="Floor ${f}">${f}</span>`;
+  }).join("");
+}
+
+function renderRecords() {
+  const s = state.stats, { L } = levelInfo();
+  $("recTiles").innerHTML = [
+    ["Level", L], ["Pushups done", s.pushups], ["Best set", s.bestSet], ["Strength test", state.tested ? state.testResult : "–"],
+    ["Biggest kill", s.biggestKill ? `${s.biggestKill} HP` : "–"], ["Fights won", `${s.wins} / ${s.fights}`], ["Deepest floor", s.deepestFloor],
+  ].map(tile).join("");
+  const ids = [...new Set([...Object.keys(state.kills), ...Object.keys(state.losses)])];
+  const rows = ids.map(id => ({ id, d: describeMonster(id) })).filter(r => r.d)
+    .sort((a, b) => (typeof a.d.hp === "number" ? a.d.hp : 999) - (typeof b.d.hp === "number" ? b.d.hp : 999));
+  $("recBeasts").innerHTML = rows.length
+    ? `<thead><tr><th>Monster</th><th>Where</th><th class="num">HP</th><th class="num">Slain</th><th class="num">Lost to</th></tr></thead>
+       <tbody>${rows.map(({ id, d }) => `<tr><td>${esc(d.name)}</td><td>${esc(d.where)}</td><td class="num">${d.hp}</td><td class="num">${state.kills[id] || 0}</td><td class="num">${state.losses[id] || 0}</td></tr>`).join("")}</tbody>`
+    : `<tbody><tr><td class="fine">No fights yet.</td></tr></tbody>`;
+  $("recHistory").innerHTML = state.history.length
+    ? state.history.map(h => h.id === "test"
+      ? `<li class="won"><span><b>Strength test</b>: ${h.reps} pushups</span><span class="fine">${fmtAt(h.t)}</span></li>`
+      : `<li class="${h.won ? "won" : "lost"}"><span><b>${h.won ? "Won" : "Lost"}</b> vs ${esc(h.name)} (${h.hp} HP): ${h.reps} hits</span><span class="fine">${esc(h.where)} · ${fmtAt(h.t)}</span></li>`).join("")
+    : `<li class="fine">No fights yet.</li>`;
+}
+
+const SLIDERS = [["sDepth", "oDepth", "depth"], ["sTop", "oTop", "top"], ["sBend", "oBend", "bend"], ["sKnee", "oKnee", "knee"]];
+function renderSettings() {
+  for (const [s, o, k] of SLIDERS) { $(s).value = state.settings[k]; $(o).textContent = state.settings[k] + "°"; }
+  $("sVoice").checked = state.settings.voice;
+  $("sCamera").value = state.settings.camera;
+  $("sModel").value = state.settings.model;
+}
+function applySettings() {
+  audio.voice = state.settings.voice;
+}
+for (const [s, o, k] of SLIDERS) {
+  $(s).addEventListener("input", e => { state.settings[k] = Number(e.target.value); $(o).textContent = e.target.value + "°"; saveSoon(); });
+}
+$("sVoice").addEventListener("change", e => { state.settings.voice = e.target.checked; applySettings(); saveSoon(); });
+$("sCamera").addEventListener("change", e => { state.settings.camera = e.target.value; saveSoon(); });
+$("sModel").addEventListener("change", e => { state.settings.model = e.target.value; saveSoon(); tracker.ensureModel(e.target.value).catch(() => {}); });
+$("btnDefaults").addEventListener("click", () => { Object.assign(state.settings, TESTED_STRICTNESS); renderSettings(); saveSoon(); });
+// backup code = the whole save as text, so progress can move to another link or phone
+const BACKUP_PREFIX = "PRPG1.";
+$("btnBackup").addEventListener("click", () => {
+  const code = BACKUP_PREFIX + btoa(asciiJson(state));
+  const box = $("backupText");
+  const showBox = () => {
+    box.value = code;
+    box.hidden = false;
+    box.select();
+    $("backupMsg").textContent = "Select all of the code above and copy it.";
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(code).then(() => { $("backupMsg").textContent = "Backup code copied. Paste it into a note to keep it."; }, showBox);
+  } else {
+    showBox();
+  }
+});
+$("btnRestore").addEventListener("click", e => {
+  const raw = $("restoreText").value.replace(/\s+/g, "");
+  let saved = null;
+  try { if (raw.startsWith(BACKUP_PREFIX)) saved = JSON.parse(atob(raw.slice(BACKUP_PREFIX.length))); } catch {}
+  if (!saved || typeof saved !== "object" || !saved.stats) {
+    $("backupMsg").textContent = "That doesn't look like a backup code. Copy the whole code and try again.";
+    return;
+  }
+  confirmTap(e.currentTarget, "Tap again to replace your progress", () => {
+    const rev = state.rev;
+    state = normalize(saved);
+    needsSave = false;
+    state.rev = Math.max(rev, state.rev || 0);
+    save();
+    applySettings();
+    renderSettings();
+    $("restoreText").value = "";
+    $("backupMsg").textContent = `Restored: level ${levelFromXp(state.xp)}, ${state.stats.pushups} pushups done.`;
+  });
+});
+
+$("btnWipe").addEventListener("click", e => confirmTap(e.currentTarget, "Tap again to reset everything", () => {
+  state = { ...freshState(state.settings), rev: state.rev };
+  save();
+  show("camp");
+}));
+
+// two taps for anything that cannot be undone
+function confirmTap(btn, armedText, fn) {
+  if (btn.dataset.armed) { disarm(btn); fn(); return; }
+  btn.dataset.text = btn.textContent;
+  btn.textContent = armedText;
+  btn.dataset.armed = String(setTimeout(() => disarm(btn), 3000));
+}
+function disarm(btn) {
+  if (!btn.dataset.armed) return;
+  clearTimeout(Number(btn.dataset.armed));
+  delete btn.dataset.armed;
+  btn.textContent = btn.dataset.text;
+}
+
+// ---------- fight ----------
+
+const tracker = createTracker({
+  video: $("video"), canvas: $("overlay"), frame: $("frame"),
+  getCfg: () => state.settings,
+  onEvent: ev => onRepEvent(ev),
+  onFrame: m => onTrackFrame(m),
+});
+
+// fight.where: "world" | "wander" | "champion" | "test" | "dungeon"
+let fight = null;  // the fight going on right now
+let rest = null;   // a break: between mine rooms, or between rounds of a big monster
+let hiddenAt = 0, flashUntil = 0, flashTimer = 0, lastBeep = 0;
+
+const fakeReps = () => DEBUG && !tracker.running;
+const plankState = () => (fakeReps() ? "up" : tracker.counter.state);
+
+async function openFightScreen(backTo) {
+  initAudio();
+  applySettings();
+  closeModal();
+  show("fight");
+  $("restPanel").hidden = true;
+  $("banner").hidden = false;
+  $("btnFlee").hidden = true;
+  updateThreat(null);
+  setBanner("Starting camera…", "");
+  $("debug").textContent = "Starting camera…";
+  $("dbgRep").hidden = $("dbgNoRep").hidden = !DEBUG;
+  try {
+    await tracker.startCamera(state.settings.camera, state.settings.model);
+    return true;
+  } catch (e) {
+    if (DEBUG) { $("debug").textContent = "debug: no camera, use the fake buttons"; return true; }
+    tracker.stop();
+    show(backTo);
+    openModal(`<p class="eyebrow">Camera</p><h2>The fight can't start</h2><p>${esc(e.friendly || "Could not start the camera.")}</p>
+      <div class="row"><button type="button" class="primary" data-action="closeModal">OK</button></div>`);
+    return false;
+  }
+}
+
+function beginFight(m, where, timedStart, label) {
+  const t = performance.now();
+  const rounds = m.rounds || [m.hp];
+  rest = null;
+  fight = {
+    m, where, label, rounds, round: 0, total: m.hp, hpLeft: m.hp, roundLeft: rounds[0],
+    reps: 0, roundReps: 0, maxSet: 0,
+    started: false, timedStart, waitSince: t, lastRepAt: t, leftSince: 0, over: false,
+    openEnded: where === "test", overkill: false,
+  };
+  tracker.counter.reset();
+  lastBeep = 0;
+  $("fMonster").classList.toggle("test", where === "test");
+  showFightHud();
+  renderFightHud();
+  renderBanner();
+  const secsWord = { 2: "two", 3: "three", 4: "four" }[slowSecs(m)] || String(slowSecs(m));
+  say(`${timedStart ? `${m.name}. Get into plank. ` : ""}${m.slow ? `Slow reps. Take ${secsWord} seconds going down.` : ""}`);
+}
+
+function showFightHud() {
+  flashUntil = 0;
+  $("restPanel").hidden = true;
+  $("banner").hidden = false;
+  $("btnFlee").hidden = false;
+  resetFleeBtn();
+  updateThreat(null);
+}
+
+const canLeaveFree = () => fight && !fight.started && !fight.timedStart;
+function resetFleeBtn() {
+  const b = $("btnFlee");
+  disarm(b);
+  b.textContent = canLeaveFree() ? (fight.where === "test" ? "Cancel" : "Run away")
+    : fight && (fight.openEnded || fight.overkill) ? "Finish"
+    : "Give up";
+}
+
+function renderFightHud() {
+  const f = fight;
+  if (!f) return;
+  $("fHits").textContent = f.reps;
+  $("fName").textContent = f.m.name;
+  $("fHp").textContent = f.openEnded ? "as many as you can"
+    : f.overkill ? `defeated · +${f.reps - f.total} extra`
+    : `${f.hpLeft} / ${f.total} HP`;
+  $("fHpFill").style.width = f.openEnded ? "100%" : (f.hpLeft / f.total) * 100 + "%";
+  const bits = [f.where === "dungeon"
+    ? `${DUNGEON.name} · floor ${state.run.floor} · room ${state.run.room + 1} of ${DUNGEON.floors[state.run.floor - 1].length}`
+    : f.label];
+  if (f.rounds.length > 1) bits.push(`round ${f.round + 1} of ${f.rounds.length}`);
+  $("fWhere").innerHTML = esc(bits.join(" · ")) + (f.m.slow ? ` <span class="chip slow">Slow reps · ${slowSecs(f.m)} s down</span>` : "");
+}
+
+const STATE_TEXT = {
+  lost: ["Can't see you. Show your whole body from the side.", "warn"],
+  idle: ["Back into plank!", "warn"],
+  up: ["Go down", ""],
+  down: ["Lower…", ""],
+  depth: ["Push up!", "good"],
+};
+function setBanner(text, kind) {
+  const b = $("banner");
+  if (b.textContent !== text) b.textContent = text;
+  const cls = "panel " + (kind || "");
+  if (b.className !== cls) b.className = cls;
+}
+function renderBanner() {
+  if (!fight || fight.over || rest || performance.now() < flashUntil) return;
+  const st = plankState();
+  const slow = fight.m.slow ? ` Slow reps: ${slowSecs(fight.m)} s going down.` : "";
+  if (!fight.started && (st === "idle" || st === "lost")) {
+    if (st === "lost") setBanner(STATE_TEXT.lost[0], "warn");
+    else if (fight.timedStart) setBanner("Get into plank! The monster is coming." + slow, "");
+    else setBanner("Get into plank. The timer starts with your first rep." + slow, "");
+    return;
+  }
+  const key = st === "down" && tracker.counter.cycle?.depth ? "depth" : st;
+  if (fight.m.slow && (key === "up" || key === "down")) {
+    setBanner(`Go down slowly · ${slowSecs(fight.m)} s`, "");
+    return;
+  }
+  const [text, kind] = STATE_TEXT[key] || STATE_TEXT.up;
+  setBanner(text, kind);
+}
+function flash(text, kind, ms) {
+  flashUntil = performance.now() + ms;
+  setBanner(text, kind);
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { flashUntil = 0; renderBanner(); }, ms);
+}
+function replay(el, cls) { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+
+function updateThreat(left, total, label = "Attack in") {
+  const el = $("threat");
+  if (left == null) { el.hidden = true; return; }
+  el.hidden = false;
+  const secs = Math.ceil(left / 1000);
+  $("threatFill").style.width = Math.max(0, (left / total) * 100) + "%";
+  $("threatText").textContent = `${label} ${secs} s`;
+  const danger = left < 5000;
+  el.classList.toggle("danger", danger);
+  if (danger && secs !== lastBeep) { lastBeep = secs; sfx.tick(); }
+}
+
+// the set is over: a loss, except in the strength test or after the Champion is already down
+function stopSet(reason) {
+  if (fight.openEnded) finishTest();
+  else if (fight.overkill) win();
+  else lose(reason);
+}
+
+function fightTick() {
+  if (hiddenAt) return;
+  const t = performance.now();
+  if (rest) { restTick(t); return; }
+  if (!fight || fight.over) return;
+  // the timer only starts with the first counted rep, so getting into position never costs you the fight
+  if (!fight.started) {
+    if (fight.timedStart) {
+      const left = RULES.dungeonStartSec * 1000 - (t - fight.waitSince);
+      if (left <= 0) { lose("No rep in time after the break."); return; }
+      updateThreat(left, RULES.dungeonStartSec * 1000);
+    }
+    renderBanner();
+    return;
+  }
+  if (fight.leftSince && t - fight.leftSince > RULES.leavePlankSec * 1000) { stopSet("You left the plank position."); return; }
+  const left = RULES.maxPauseSec * 1000 - (t - fight.lastRepAt);
+  if (left <= 0) { stopSet(`No strict rep for ${RULES.maxPauseSec} seconds.`); return; }
+  updateThreat(left, RULES.maxPauseSec * 1000, fight.openEnded || fight.overkill ? "Set ends in" : "Attack in");
+  renderBanner();
+}
+setInterval(fightTick, 200);
+
+function onTrackFrame(m) {
+  $("debug").textContent = m
+    ? `elbow ${Math.round(m.elbow)}° · body ${Math.round(m.bodyBend)}° · knee ${Math.round(m.knee)}° · ${tracker.fps} fps`
+    : `no body found · ${tracker.fps} fps`;
+  // standing up or sitting back (seen clearly) for a few seconds ends the set
+  if (fight && fight.started && !fight.over && !rest && m && m.visible) {
+    fight.leftSince = m.horizontal ? 0 : fight.leftSince || performance.now();
+  }
+  renderBanner();
+}
+
+function noRep(reasons) {
+  sfx.norep();
+  say(reasons[0]);
+  flash("No rep: " + reasons.join(" · "), "bad", 1800);
+}
+
+function onRepEvent(ev) {
+  if (rest || !fight || fight.over) return;
+  if (ev.type === "depth") { sfx.depth(); return; }
+  if (ev.type === "rep") {
+    if (fight.m.slow && ev.downSecs != null && ev.downSecs < slowSecs(fight.m)) { noRep(["Too fast. Go down slowly"]); return; }
+    hit();
+  } else if (ev.type === "norep") {
+    noRep(ev.reasons);
+  }
+}
+
+function hit() {
+  const f = fight;
+  if (!f.started) {
+    f.started = true;
+    resetFleeBtn();
+  }
+  f.reps++;
+  f.roundReps++;
+  f.maxSet = Math.max(f.maxSet, f.roundReps);
+  f.lastRepAt = performance.now();
+  lastBeep = 0;
+  sfx.hit();
+  replay($("fMonster"), "hit");
+  replay($("fHits"), "bump");
+  if (f.openEnded || f.overkill) {
+    renderFightHud();
+    say(String(f.reps));
+    flash(f.overkill ? `New record: ${f.reps}!` : `${f.reps}!`, "good", 900);
+    return;
+  }
+  f.hpLeft--;
+  f.roundLeft--;
+  renderFightHud();
+  if (f.hpLeft <= 0) {
+    if (f.where === "champion") {
+      f.overkill = true;
+      renderFightHud();
+      resetFleeBtn();
+      sfx.win();
+      say("Champion down! Keep going!");
+      flash("Champion down! Keep going for a bigger record", "good", 2200);
+      return;
+    }
+    win();
+    return;
+  }
+  if (f.roundLeft <= 0) { roundBreak(); return; }
+  say(String(f.reps));
+  flash(f.rounds.length > 1 ? `Hit! ${f.roundLeft} left this round` : `Hit! ${f.hpLeft} HP left`, "good", 1000);
+}
+
+function recordFight(f, won) {
+  const s = state.stats;
+  s.pushups += f.reps;
+  s.fights++;
+  s.bestSet = Math.max(s.bestSet, f.maxSet);
+  if (won) {
+    s.wins++;
+    s.biggestKill = Math.max(s.biggestKill, f.where === "champion" ? f.reps : f.m.hp);
+    state.kills[f.m.id] = (state.kills[f.m.id] || 0) + 1;
+  } else {
+    state.losses[f.m.id] = (state.losses[f.m.id] || 0) + 1;
+  }
+  state.history.unshift({
+    t: now(), id: f.m.id, name: f.m.name, hp: f.m.hp, reps: f.reps, won,
+    where: f.where === "dungeon" ? `Mine floor ${state.run ? state.run.floor : "?"}` : f.label,
+  });
+  state.history.length = Math.min(state.history.length, 40);
+}
+
+function levelUpLine(before, lines) {
+  const after = levelFromXp(state.xp);
+  if (after > before) {
+    lines.push(`<span class="levelup">Level up! You are level ${after}: ${esc(titleFor(after))}.</span>`);
+    sfx.levelUp();
+  }
+}
+
+function win() {
+  const f = fight;
+  f.over = true;
+  updateThreat(null);
+  const levelBefore = levelFromXp(state.xp);
+  const prevBest = state.stats.bestSet;
+  const gain = f.where === "champion" ? f.reps * RULES.championXpPerRep : rewardFor(f.m, f.where);
+  state.xp += gain;
+  recordFight(f, true);
+  const lines = [`+${gain} XP for ${f.m.name.startsWith("The ") ? "" : "the "}${esc(f.m.name)}.`];
+  if (f.maxSet > prevBest) lines.push(`New best set: ${f.maxSet} pushups!`);
+  sfx.win();
+
+  if (f.where !== "dungeon") {
+    if (f.where === "world") {
+      const { zi } = findMonster(f.m.id);
+      if (f.m.boss && zi + 1 === state.unlockedZones && zi + 1 < ZONES.length) {
+        state.unlockedZones++;
+        lines.push(`New area open: ${esc(ZONES[zi + 1].name)}.`);
+      }
+    }
+    if (f.where === "wander") { state.wandererDone = f.m.key; lines.push("It wanders off. Another one may come tomorrow."); }
+    if (f.where === "champion") lines.push(`The next Champion will have ${state.stats.bestSet + 1} HP.`);
+    levelUpLine(levelBefore, lines);
+    save();
+    say(f.where === "champion" ? `New record. ${f.reps}!` : `${f.m.name} defeated!`);
+    endFight("map");
+    resultModal({ tone: "won", eyebrow: "Victory", title: `${f.m.name} defeated`, lines,
+      buttons: `<button type="button" class="primary" data-action="closeModal">Back to the map</button>` });
+    return;
+  }
+
+  const run = state.run;
+  run.room++;
+  const rooms = DUNGEON.floors[run.floor - 1];
+  if (run.room < rooms.length) {
+    levelUpLine(levelBefore, lines);
+    save();
+    say(`${f.m.name} defeated! Rest.`);
+    mineBreak(RULES.restBetweenRoomsSec, `Room ${run.room} cleared`, lines);
+    return;
+  }
+
+  // last room done: safe room
+  const cleared = run.floor;
+  const bonus = RULES.floorBonusXp * cleared;
+  state.xp += bonus;
+  state.stats.deepestFloor = Math.max(state.stats.deepestFloor, cleared);
+  state.dungeonFloor = cleared + 1;
+  state.run = null;
+  lines.push(`Safe room reached! Floor ${cleared} is saved. +${bonus} XP.`);
+  levelUpLine(levelBefore, lines);
+  save();
+  say("Safe room reached!");
+  endFight("dungeon");
+  const more = state.dungeonFloor <= DUNGEON.floors.length;
+  resultModal({ tone: "won", eyebrow: "Victory", title: `Floor ${cleared} cleared`, lines,
+    buttons: (more ? `<button type="button" class="primary" data-action="deeper">Go deeper: floor ${state.dungeonFloor}</button>` : "")
+      + `<button type="button"${more ? "" : ' class="primary"'} data-action="closeModal">Leave the mine</button>` });
+}
+
+function lose(reason) {
+  const f = fight;
+  const where = f ? f.where : "dungeon";
+  const prevBest = state.stats.bestSet;
+  let prev = null;
+  if (f) {
+    prev = state.history.find(h => h.id === f.m.id || (!h.id && h.name === f.m.name));
+    f.over = true;
+    recordFight(f, false);
+  }
+  if (where === "wander") state.wandererDone = f.m.key;
+  rest = null;
+  updateThreat(null);
+  const t = now();
+  state.restUntil = t + RULES.restHoursAfterLoss * 3600e3;
+
+  const lines = [esc(reason)];
+  if (f) {
+    lines.push(f.rounds.length > 1
+      ? `You did ${f.reps} of ${f.total} (round ${f.round + 1} of ${f.rounds.length}).`
+      : `You did ${f.reps} of ${f.total}.`);
+    if (f.maxSet > prevBest) lines.push(`New best set: ${f.maxSet}! You got stronger, even in a loss.`);
+    else if (prev && f.reps > prev.reps) lines.push(`That's ${f.reps - prev.reps} more than your last try against it.`);
+    else if (f.total - f.reps <= 3) lines.push(`Only ${f.total - f.reps} short. Next time.`);
+    if (where === "champion") lines.push(`Your record stays at ${state.stats.bestSet}.`);
+  }
+  if (where === "dungeon") {
+    state.dungeonLockedUntil = t + RULES.dungeonLockDays * 86400e3;
+    lines.push(`${DUNGEON.name} is closed for ${RULES.dungeonLockDays} days, until ${fmtAt(state.dungeonLockedUntil)}. Then you start floor ${state.dungeonFloor} again.`);
+    state.run = null;
+  }
+  lines.push(`Your muscles need rest. Fights open again in ${RULES.restHoursAfterLoss} hours (${fmtAt(state.restUntil)}).`);
+  save();
+  sfx.lose();
+  say("Time to recover.");
+  endFight(where === "dungeon" ? "dungeon" : "map");
+  resultModal({ tone: "lost", eyebrow: "Recovering", title: f ? `${f.m.name} won this time` : "You left the mine", lines,
+    buttons: `<button type="button" class="primary" data-action="goto" data-to="camp">Back to camp</button>` });
+}
+
+function finishTest() {
+  const f = fight;
+  f.over = true;
+  updateThreat(null);
+  const reps = f.reps;
+  if (!reps) {
+    endFight("map");
+    resultModal({ tone: "info", eyebrow: "Strength test", title: "No reps counted",
+      lines: ["No strict pushup was counted. Check that the camera sees your whole body from the side, then try again."],
+      buttons: `<button type="button" class="primary" data-action="closeModal">OK</button>` });
+    return;
+  }
+  const levelBefore = levelFromXp(state.xp);
+  const s = state.stats;
+  s.pushups += reps;
+  s.bestSet = Math.max(s.bestSet, reps);
+  state.tested = true;
+  state.testResult = reps;
+  state.xp += reps;
+  const zi = startZoneFor(reps);
+  state.unlockedZones = Math.max(state.unlockedZones, zi + 1);
+  state.history.unshift({ t: now(), id: "test", name: "Strength test", hp: 0, reps, won: true, where: "Strength test" });
+  state.history.length = Math.min(state.history.length, 40);
+  const z = ZONES[zi], hps = z.monsters.map(m => m.hp);
+  const lines = [
+    `You did <b>${reps} strict pushup${reps === 1 ? "" : "s"}</b> in one set. +${reps} XP.`,
+    `Your starting area: <b>${esc(z.name)}</b> (${Math.min(...hps)}–${Math.max(...hps)} HP).`,
+    zi > 0 ? "The areas before it stay open for warm-ups and easy XP." : "Beat the monsters here, then the boss, to open the next area.",
+    `The Champion on the map now has your best set + 1: ${s.bestSet + 1} HP.`,
+  ];
+  levelUpLine(levelBefore, lines);
+  save();
+  sfx.win();
+  say(`${reps} pushups. Well done.`);
+  endFight("map");
+  resultModal({ tone: "won", eyebrow: "Strength test", title: `${reps} pushup${reps === 1 ? "" : "s"}`, lines,
+    buttons: `<button type="button" class="primary" data-action="closeModal">See the map</button>` });
+}
+
+function endFight(screen) {
+  fight = null;
+  rest = null;
+  tracker.stop();
+  $("restPanel").hidden = true;
+  show(screen);
+}
+
+function resultModal({ tone, eyebrow, title, lines, buttons }) {
+  openModal(`
+    <div class="result ${tone}">
+      <p class="eyebrow">${esc(eyebrow)}</p>
+      <h2 class="big">${esc(title)}</h2>
+    </div>
+    <ul class="lines">${lines.map(l => `<li>${l}</li>`).join("")}</ul>
+    <div class="row">${buttons}</div>`);
+}
+
+// ----- breaks: between rounds, or between mine rooms -----
+
+function startRest(o) {
+  rest = { endsAt: performance.now() + o.sec * 1000, beeped: 0, onDone: o.onDone, quitReason: o.quitReason };
+  $("restTitle").textContent = o.title;
+  $("restNext").innerHTML = o.next;
+  $("restWarn").textContent = o.warn;
+  const q = $("btnQuitRun");
+  disarm(q);
+  q.textContent = o.quitLabel;
+  $("restPanel").hidden = false;
+  $("banner").hidden = true;
+  $("btnFlee").hidden = true;
+  updateThreat(null);
+  restTick(performance.now());
+}
+function restTick(t) {
+  const left = rest.endsAt - t;
+  $("restTime").textContent = fmtClock(left);
+  const secs = Math.ceil(left / 1000);
+  if (left > 0 && secs <= 3 && secs !== rest.beeped) { rest.beeped = secs; sfx.tick(); }
+  if (left <= 0) endRest();
+}
+function endRest() {
+  if (!rest) return;
+  const next = rest.onDone;
+  rest = null;
+  next();
+}
+
+function roundBreak() {
+  const f = fight;
+  f.round++;
+  f.roundLeft = f.rounds[f.round];
+  sfx.win();
+  say(`Round ${f.round} done. Rest.`);
+  renderFightHud();
+  startRest({
+    sec: RULES.roundRestSec,
+    title: `Round ${f.round} of ${f.rounds.length} done`,
+    next: `Next: round ${f.round + 1}, <b>${f.roundLeft} pushups</b>. ${f.hpLeft} HP left in total.`,
+    quitLabel: "Give up",
+    quitReason: "You gave up between rounds.",
+    warn: "Giving up counts as a loss.",
+    onDone: resumeRound,
+  });
+}
+function resumeRound() {
+  const f = fight;
+  const t = performance.now();
+  Object.assign(f, { started: false, timedStart: true, waitSince: t, lastRepAt: t, leftSince: 0, roundReps: 0 });
+  tracker.counter.reset();
+  showFightHud();
+  renderFightHud();
+  renderBanner();
+  say(`Round ${f.round + 1}. Get into plank.`);
+}
+
+function mineBreak(sec, title, lines) {
+  fight = null;
+  const run = state.run;
+  const rooms = DUNGEON.floors[run.floor - 1];
+  const next = rooms[run.room];
+  startRest({
+    sec,
+    title,
+    next: `${lines.length ? lines.join("<br>") + "<br>" : ""}Next: <b>${esc(next.name)}</b>, ${next.hp} HP (room ${run.room + 1} of ${rooms.length})${next.slow ? `<br><span class="chip slow">Slow reps · ${slowSecs(next)} s down</span>` : ""}`,
+    quitLabel: "Leave the mine",
+    quitReason: "You left the mine before the safe room.",
+    warn: `Leaving now closes the mine for ${RULES.dungeonLockDays} days.`,
+    onDone: () => beginFight(next, "dungeon", true, DUNGEON.name),
+  });
+  // show the next monster in the HUD during the break
+  $("fHits").textContent = "0";
+  $("fName").textContent = next.name;
+  $("fHp").textContent = `${next.hp} / ${next.hp} HP`;
+  $("fHpFill").style.width = "100%";
+  $("fWhere").textContent = `${DUNGEON.name} · floor ${run.floor} · next room`;
+}
+
+// ----- starting fights -----
+
+async function startFight(id) {
+  const r = resolveMonster(id);
+  if (!r || fight || state.run) return;
+  if (r.where !== "test" && (state.restUntil > now() || bossLock(r.m, r.zone))) return;
+  if (!(await openFightScreen("map"))) return;
+  beginFight(r.m, r.where, false, r.label);
+}
+async function enterFloor() {
+  const t = now();
+  if (fight || state.run || state.restUntil > t || state.dungeonLockedUntil > t || state.dungeonFloor > DUNGEON.floors.length) return;
+  state.run = { floor: state.dungeonFloor, room: 0 };
+  save();
+  if (!(await openFightScreen("dungeon"))) { state.run = null; save(); renderCurrent(); return; }
+  beginFight(DUNGEON.floors[state.run.floor - 1][0], "dungeon", false, DUNGEON.name);
+}
+async function continueRun() {
+  if (!state.run || fight) return;
+  if (!(await openFightScreen("dungeon"))) return;
+  mineBreak(60, "Back in the mine", []);
+}
+
+// ---------- controls ----------
+
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-action]");
+  if (!b || b.disabled) return;
+  const { action, to, id } = b.dataset;
+  if (action === "goto") { closeModal(); show(to); }
+  else if (action === "prefight") openPrefight(id);
+  else if (action === "fight") startFight(id);
+  else if (action === "closeModal") { closeModal(); renderCurrent(); }
+  else if (action === "enterFloor") enterFloor();
+  else if (action === "deeper") { closeModal(); enterFloor(); }
+  else if (action === "continueRun") continueRun();
+});
+
+$("btnFlee").addEventListener("click", e => {
+  if (!fight || fight.over) return;
+  if (canLeaveFree()) {
+    // not started yet: no penalty
+    const backTo = fight.where === "dungeon" ? "dungeon" : "map";
+    if (fight.where === "dungeon") { state.run = null; save(); }
+    endFight(backTo);
+    return;
+  }
+  if (fight.openEnded || fight.overkill) { stopSet("You finished."); return; }
+  confirmTap(e.currentTarget, "Tap again to give up", () => lose("You gave up."));
+});
+$("btnFightNow").addEventListener("click", endRest);
+$("btnQuitRun").addEventListener("click", e => confirmTap(e.currentTarget, "Tap again to confirm", () => {
+  const reason = rest ? rest.quitReason : "You gave up.";
+  rest = null;
+  lose(reason);
+}));
+$("btnSound").addEventListener("click", e => {
+  audio.on = !audio.on;
+  e.currentTarget.textContent = audio.on ? "Sound on" : "Sound off";
+  e.currentTarget.setAttribute("aria-pressed", String(audio.on));
+  if (audio.on) initAudio(); else hush();
+});
+$("dbgRep").addEventListener("click", () => { if (fight && !fight.over && !rest) hit(); });
+$("dbgNoRep").addEventListener("click", () => onRepEvent({ type: "norep", reasons: ["Go lower"] }));
+
+// a phone call or app switch pauses the fight timers instead of losing the fight
+document.addEventListener("visibilitychange", () => {
+  const t = performance.now();
+  if (document.hidden) { if (fight || rest) hiddenAt = t; return; }
+  if (!hiddenAt) return;
+  const d = t - hiddenAt;
+  hiddenAt = 0;
+  if (fight) { fight.lastRepAt += d; fight.waitSince += d; if (fight.leftSince) fight.leftSince += d; }
+  if (rest) rest.endsAt += d;
+});
+
+// ---------- start ----------
+
+applySettings();
+show("camp");
+saveIfMigrated();
+syncFromPc();
+// load body tracking early so the first fight starts fast
+setTimeout(() => tracker.ensureModel(state.settings.model).catch(() => {}), 1500);
+
+if (DEBUG) {
+  window.PushupRPG = {
+    get state() { return state; },
+    get fight() { return fight; },
+    get rest() { return rest; },
+    timeTravel(hours) { timeOffset += hours * 3600e3; renderCurrent(); },
+    skipRest() { if (rest) rest.endsAt = performance.now(); },
+    repEvent: ev => onRepEvent(ev),
+    wanderer: () => todaysWanderer(),
+  };
+}
