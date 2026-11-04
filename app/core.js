@@ -54,13 +54,20 @@ export function analyzePose(lm, w, h, prevSide) {
 
 // Rep = arms locked out -> elbows at depth -> locked out again, with body and legs straight the whole way.
 export function createRepCounter(getCfg) {
-  let state = "idle", cycle = null, count = 0, lostSince = 0;
+  // topAt: last moment the arms were straight (elbow >= top), where a slow rep's clock starts
+  let state = "idle", cycle = null, count = 0, lostSince = 0, topAt = 0;
   const summary = (c, t) => ({
     minElbow: Math.round(c.minElbow), maxBend: Math.round(c.maxBend), bendDir: c.bendDir,
     minKnee: Math.round(c.minKnee), secs: +((t - c.t0) / 1000).toFixed(1),
-    // time from leaving the top to reaching depth, for "slow reps" monsters
-    downSecs: c.depthAt ? +((c.depthAt - c.t0) / 1000).toFixed(1) : null,
+    downSecs: downSecs(c),
   });
+  // "slow reps" time: from straight arms to arriving at the bottom (first moment within 3° of the
+  // lowest angle), so a pause at the bottom doesn't count. Measuring only the middle of the way down
+  // timed about half of a real rep and turned honest 2 s reps into "too fast".
+  function downSecs(c) {
+    const low = c.trace.find(p => p.e <= c.minElbow + 3);
+    return low ? +((low.t - c.topAt) / 1000).toFixed(1) : null;
+  }
 
   function update(m, t) {
     const cfg = getCfg();
@@ -80,15 +87,17 @@ export function createRepCounter(getCfg) {
     if (state === "lost") setState("idle");
 
     if (state === "idle") {
-      if (m.horizontal && m.knee >= cfg.knee && m.elbow >= cfg.top) setState("up");
+      if (m.horizontal && m.knee >= cfg.knee && m.elbow >= cfg.top) { topAt = t; setState("up"); }
     } else if (state === "up") {
+      if (m.elbow >= cfg.top) topAt = t;
       if (!m.horizontal) setState("idle");
       else if (m.elbow < cfg.top - 15) {
-        cycle = { t0: t, minElbow: m.elbow, maxBend: m.bodyBend, bendDir: m.bendDir, minKnee: m.knee, depth: false };
+        cycle = { t0: t, topAt: topAt || t, trace: [{ t, e: m.elbow }], minElbow: m.elbow, maxBend: m.bodyBend, bendDir: m.bendDir, minKnee: m.knee, depth: false };
         setState("down");
       }
     } else if (state === "down") {
       const c = cycle;
+      c.trace.push({ t, e: m.elbow });
       c.minElbow = Math.min(c.minElbow, m.elbow);
       if (m.bodyBend > c.maxBend) { c.maxBend = m.bodyBend; c.bendDir = m.bendDir; }
       c.minKnee = Math.min(c.minKnee, m.knee);
@@ -113,6 +122,7 @@ export function createRepCounter(getCfg) {
           ev.push({ type: "norep", reasons, ...s });
         }
         cycle = null;
+        topAt = t;
         setState("up");
       }
     }
@@ -121,7 +131,7 @@ export function createRepCounter(getCfg) {
 
   return {
     update,
-    reset() { state = "idle"; cycle = null; count = 0; lostSince = 0; },
+    reset() { state = "idle"; cycle = null; count = 0; lostSince = 0; topAt = 0; },
     get count() { return count; },
     get state() { return state; },
     get cycle() { return cycle; },

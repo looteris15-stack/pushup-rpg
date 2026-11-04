@@ -339,7 +339,7 @@ function openPrefight(id) {
     const rounds = m.rounds || [m.hp];
     // special rules go in highlighted boxes so nobody misses them
     const special = [];
-    if (m.slow) special.push(["slow", `<b>Slow reps:</b> take at least <b>${slowSecs(m)} seconds going down</b>. Faster reps don't count. The way up can be normal speed. Fewer HP and ${RULES.specialXpMult}× XP to make up for it.`]);
+    if (m.slow) special.push(["slow", `<b>Slow reps:</b> take at least <b>${slowSecs(m)} seconds going down</b>, from straight arms to the bottom. Faster reps don't count, and after each rep you see how long it took. Holding at the bottom doesn't add time. The way up can be normal speed. Fewer HP and ${RULES.specialXpMult}× XP to make up for it.`]);
     if (rounds.length > 1) special.push(["torch", `<b>${rounds.length} rounds:</b> ${rounds.join(" + ")} pushups, with <b>${RULES.roundRestSec} s rest</b> between rounds. Each round is one set.`]);
     if (where === "champion") special.push(["torch", `<b>Record fight:</b> it has your best set + 1 HP. After it falls, <b>keep going</b> for a bigger record, then tap Finish.`]);
     if (where === "wander") special.push(["torch", `<b>Today only:</b> double XP. It's gone at midnight.`]);
@@ -694,24 +694,30 @@ function onTrackFrame(m) {
   renderBanner();
 }
 
-function noRep(reasons) {
+function noRep(reasons, spoken = reasons[0], ms = 1800) {
   sfx.norep();
-  say(reasons[0]);
-  flash("No rep: " + reasons.join(" · "), "bad", 1800);
+  say(spoken);
+  flash("No rep: " + reasons.join(" · "), "bad", ms);
 }
 
 function onRepEvent(ev) {
   if (rest || !fight || fight.over) return;
   if (ev.type === "depth") { sfx.depth(); return; }
   if (ev.type === "rep") {
-    if (fight.m.slow && ev.downSecs != null && ev.downSecs < slowSecs(fight.m)) { noRep(["Too fast. Go down slowly"]); return; }
-    hit();
+    const need = slowSecs(fight.m);
+    // slow monsters: tell the player how long the way down took, so they know how much slower to go
+    if (need && ev.downSecs != null && ev.downSecs < need) {
+      noRep([`Too fast: ${ev.downSecs.toFixed(1)} s down, need ${need} s`], `Too fast. ${ev.downSecs} seconds.`, 2600);
+      return;
+    }
+    hit(need ? ev.downSecs : null);
   } else if (ev.type === "norep") {
     noRep(ev.reasons);
   }
 }
 
-function hit() {
+// downSecs: how long the way down took, shown on slow monsters
+function hit(downSecs = null) {
   const f = fight;
   if (!f.started) {
     f.started = true;
@@ -749,7 +755,8 @@ function hit() {
   }
   if (f.roundLeft <= 0) { roundBreak(); return; }
   say(String(f.reps));
-  flash(f.rounds.length > 1 ? `Hit! ${f.roundLeft} left this round` : `Hit! ${f.hpLeft} HP left`, "good", 1000);
+  const took = downSecs != null ? ` ${downSecs.toFixed(1)} s down ·` : "";
+  flash(f.rounds.length > 1 ? `Hit!${took} ${f.roundLeft} left this round` : `Hit!${took} ${f.hpLeft} HP left`, "good", downSecs != null ? 1600 : 1000);
 }
 
 function recordFight(f, won) {
