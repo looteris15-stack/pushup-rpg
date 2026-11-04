@@ -151,8 +151,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   width: 100%; text-align: left; justify-content: stretch;
   padding-left: 8px;
 }
-.mmain { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; }
-.mchips { display: flex; flex-wrap: wrap; gap: 4px; }
+.mmain { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
+.mchips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .mthumb { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; display: block; background: var(--tint); border: 1px solid var(--line); }
 .portrait { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 0 auto; border-radius: 14px; object-fit: cover; border: 1px solid var(--line); }
 .beast { display: flex; align-items: center; gap: 10px; }

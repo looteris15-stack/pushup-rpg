@@ -307,13 +307,14 @@ function monsterRow(m, zone) {
   const lock = bossLock(m, zone);
   const note = lock ? `beat the others first (${lock.done}/${lock.total})` : k ? `✓ slain ×${k}` : "new";
   const tags = chips(m).trim();
-  // name, tags and note stack in the middle so a long note can't push into the HP on narrow phones
+  // name, note and tags stack in the middle so a long note can't push into the HP on narrow phones;
+  // the note sits right under the name on every row, the tags go last
   return `<button type="button" class="mrow${lock ? " locked" : ""}" data-action="prefight" data-id="${m.id}">
     ${thumb(m.id)}
     <span class="mmain">
       <span class="mname">${esc(m.name)}</span>
-      ${tags ? `<span class="mchips">${tags}</span>` : ""}
       <span class="mkills">${note}</span>
+      ${tags ? `<span class="mchips">${tags}</span>` : ""}
     </span>
     <span class="mhp">${m.hp} HP</span>
   </button>`;
