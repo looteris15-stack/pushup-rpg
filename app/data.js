@@ -125,6 +125,15 @@ export const WANDERERS = [
   { id: "storm-hawk", name: "Storm Hawk" },
 ];
 
+// Monsters that have a picture: img/monsters/<id>.jpg (512 px) and <id>-s.jpg (160 px).
+// Add new ones with tools\import-art.ps1, then list them here.
+export const ART = new Set([
+  "field-mouse", "cave-rat", "thorn-sprite", "old-badger",
+  "forest-goblin", "moss-slime", "grey-wolf", "goblin-chief",
+  "bog-leech", "swamp-lurker",
+]);
+export const artUrl = (id, small = false) => (ART.has(id) ? `img/monsters/${id}${small ? "-s" : ""}.jpg` : null);
+
 // Levels are only for show: they never change how much damage a rep does.
 export const TITLES = [
   [1, "Wanderer"],

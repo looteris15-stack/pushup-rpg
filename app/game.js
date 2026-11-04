@@ -1,5 +1,5 @@
 import { createTracker, initAudio, sfx, say, hush, audio } from "./core.js";
-import { RULES, ZONES, DUNGEON, WANDERERS, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs } from "./data.js";
+import { RULES, ZONES, DUNGEON, WANDERERS, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
 const SAVE_KEY = "pushupRPG.save.v1";
@@ -231,6 +231,17 @@ function levelInfo() {
   return { L, into: state.xp - base, need: next - base, title: titleFor(L) };
 }
 const tile = ([label, value]) => `<div class="tile panel"><span class="label">${label}</span><b>${value}</b></div>`;
+// small picture for lists; an empty tile keeps rows lined up when a monster has no picture yet
+const thumb = id => {
+  const url = artUrl(id, true);
+  return url ? `<img class="mthumb" src="${url}" alt="">` : '<span class="mthumb" aria-hidden="true"></span>';
+};
+function setFightArt(m) {
+  const url = artUrl(m.id);
+  const img = $("fArt");
+  img.hidden = !url;
+  if (url && img.getAttribute("src") !== url) img.src = url;
+}
 const chips = m => [
   m.boss ? '<span class="chip boss">Boss</span>' : "",
   m.rounds ? `<span class="chip">${m.rounds.length} rounds</span>` : "",
@@ -296,6 +307,7 @@ function monsterRow(m, zone) {
   const lock = bossLock(m, zone);
   const note = lock ? `beat the others first (${lock.done}/${lock.total})` : k ? `✓ slain ×${k}` : "new";
   return `<button type="button" class="mrow${lock ? " locked" : ""}" data-action="prefight" data-id="${m.id}">
+    ${thumb(m.id)}
     <span class="mname">${esc(m.name)} ${chips(m)}</span>
     <span class="mhp">${m.hp} HP</span>
     <span class="mkills">${note}</span>
@@ -340,7 +352,9 @@ function openPrefight(id) {
     : lock ? `<button type="button" disabled>Beat the other ${lock.total - lock.done} first</button>`
     : recovering && where !== "test" ? `<button type="button" disabled>Recovering: ${until(state.restUntil)}</button>`
     : `<button type="button" class="primary" data-action="fight" data-id="${m.id}">${start}</button>`;
+  const art = artUrl(m.id);
   openModal(`
+    ${art ? `<img class="portrait" src="${art}" alt="${esc(m.name)}">` : ""}
     <p class="eyebrow">${esc(label)}</p>
     <h2 class="big">${esc(m.name)}</h2>
     ${m.boss || m.slow || m.rounds ? `<p>${chips(m)}</p>` : ""}
@@ -401,7 +415,7 @@ function renderRecords() {
     .sort((a, b) => (typeof a.d.hp === "number" ? a.d.hp : 999) - (typeof b.d.hp === "number" ? b.d.hp : 999));
   $("recBeasts").innerHTML = rows.length
     ? `<thead><tr><th>Monster</th><th>Where</th><th class="num">HP</th><th class="num">Slain</th><th class="num">Lost to</th></tr></thead>
-       <tbody>${rows.map(({ id, d }) => `<tr><td>${esc(d.name)}</td><td>${esc(d.where)}</td><td class="num">${d.hp}</td><td class="num">${state.kills[id] || 0}</td><td class="num">${state.losses[id] || 0}</td></tr>`).join("")}</tbody>`
+       <tbody>${rows.map(({ id, d }) => `<tr><td><span class="beast">${thumb(id)}${esc(d.name)}</span></td><td>${esc(d.where)}</td><td class="num">${d.hp}</td><td class="num">${state.kills[id] || 0}</td><td class="num">${state.losses[id] || 0}</td></tr>`).join("")}</tbody>`
     : `<tbody><tr><td class="fine">No fights yet.</td></tr></tbody>`;
   $("recHistory").innerHTML = state.history.length
     ? state.history.map(h => h.id === "test"
@@ -570,6 +584,7 @@ function renderFightHud() {
   if (!f) return;
   $("fHits").textContent = f.reps;
   $("fName").textContent = f.m.name;
+  setFightArt(f.m);
   $("fHp").textContent = f.openEnded ? "as many as you can"
     : f.overkill ? `defeated · +${f.reps - f.total} extra`
     : `${f.hpLeft} / ${f.total} HP`;
@@ -991,6 +1006,7 @@ function mineBreak(sec, title, lines) {
   // show the next monster in the HUD during the break
   $("fHits").textContent = "0";
   $("fName").textContent = next.name;
+  setFightArt(next);
   $("fHp").textContent = `${next.hp} / ${next.hp} HP`;
   $("fHpFill").style.width = "100%";
   $("fWhere").textContent = `${DUNGEON.name} · floor ${run.floor} · next room`;
