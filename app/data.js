@@ -152,15 +152,31 @@ export const TITLES = [
   [16, "Beast Hunter"],
   [20, "Iron Arms"],
   [25, "Warden of the Wilds"],
-  [30, "Legend of the Forest"],
+  // later titles come about every 1-2 months at ~40 pushups a day
+  [30, "Bog Strider"],
+  [35, "Ridge Runner"],
+  [40, "Stone Breaker"],
+  [45, "Frost Walker"],
+  [50, "Giant Slayer"],
+  [55, "Ember Heart"],
+  [60, "Ash Walker"],
+  [66, "Deep Delver"],
+  [72, "Wyrm Hunter"],
+  [78, "Dragon Hunter"],
+  [85, "Legend of the Forest"],
+  [92, "Elder of the Wilds"],
+  [99, "Master of the Wilds"],
 ];
+
+// Levels stop at 99 (about 30,700 XP, roughly 25,000 pushups). XP keeps counting after that.
+export const MAX_LEVEL = 99;
 
 // total XP needed to reach level L
 export const xpForLevel = L => (L <= 1 ? 0 : Math.round(20 * Math.pow(L - 1, 1.6)));
 
 export function levelFromXp(xp) {
   let L = 1;
-  while (xp >= xpForLevel(L + 1)) L++;
+  while (L < MAX_LEVEL && xp >= xpForLevel(L + 1)) L++;
   return L;
 }
 

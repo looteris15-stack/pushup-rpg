@@ -1,5 +1,5 @@
 import { createTracker, initAudio, sfx, say, hush, audio } from "./core.js";
-import { RULES, ZONES, DUNGEON, WANDERERS, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
+import { RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
 const SAVE_KEY = "pushupRPG.save.v1";
@@ -229,8 +229,10 @@ function closeModal() {
 
 function levelInfo() {
   const L = levelFromXp(state.xp), base = xpForLevel(L), next = xpForLevel(L + 1);
+  if (L >= MAX_LEVEL) return { L, into: 1, need: 1, title: titleFor(L), max: true };
   return { L, into: state.xp - base, need: next - base, title: titleFor(L) };
 }
+const num = n => n.toLocaleString("en-US"); // 30690 -> "30,690"
 const tile = ([label, value]) => `<div class="tile panel"><span class="label">${label}</span><b>${value}</b></div>`;
 // small picture for lists; an empty tile keeps rows lined up when a monster has no picture yet
 const thumb = id => {
@@ -250,11 +252,13 @@ const chips = m => [
 ].join(" ");
 
 function renderCamp() {
-  const { L, into, need, title } = levelInfo();
+  const { L, into, need, title, max } = levelInfo();
   $("campLevel").textContent = L;
   $("campTitle").textContent = title;
   $("campXpFill").style.width = (into / need) * 100 + "%";
-  $("campXpText").textContent = `${state.xp} XP · ${need - into} XP to level ${L + 1}`;
+  $("campXpText").textContent = max
+    ? `${num(state.xp)} XP · Max level`
+    : `${num(state.xp)} XP · ${num(need - into)} XP to level ${L + 1}`;
   const t = now();
   const status =
     state.restUntil > t ? `<span class="chip warn">Recovering</span> Your muscles are resting after a hard set. Fights open in ${until(state.restUntil)} (${fmtAt(state.restUntil)}).`
@@ -787,7 +791,9 @@ function recordFight(f, won) {
 function levelUpLine(before, lines) {
   const after = levelFromXp(state.xp);
   if (after > before) {
-    lines.push(`<span class="levelup">Level up! You are level ${after}: ${esc(titleFor(after))}.</span>`);
+    const newTitle = titleFor(after) !== titleFor(before);
+    const top = after >= MAX_LEVEL ? " Max level reached!" : newTitle ? " New title!" : "";
+    lines.push(`<span class="levelup">Level up! You are level ${after}: ${esc(titleFor(after))}.${top}</span>`);
     sfx.levelUp();
   }
 }
