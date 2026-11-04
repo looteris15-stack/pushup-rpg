@@ -59,7 +59,7 @@ export function createRepCounter(getCfg) {
   const summary = (c, t) => ({
     minElbow: Math.round(c.minElbow), maxBend: Math.round(c.maxBend), bendDir: c.bendDir,
     minKnee: Math.round(c.minKnee), secs: +((t - c.t0) / 1000).toFixed(1),
-    downSecs: downSecs(c),
+    depth: c.depth, downSecs: downSecs(c),
   });
   // "slow reps" time: from straight arms to arriving at the bottom (first moment within 3° of the
   // lowest angle), so a pause at the bottom doesn't count. Measuring only the middle of the way down

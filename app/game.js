@@ -11,6 +11,7 @@ const DEFAULT_SETTINGS = { ...TESTED_STRICTNESS, strictV: STRICT_V, voice: true,
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`; // "1 hit", "2 hits"
 let timeOffset = 0; // debug only: pretend time has passed
 const now = () => Date.now() + timeOffset;
 
@@ -425,8 +426,8 @@ function renderRecords() {
     : `<tbody><tr><td class="fine">No fights yet.</td></tr></tbody>`;
   $("recHistory").innerHTML = state.history.length
     ? state.history.map(h => h.id === "test"
-      ? `<li class="won"><span><b>Strength test</b>: ${h.reps} pushups</span><span class="fine">${fmtAt(h.t)}</span></li>`
-      : `<li class="${h.won ? "won" : "lost"}"><span><b>${h.won ? "Won" : "Lost"}</b> vs ${esc(h.name)} (${h.hp} HP): ${h.reps} hits</span><span class="fine">${esc(h.where)} · ${fmtAt(h.t)}</span></li>`).join("")
+      ? `<li class="won"><span><b>Strength test</b>: ${plural(h.reps, "pushup")}</span><span class="fine">${fmtAt(h.t)}</span></li>`
+      : `<li class="${h.won ? "won" : "lost"}"><span><b>${h.won ? "Won" : "Lost"}</b> vs ${esc(h.name)} (${h.hp} HP): ${plural(h.reps, "hit")}</span><span class="fine">${esc(h.where)} · ${fmtAt(h.t)}</span></li>`).join("")
     : `<li class="fine">No fights yet.</li>`;
 }
 
@@ -481,7 +482,7 @@ $("btnRestore").addEventListener("click", e => {
     applySettings();
     renderSettings();
     $("restoreText").value = "";
-    $("backupMsg").textContent = `Restored: level ${levelFromXp(state.xp)}, ${state.stats.pushups} pushups done.`;
+    $("backupMsg").textContent = `Restored: level ${levelFromXp(state.xp)}, ${plural(state.stats.pushups, "pushup")} done.`;
   });
 });
 
@@ -712,6 +713,9 @@ function onRepEvent(ev) {
     }
     hit(need ? ev.downSecs : null);
   } else if (ev.type === "norep") {
+    // before the first counted rep, moves that never reached the bottom are just getting into
+    // position (dropping to the knees, shifting the hands), so they don't buzz
+    if (!fight.started && ev.depth === false) return;
     noRep(ev.reasons);
   }
 }
@@ -796,7 +800,7 @@ function win() {
   state.xp += gain;
   recordFight(f, true);
   const lines = [`+${gain} XP for ${f.m.name.startsWith("The ") ? "" : "the "}${esc(f.m.name)}.`];
-  if (f.maxSet > prevBest) lines.push(`New best set: ${f.maxSet} pushups!`);
+  if (f.maxSet > prevBest) lines.push(`New best set: ${plural(f.maxSet, "pushup")}!`);
   sfx.win();
 
   if (f.where !== "dungeon") {
@@ -920,7 +924,7 @@ function finishTest() {
   levelUpLine(levelBefore, lines);
   save();
   sfx.win();
-  say(`${reps} pushups. Well done.`);
+  say(`${plural(reps, "pushup")}. Well done.`);
   endFight("map");
   resultModal({ tone: "won", eyebrow: "Strength test", title: `${reps} pushup${reps === 1 ? "" : "s"}`, lines,
     buttons: `<button type="button" class="primary" data-action="closeModal">See the map</button>` });
