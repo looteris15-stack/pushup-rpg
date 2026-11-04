@@ -129,8 +129,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   border-color: rgba(240, 168, 60, 0.45);
 }
 .special b { font: 700 19px/1.2 var(--display); }
-.special > span:not(.eyebrow) { font-size: 13px; color: var(--muted); font-weight: 500; }
+.special > span:not(.eyebrow):not(.stext) { font-size: 13px; color: var(--muted); font-weight: 500; }
 .special.done { opacity: 0.6; border-color: var(--line); }
+.special.has-art { flex-direction: row; align-items: center; gap: 14px; }
+.special.has-art .mthumb { width: 64px; height: 64px; flex: none; }
+.stext { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; }
+.stext > span:not(.eyebrow) { font-size: 13px; color: var(--muted); font-weight: 500; }
+.stext b { font: 700 19px/1.2 var(--display); }
+.rooms .beast .mthumb { width: 36px; height: 36px; flex: none; }
+.rooms .beast > span:last-child { min-width: 0; }
 .chip.slow { background: rgba(150, 185, 255, 0.15); color: #a9c4ff; }
 .callout { padding: 12px 14px; border-radius: 10px; border: 1px solid; font-size: 15px; }
 .callout.slow { background: rgba(150, 185, 255, 0.12); border-color: rgba(150, 185, 255, 0.55); }

@@ -130,7 +130,14 @@ export const WANDERERS = [
 export const ART = new Set([
   "field-mouse", "cave-rat", "thorn-sprite", "old-badger",
   "forest-goblin", "moss-slime", "grey-wolf", "goblin-chief",
-  "bog-leech", "swamp-lurker",
+  "bog-leech", "swamp-lurker", "bog-troll", "mire-king",
+  "ridge-boar", "shadow-lynx", "stone-golem", "elder-bear",
+  "ice-wraith", "frost-giant", "white-wyrm",
+  "ember-hound",
+  "champion",
+  "wanderer-golden-boar", "wanderer-lost-knight", "wanderer-will-o-wisp",
+  "wanderer-night-stalker", "wanderer-hermit-troll", "wanderer-storm-hawk",
+  "mine-1-1", "mine-1-2", "mine-1-3", "mine-2-1", "mine-2-2", "mine-2-3", "mine-3-1", "mine-3-2", "mine-3-3",
 ]);
 export const artUrl = (id, small = false) => (ART.has(id) ? `img/monsters/${id}${small ? "-s" : ""}.jpg` : null);
 

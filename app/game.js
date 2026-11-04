@@ -278,18 +278,20 @@ function renderMap() {
       <span class="eyebrow">Start here</span><b>Strength test</b>
       <span>Do as many strict pushups as you can. It picks your starting area.</span></button>`);
   } else {
-    cards.push(`<button type="button" class="special panel" data-action="prefight" data-id="champion">
+    cards.push(`<button type="button" class="special panel has-art" data-action="prefight" data-id="champion">
+      ${thumb("champion")}<span class="stext">
       <span class="eyebrow">Champion's Ring</span><b>The Champion · ${state.stats.bestSet + 1} HP</b>
-      <span>Your best set + 1. Beat it for a new record, then keep going.</span></button>`);
+      <span>Your best set + 1. Beat it for a new record, then keep going.</span></span></button>`);
   }
   const w = todaysWanderer();
   if (w && state.wandererDone === w.key) {
     cards.push(`<div class="special panel done"><span class="eyebrow">Wandering monster</span><b>${esc(w.name)} is gone</b>
       <span>You already fought it today. Another one may come tomorrow.</span></div>`);
   } else if (w) {
-    cards.push(`<button type="button" class="special panel" data-action="prefight" data-id="${w.id}">
+    cards.push(`<button type="button" class="special panel has-art" data-action="prefight" data-id="${w.id}">
+      ${thumb(w.id)}<span class="stext">
       <span class="eyebrow">Wandering monster · today only</span><b>${esc(w.name)} · ${w.hp} HP ${chips(w)}</b>
-      <span>Double XP (${rewardFor(w, "wander")}). Gone at midnight.</span></button>`);
+      <span>Double XP (${rewardFor(w, "wander")}). Gone at midnight.</span></span></button>`);
   }
   $("mapSpecial").innerHTML = cards.join("");
 
@@ -395,7 +397,7 @@ function renderDungeon() {
   $("dgFloor").innerHTML = `
     <div class="m-row"><h2>Floor ${shown} of ${total}</h2><span class="hp-range">${sum} pushups in total</span></div>
     <ol class="rooms">
-      ${rooms.map((m, i) => `<li class="${i < done ? "done" : i === done ? "next" : ""}"><span>Room ${i + 1}: <b>${esc(m.name)}</b> ${chips(m)}</span><span class="mhp">${m.hp} HP</span></li>`).join("")}
+      ${rooms.map((m, i) => `<li class="${i < done ? "done" : i === done ? "next" : ""}"><span class="beast">${thumb(m.id)}<span>Room ${i + 1}: <b>${esc(m.name)}</b> ${chips(m)}</span></span><span class="mhp">${m.hp} HP</span></li>`).join("")}
       <li class="safe"><span>Safe room</span><span>progress saved</span></li>
     </ol>
     ${button ? `<div class="row">${button}</div>` : ""}`;
