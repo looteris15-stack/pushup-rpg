@@ -22,6 +22,7 @@ function freshState(settings = DEFAULT_SETTINGS) {
     v: 1, rev: 0, savedAt: 0,
     xp: 0, restUntil: 0, dungeonLockedUntil: 0, dungeonFloor: 1, run: null, unlockedZones: 1,
     tested: false, testResult: 0, wandererDone: "",
+    lastBackupAt: 0, backupFights: 0, // when the last backup was made, and stats.fights at that time
     kills: {}, losses: {}, history: [],
     stats: { pushups: 0, fights: 0, wins: 0, bestSet: 0, biggestKill: 0, deepestFloor: 0 },
     settings: { ...settings },
@@ -76,9 +77,9 @@ function pushToPc() {
 }
 async function syncFromPc() {
   if (!PC_SAVE) {
-    $("syncStatus").textContent = "Progress is saved on this phone. Copy a backup code in Settings now and then.";
-    // ask the browser not to clear this site's storage when space runs low
-    try { navigator.storage?.persist?.(); } catch {}
+    // the camp shows where progress is saved and when the last backup was;
+    // checkStorage asks Chrome not to clean this site's storage when space runs low
+    checkStorage();
     return;
   }
   try {
@@ -267,6 +268,15 @@ function renderCamp() {
   const test = state.tested ? ""
     : `<div class="row"><button type="button" class="primary" data-action="prefight" data-id="test">Take the strength test</button><span class="fine">It picks the area where you start.</span></div>`;
   $("campStatus").innerHTML = status + test;
+  const b = backupInfo();
+  $("backupNag").hidden = !b.overdue;
+  if (b.overdue) {
+    $("backupNag").innerHTML = `<span class="chip warn">Backup</span> ${b.days == null
+      ? "Your progress has no backup yet."
+      : `Last backup: ${b.when}, with ${plural(b.fightsSince, "fight")} since then.`} If Chrome's data gets cleared, a backup is the only way back.
+      <div class="row"><button type="button" class="primary" data-action="backupNow">Back up now</button></div>`;
+  }
+  if (!PC_SAVE) $("syncStatus").textContent = `Progress is saved on this phone. Last backup: ${b.when}.`;
   const s = state.stats;
   $("campTiles").innerHTML = [["Pushups done", s.pushups], ["Best set", s.bestSet], ["Monsters slain", s.wins], ["Deepest floor", s.deepestFloor]].map(tile).join("");
 }
@@ -443,6 +453,20 @@ function renderSettings() {
   $("sVoice").checked = state.settings.voice;
   $("sCamera").value = state.settings.camera;
   $("sModel").value = state.settings.model;
+  const b = backupInfo();
+  $("backupWhen").innerHTML = `Last backup: <b>${b.when}</b>${b.days != null && b.fightsSince > 0 ? ` (${plural(b.fightsSince, "fight")} since)` : ""}`;
+  $("storageNote").textContent = storageSafe == null ? ""
+    : storageSafe ? "Chrome protects this game's storage from automatic cleanup. Clearing Chrome's data by hand still deletes it."
+    : "Chrome may clean this game's storage if the phone runs low on space. Keep backups.";
+}
+// can Chrome clean up our storage by itself? (installed apps and often-used sites usually get protected)
+let storageSafe = null;
+async function checkStorage() {
+  try {
+    if (!PC_SAVE && !(await navigator.storage.persisted())) await navigator.storage.persist();
+    storageSafe = await navigator.storage.persisted();
+  } catch { storageSafe = null; }
+  if (current === "settings") renderSettings();
 }
 function applySettings() {
   audio.voice = state.settings.voice;
@@ -454,10 +478,76 @@ $("sVoice").addEventListener("change", e => { state.settings.voice = e.target.ch
 $("sCamera").addEventListener("change", e => { state.settings.camera = e.target.value; saveSoon(); });
 $("sModel").addEventListener("change", e => { state.settings.model = e.target.value; saveSoon(); tracker.ensureModel(e.target.value).catch(() => {}); });
 $("btnDefaults").addEventListener("click", () => { Object.assign(state.settings, TESTED_STRICTNESS); renderSettings(); saveSoon(); });
-// backup code = the whole save as text, so progress can move to another link or phone
+// ---------- backups ----------
+// The save lives in the phone's browser. If its data gets cleared, a backup is the only way back.
+// backup code = the whole save as text, so progress can move to another link or phone.
 const BACKUP_PREFIX = "PRPG1.";
+const backupCode = () => BACKUP_PREFIX + btoa(asciiJson(state));
+const backupName = () => {
+  const d = new Date(now()), p = n => String(n).padStart(2, "0");
+  return `pushup-rpg-backup-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.txt`; // local date, not UTC
+};
+const backupText = () =>
+  `Pushup RPG backup · level ${levelFromXp(state.xp)} · ${plural(state.stats.pushups, "pushup")} · ${fmtAt(now())}\n` +
+  `To restore: open the game, Settings → Backup → Open backup file, or paste this whole text there.\n\n${backupCode()}\n`;
+
+// read a backup out of any text: a pasted code, a whole message, or a backup file
+function readBackup(text) {
+  const m = /PRPG1\.([A-Za-z0-9+/=\s]+)/.exec(text || "");
+  if (!m) return null;
+  const b64 = m[1].replace(/\s+/g, "");
+  // words after the code (an email signature, "sent from my phone") stick to it once spaces are
+  // removed, so cut letters off the end until it reads as a save again
+  for (let end = b64.length; end > 0 && end > b64.length - 400; end--) {
+    try { const s = JSON.parse(atob(b64.slice(0, end))); if (s && typeof s === "object" && s.stats) return s; } catch {}
+  }
+  return null;
+}
+
+function backupInfo() {
+  const fightsSince = state.stats.fights - (state.backupFights || 0);
+  const days = state.lastBackupAt ? Math.floor((now() - state.lastBackupAt) / 86400000) : null;
+  const when = days == null ? "never" : days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
+  // nag only when there is something new to lose: never backed up, a week old, or many fights since
+  const overdue = state.stats.fights > 0 && fightsSince > 0 && (days == null || days >= 7 || fightsSince >= 20);
+  return { fightsSince, days, when, overdue };
+}
+function markBackedUp(msg) {
+  state.lastBackupAt = now();
+  state.backupFights = state.stats.fights;
+  save();
+  $("backupMsg").textContent = msg;
+  renderCurrent();
+}
+
+// one tap: the phone's share menu, so the backup file goes to Google Drive, email, Messenger...
+async function shareBackup() {
+  const text = backupText();
+  const file = new File([text], backupName(), { type: "text/plain" });
+  try {
+    if (navigator.canShare?.({ files: [file] })) await navigator.share({ files: [file], title: "Pushup RPG backup" });
+    else if (navigator.share) await navigator.share({ title: "Pushup RPG backup", text });
+    else { downloadBackup(); return; }
+    markBackedUp("Backup sent. Keep it somewhere safe, like Google Drive or an email to yourself.");
+  } catch (e) {
+    if (e?.name === "AbortError") { $("backupMsg").textContent = "Backup not sent."; return; }
+    downloadBackup();
+  }
+}
+function downloadBackup() {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([backupText()], { type: "text/plain" }));
+  a.download = backupName();
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  markBackedUp(`Backup file saved (${backupName()}), usually in your Downloads folder.`);
+}
+$("btnShareBackup").addEventListener("click", shareBackup);
+$("btnSaveBackup").addEventListener("click", downloadBackup);
 $("btnBackup").addEventListener("click", () => {
-  const code = BACKUP_PREFIX + btoa(asciiJson(state));
+  const code = backupCode();
   const box = $("backupText");
   const showBox = () => {
     box.value = code;
@@ -466,16 +556,24 @@ $("btnBackup").addEventListener("click", () => {
     $("backupMsg").textContent = "Select all of the code above and copy it.";
   };
   if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(code).then(() => { $("backupMsg").textContent = "Backup code copied. Paste it into a note to keep it."; }, showBox);
+    navigator.clipboard.writeText(code).then(() => markBackedUp("Backup code copied. Paste it into a note to keep it."), showBox);
   } else {
     showBox();
   }
 });
+$("restoreFile").addEventListener("change", async e => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = "";
+  if (!f) return;
+  const text = await f.text().catch(() => "");
+  const s = readBackup(text);
+  if (!s) { $("backupMsg").textContent = "That file has no Pushup RPG backup in it."; return; }
+  $("restoreText").value = text;
+  $("backupMsg").textContent = `Backup found: level ${levelFromXp(s.xp || 0)}, ${plural((s.stats && s.stats.pushups) || 0, "pushup")}. Tap Restore to use it.`;
+});
 $("btnRestore").addEventListener("click", e => {
-  const raw = $("restoreText").value.replace(/\s+/g, "");
-  let saved = null;
-  try { if (raw.startsWith(BACKUP_PREFIX)) saved = JSON.parse(atob(raw.slice(BACKUP_PREFIX.length))); } catch {}
-  if (!saved || typeof saved !== "object" || !saved.stats) {
+  const saved = readBackup($("restoreText").value);
+  if (!saved) {
     $("backupMsg").textContent = "That doesn't look like a backup code. Copy the whole code and try again.";
     return;
   }
@@ -484,11 +582,11 @@ $("btnRestore").addEventListener("click", e => {
     state = normalize(saved);
     needsSave = false;
     state.rev = Math.max(rev, state.rev || 0);
-    save();
     applySettings();
     renderSettings();
     $("restoreText").value = "";
-    $("backupMsg").textContent = `Restored: level ${levelFromXp(state.xp)}, ${plural(state.stats.pushups, "pushup")} done.`;
+    // the progress now equals the backup it came from, so it counts as backed up
+    markBackedUp(`Restored: level ${levelFromXp(state.xp)}, ${plural(state.stats.pushups, "pushup")} done.`);
   });
 });
 
@@ -1122,6 +1220,7 @@ document.addEventListener("click", e => {
   else if (action === "enterFloor") enterFloor();
   else if (action === "deeper") { closeModal(); enterFloor(); }
   else if (action === "continueRun") continueRun();
+  else if (action === "backupNow") shareBackup();
 });
 
 $("btnFlee").addEventListener("click", e => {

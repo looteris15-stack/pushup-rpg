@@ -50,6 +50,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .primary { background: var(--torch); color: var(--torch-ink); border-color: transparent; }
 .primary:hover { border-color: transparent; filter: brightness(1.08); }
 .danger-btn { color: var(--bad); }
+/* a file picker that looks like the other buttons */
+.file-btn { position: relative; cursor: pointer; }
+.file-btn input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-btn:focus-within { outline: 2px solid var(--torch); outline-offset: 2px; }
 
 .panel {
   background: var(--panel);
