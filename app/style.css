@@ -168,7 +168,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .mmain { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; min-width: 0; }
 .mchips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .mthumb { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; display: block; background: var(--tint); border: 1px solid var(--line); }
-.portrait { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 0 auto; border-radius: 14px; object-fit: cover; border: 1px solid var(--line); }
+.portrait { display: block; width: min(100%, 320px, 34vh); aspect-ratio: 1; margin: 0 auto; border-radius: 14px; object-fit: cover; border: 1px solid var(--line); }
 .beast { display: flex; align-items: center; gap: 10px; }
 .beast .mthumb { width: 34px; height: 34px; }
 .mname { font-weight: 700; overflow-wrap: anywhere; }
@@ -241,6 +241,12 @@ output { color: var(--torch); font-family: var(--display); font-weight: 700; fon
   display: flex; flex-direction: column; gap: 14px;
 }
 .big { font: 800 clamp(26px, 7vw, 36px)/1.05 var(--display); }
+/* the Fight / Back buttons stay at the bottom of the screen while the info above scrolls */
+.card .actions {
+  position: sticky; bottom: calc(-24px - env(safe-area-inset-bottom, 0px)); z-index: 1;
+  margin: 0 -22px -22px; padding: 12px 22px calc(14px + env(safe-area-inset-bottom, 0px));
+  background: var(--panel-solid); border-top: 1px solid var(--line); border-radius: 0 0 16px 16px;
+}
 .hpbig { font: 800 56px/1 var(--display); color: var(--bad); font-variant-numeric: tabular-nums; }
 .hpbig span { font-size: 18px; color: var(--muted); margin-left: 4px; }
 .lines { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }

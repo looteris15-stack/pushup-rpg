@@ -1,4 +1,4 @@
-import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles, downSecsOf } from "./core.js";
+import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake } from "./core.js";
 import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
@@ -22,6 +22,7 @@ function freshState(settings = DEFAULT_SETTINGS) {
     v: 1, rev: 0, savedAt: 0,
     xp: 0, restUntil: 0, dungeonLockedUntil: 0, dungeonFloor: 1, run: null, unlockedZones: 1,
     tested: false, testResult: 0, wandererDone: "",
+    wanderToday: null, // { key, hp }: today's wandering monster keeps the HP it had when first seen
     lastBackupAt: 0, backupFights: 0, // when the last backup was made, and stats.fights at that time
     fightMark: null, // a fight that has started (see markFight), so closing the game still counts it
     kills: {}, losses: {}, history: [],
@@ -42,18 +43,43 @@ function normalize(s) {
 function saveIfMigrated() {
   if (needsSave) { needsSave = false; save(); }
 }
+// a save that can't be read is kept under its own key, so starting over never destroys it
+let brokenSave = false, saveFailed = false;
 function loadLocal() {
+  let raw = null;
   try {
-    const raw = localStorage.getItem(SAVE_KEY);
+    raw = localStorage.getItem(SAVE_KEY);
     return raw ? normalize(JSON.parse(raw)) : freshState();
   } catch {
+    if (raw) {
+      brokenSave = true;
+      try { if (!localStorage.getItem(SAVE_KEY + ".broken")) localStorage.setItem(SAVE_KEY + ".broken", raw); } catch {}
+    }
     return freshState();
   }
 }
 let state = loadLocal();
 function storeLocal() {
-  try { localStorage.setItem(SAVE_KEY, JSON.stringify(state)); } catch {}
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(state)); saveFailed = false; }
+  catch { saveFailed = true; } // storage full or blocked: the camp shows a warning
 }
+function storedSave() {
+  try { const raw = localStorage.getItem(SAVE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+// The installed app and a Chrome tab (or two tabs) share one save. When another window saves newer
+// progress, this one takes it over, so an older window can never save over it.
+function adoptIfNewer() {
+  const s = storedSave();
+  if (!s || !((s.rev || 0) > (state.rev || 0))) return false;
+  state = normalize(s);
+  needsSave = false;
+  applySettings();
+  if (current !== "fight") renderCurrent();
+  return true;
+}
+window.addEventListener("storage", e => { if (e.key === SAVE_KEY) adoptIfNewer(); });
+window.addEventListener("pageshow", e => { if (e.persisted) adoptIfNewer(); });
+window.addEventListener("focus", () => adoptIfNewer());
 
 // Run from the PC (start.ps1), the server keeps a copy in save\save.json, so progress survives a new phone link.
 // On a fixed web address (GitHub Pages) there is no PC copy: the save lives on the phone, plus backup codes.
@@ -63,6 +89,8 @@ const PC_SAVE = !location.hostname.endsWith("github.io");
 let pcChecked = false;
 const asciiJson = s => JSON.stringify(s).replace(/[\u007f-￿]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
 function save() {
+  // another window saved newer progress since this one last looked: take that instead of saving over it
+  if (adoptIfNewer()) return;
   state.rev = (state.rev || 0) + 1;
   state.savedAt = Date.now();
   storeLocal();
@@ -92,6 +120,7 @@ async function syncFromPc() {
     setSync(true);
     if (remote.rev > state.rev) {
       state = remote;
+      brokenSave = false; // the PC copy replaced a save that couldn't be read
       storeLocal();
       applySettings();
       renderCurrent();
@@ -165,10 +194,15 @@ function todaysWanderer() {
   }
   const hps = ZONES[zi].monsters.filter(m => !m.slow && !m.rounds).map(m => m.hp);
   const lo = Math.min(...hps), hi = Math.max(...hps);
-  const hp = lo + ((h >>> 8) % (hi - lo + 1));
+  let hp = lo + ((h >>> 8) % (hi - lo + 1));
   // a slow-rep wanderer gets fewer HP, like the other slow monsters (3 s from Frost Peaks on)
   const slow = w.slow ? (zi >= 4 ? RULES.slowHardSec : RULES.slowDownSec) : 0;
-  return { ...w, id: `wanderer-${w.id}`, slow, hp: slow ? Math.round(hp * RULES.specialHpMult) : hp, key };
+  if (slow) hp = Math.round(hp * RULES.specialHpMult);
+  // it keeps the HP it had when first seen today, even if a new area opens later that day
+  const seen = state.wanderToday;
+  if (seen && seen.key === key) hp = seen.hp;
+  else { state.wanderToday = { key, hp }; saveSoon(); }
+  return { ...w, id: `wanderer-${w.id}`, slow, hp, key };
 }
 
 // everything you can fight from the map: { m, where, label, zone }
@@ -221,12 +255,15 @@ function renderCurrent() {
 
 function openModal(html, refresh = null) {
   $("modalCard").innerHTML = html;
+  if ($("modal").hidden) $("modal").scrollTop = 0; // a new sheet starts at the top; a redraw keeps its place
   $("modal").hidden = false;
   modalRefresh = refresh;
+  prefightId = null;
 }
 function closeModal() {
   $("modal").hidden = true;
   modalRefresh = null;
+  prefightId = null;
 }
 
 function levelInfo() {
@@ -269,6 +306,14 @@ function renderCamp() {
   const test = state.tested ? ""
     : `<div class="row"><button type="button" class="primary" data-action="prefight" data-id="test">Take the strength test</button><span class="fine">It picks the area where you start.</span></div>`;
   $("campStatus").innerHTML = status + test;
+  // problems with the save itself come first: they can cost progress
+  const warn = saveFailed
+    ? `<span class="chip bad">Not saving</span> Saving doesn't work right now (the phone's storage may be full or blocked). Free some space, then make a backup in Settings.`
+    : brokenSave
+    ? `<span class="chip bad">Save damaged</span> Your saved progress couldn't be read, so the game started fresh. A copy of it was kept. If you have a backup, restore it in Settings → Backup.`
+    : "";
+  $("saveWarn").hidden = !warn;
+  $("saveWarn").innerHTML = warn;
   const b = backupInfo();
   $("backupNag").hidden = !b.overdue;
   if (b.overdue) {
@@ -345,33 +390,35 @@ function openPrefight(id) {
   const recovering = state.restUntil > now();
   const lock = bossLock(m, zone);
   let body, start = "Fight";
+  // the phone refused to keep the screen on: it could switch off mid-set, which counts as leaving
+  const screenWarn = screenOk === false
+    ? `<p class="callout leave"><b>Your screen may turn off:</b> the phone won't keep it on right now (often battery saver). Turn battery saver off or set the screen timeout to 2 minutes or more first.</p>`
+    : "";
   if (where === "test") {
     start = "Start the test";
     body = `<p>Do <b>as many strict pushups as you can</b> in one set. Your result picks the area where you start.</p>
+      ${screenWarn}
       <ul class="rules">
-        <li>Take your time getting into position. The timer starts with your first strict rep.</li>
-        <li>After that, it ends when you stop for ${RULES.maxPauseSec} seconds, stand up, or tap Finish.</li>
+        <li>The timer starts with your first strict rep. Then it ends when you stop for ${RULES.maxPauseSec} s, stand up, or tap Finish.</li>
         <li>This is not a fight: no rest time afterwards.</li>
       </ul>`;
   } else {
     const rounds = m.rounds || [m.hp];
-    // special rules go in highlighted boxes so nobody misses them
+    // special rules go in highlighted boxes so nobody misses them (kept short: the Fight button must stay in reach)
     const special = [];
-    if (m.slow) special.push(["slow", `<b>Slow reps:</b> take at least <b>${slowSecs(m)} seconds going down</b>, from straight arms to the bottom. Faster reps don't count, and after each rep you see how long it took. Holding at the bottom doesn't add time. The way up can be normal speed. Fewer HP and ${RULES.specialXpMult}× XP to make up for it.`]);
-    if (rounds.length > 1) special.push(["torch", `<b>${rounds.length} rounds:</b> ${rounds.join(" + ")} pushups, with <b>${RULES.roundRestSec} s rest</b> between rounds. Each round is one set.`]);
-    if (where === "champion") special.push(["torch", `<b>Record fight:</b> it has your best set + 1 HP. After it falls, <b>keep going</b> for a bigger record, then tap Finish.`]);
+    if (m.slow) special.push(["slow", `<b>Slow reps:</b> at least <b>${slowSecs(m)} s going down</b>, from straight arms to the bottom. A pause at the bottom doesn't count. You see your time after each rep. Fewer HP, ${RULES.specialXpMult}× XP.`]);
+    if (rounds.length > 1) special.push(["torch", `<b>${rounds.length} rounds:</b> ${rounds.join(" + ")} pushups, <b>${RULES.roundRestSec} s rest</b> between them. Each round is one set.`]);
+    if (where === "champion") special.push(["torch", `<b>Record fight:</b> your best set + 1 HP. When it falls, <b>keep going</b> for a bigger record, then tap Finish.`]);
     if (where === "wander") special.push(["torch", `<b>Today only:</b> double XP. It's gone at midnight.`]);
     // everyone sees this one: leaving mid-fight used to dodge the rest time
-    special.push(["leave", where === "champion"
-      ? `<b>Stay in the game:</b> once your first rep counts, leaving the app (closing it, switching apps or locking the phone) for more than ${RULES.leaveAppSec} seconds counts as giving up, with ${RULES.restHoursAfterLoss} hours of rest. After the Champion falls, leaving just ends your set and the record counts.`
-      : `<b>Stay in the game:</b> once your first rep counts, leaving the app (closing it, switching apps or locking the phone) for more than ${RULES.leaveAppSec} seconds counts as giving up, with ${RULES.restHoursAfterLoss} hours of rest.`]);
+    special.push(["leave", `<b>Stay in the game:</b> after your first rep, leaving the app for more than ${RULES.leaveAppSec} s (closing it, switching apps, locking the phone) counts as giving up.${where === "champion" ? " Once the Champion is down, leaving just ends your set." : ""}`]);
     const rules = [];
-    if (rounds.length === 1) rules.push(`Do <b>${m.hp} strict pushups in one set</b> to win. Each rep is 1 hit.`);
-    rules.push("Take your time getting into position. The timer starts with your first strict rep.");
-    rules.push(`After that: no strict rep for ${RULES.maxPauseSec} seconds, or you stand up, and the monster wins.`);
-    rules.push(`If it wins, you recover ${RULES.restHoursAfterLoss} hours before the next fight.`);
+    if (rounds.length === 1) rules.push(`<b>${m.hp} strict pushups in one set</b> win. Each rep is 1 hit.`);
+    rules.push(`The timer starts with your first strict rep. Then ${RULES.maxPauseSec} s without one, or standing up, and the monster wins.`);
+    rules.push(`If it wins, you rest ${RULES.restHoursAfterLoss} hours.`);
     const xp = rewardFor(m, where) + (where === "champion" ? " or more" : "");
     body = `<p class="hpbig">${m.hp}<span>HP</span></p>
+      ${screenWarn}
       ${special.map(([kind, text]) => `<p class="callout ${kind}">${text}</p>`).join("")}
       <ul class="rules">${rules.map(x => `<li>${x}</li>`).join("")}</ul>
       <p class="fine">Win: +${xp} XP. Your best set so far: ${state.stats.bestSet}.${state.kills[m.id] ? ` Slain ×${state.kills[m.id]}.` : ""}</p>`;
@@ -387,9 +434,17 @@ function openPrefight(id) {
     <h2 class="big">${esc(m.name)}</h2>
     ${m.boss || m.slow || m.rounds ? `<p>${chips(m)}</p>` : ""}
     ${body}
-    <div class="row">${button}<button type="button" data-action="closeModal">Back</button></div>`,
+    <div class="row actions">${button}<button type="button" data-action="closeModal">Back</button></div>`,
     () => openPrefight(id));
+  prefightId = id;
+  // ask the phone about keeping the screen on; show the warning if the answer changed
+  canKeepAwake().then(ok => {
+    if (ok === screenOk) return;
+    screenOk = ok;
+    if (prefightId === id && !$("modal").hidden) openPrefight(id);
+  });
 }
+let screenOk = null, prefightId = null;
 
 function renderDungeon() {
   const t = now(), F = state.dungeonFloor, run = state.run, total = DUNGEON.floors.length;
@@ -649,7 +704,8 @@ $("btnBackup").addEventListener("click", () => {
     $("backupMsg").textContent = "Select all of the code above and copy it.";
   };
   if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(code).then(() => markBackedUp("Backup code copied. Paste it into a note to keep it."), showBox);
+    // only copied, not kept anywhere yet, so this doesn't count as a backup (Send / Save as file do)
+    navigator.clipboard.writeText(code).then(() => { $("backupMsg").textContent = "Backup code copied. Paste it somewhere safe now, like a note or an email to yourself."; }, showBox);
   } else {
     showBox();
   }
@@ -767,6 +823,8 @@ function beginFight(m, where, timedStart, label) {
   showFightHud();
   renderFightHud();
   renderBanner();
+  // the phone refused to keep the screen on: say it now, before the first rep
+  if (tracker.awake === false) flash("Your screen may turn off (battery saver?). That would end the fight.", "warn", 6000);
   const secsWord = { 2: "two", 3: "three", 4: "four" }[slowSecs(m)] || String(slowSecs(m));
   say(`${timedStart ? `${m.name}. Get into plank. ` : ""}${m.slow ? `Slow reps. Take ${secsWord} seconds going down.` : ""}`);
 }
@@ -790,15 +848,26 @@ function markFight() {
   const f = fight;
   if (!committed(f)) return;
   state.fightMark = {
+    at: now(), // updated every rep: a fresh mark may still be in use by another window
     id: f.m.id, name: f.m.name, hp: f.m.hp, key: f.m.key || "", boss: !!f.m.boss,
     where: f.where, label: f.label, reps: f.reps, maxSet: f.maxSet, total: f.total,
     rounds: f.rounds, round: f.round, overkill: !!f.overkill,
   };
   save();
 }
-function settleLeftFight() {
+let settleTimer = 0;
+function settleLeftFight(force = false) {
   const mk = state.fightMark;
+  if (mk && fight) return; // this window is the one fighting
   if (mk) {
+    // a mark from the last 20 s may belong to a fight still going on in another window of the game:
+    // look again later (that window keeps updating it) instead of ending a fight that isn't over
+    const age = now() - (mk.at || 0);
+    if (!force && age >= 0 && age < 20000) {
+      clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => { adoptIfNewer(); settleLeftFight(); }, 20000 - age + 500);
+      return;
+    }
     state.fightMark = null;
     fight = {
       m: { id: mk.id, name: mk.name, hp: mk.hp, key: mk.key, boss: mk.boss }, where: mk.where, label: mk.label,
@@ -1335,6 +1404,8 @@ function mineBreak(sec, title, lines) {
 // ----- starting fights -----
 
 async function startFight(id) {
+  // an unfinished fight from a closed game is settled first, so a new fight can't wipe it away
+  if (state.fightMark && !fight) { closeModal(); settleLeftFight(true); return; }
   const r = resolveMonster(id);
   if (!r || fight || state.run) return;
   if (r.where !== "test" && (state.restUntil > now() || bossLock(r.m, r.zone))) return;
@@ -1342,6 +1413,7 @@ async function startFight(id) {
   beginFight(r.m, r.where, false, r.label);
 }
 async function enterFloor() {
+  if (state.fightMark && !fight) { closeModal(); settleLeftFight(true); return; }
   const t = now();
   if (fight || state.run || state.restUntil > t || state.dungeonLockedUntil > t || state.dungeonFloor > DUNGEON.floors.length) return;
   state.run = { floor: state.dungeonFloor, room: 0 };
@@ -1350,6 +1422,7 @@ async function enterFloor() {
   beginFight(DUNGEON.floors[state.run.floor - 1][0], "dungeon", false, DUNGEON.name);
 }
 async function continueRun() {
+  if (state.fightMark && !fight) { closeModal(); settleLeftFight(true); return; }
   if (!state.run || fight) return;
   if (!(await openFightScreen("dungeon"))) return;
   // back after the game was closed: only what was left of the break (a full minute if no break was on)
@@ -1406,6 +1479,7 @@ $("dbgNoRep").addEventListener("click", () => onRepEvent({ type: "norep", reason
 document.addEventListener("visibilitychange", () => {
   const t = performance.now();
   if (document.hidden) { if (fight || rest) hiddenAt = t; return; }
+  adoptIfNewer(); // another window may have saved while this one was in the background
   if (!hiddenAt) return;
   const away = t - hiddenAt;
   hiddenAt = 0;

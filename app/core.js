@@ -199,6 +199,15 @@ export function hush() {
 
 const friendly = msg => Object.assign(new Error(msg), { friendly: msg });
 
+// Can the phone keep the screen on? Asks once and lets go right away. false = refused (often battery
+// saver), null = this browser can't say. Asked before a fight, because a screen that turns off mid-set
+// now counts as leaving the game.
+export async function canKeepAwake() {
+  if (!("wakeLock" in navigator) || document.visibilityState !== "visible") return null;
+  try { const l = await navigator.wakeLock.request("screen"); l.release().catch(() => {}); return true; }
+  catch { return false; }
+}
+
 // every outside file that body tracking needs, so the installed app can keep them for offline use
 export async function trackingFiles(name) {
   const { FilesetResolver } = await import(LIB);
@@ -258,8 +267,12 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   video.addEventListener("loadedmetadata", setDims);
   video.addEventListener("resize", setDims);
 
+  // awake: did the phone agree to keep the screen on? (battery saver can refuse; null = not asked yet)
+  let awake = null;
   async function keepAwake() {
-    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+    try { wakeLock = await navigator.wakeLock.request("screen"); awake = true; }
+    catch { wakeLock = null; awake = "wakeLock" in navigator ? false : null; }
+    return awake;
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && running) keepAwake();
@@ -305,7 +318,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     resetSmooth();
     lastVideoTime = -1;
     running = true;
-    keepAwake();
+    await keepAwake();
     cancelAnimationFrame(rafId);
     fpsT = performance.now();
     frames = 0;
@@ -389,6 +402,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     counter,
     get running() { return running; },
     get fps() { return fps; },
+    get awake() { return awake; },
     get delegate() { return delegate; },
   };
 }
