@@ -618,6 +618,10 @@ function readBackup(text) {
 const WANDER_HP_MAX = Math.max(...ZONES.flatMap(z => z.monsters.filter(m => !m.slow && !m.rounds).map(m => m.hp)));
 function checkSave(s) {
   const whole = v => Number.isFinite(v) && v >= 0 && Math.floor(v) === v;
+  // the monster lists may be missing or null (cleanSave repairs them), but never an array or a plain value
+  const isMap = v => v == null || (typeof v === "object" && !Array.isArray(v));
+  if (!isMap(s.kills) || !isMap(s.losses)) return "its monster list is broken";
+  if (!s.stats || typeof s.stats !== "object" || Array.isArray(s.stats)) return "its stats are broken";
   const st = s.stats || {};
   const kills = s.kills || {}, losses = s.losses || {};
   if (![s.xp, s.testResult ?? 0, s.unlockedZones ?? 1, s.dungeonFloor ?? 1].every(whole)) return "a number in it is not a normal number";
@@ -680,7 +684,24 @@ function checkSave(s) {
 function cleanSave(s, keepMark = false) {
   const str = (v, n) => (typeof v === "string" ? v.slice(0, n) : "");
   const numOr = (v, d) => (Number.isFinite(v) ? v : d);
+  const count = (v, d) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : d);
   const out = { ...s };
+  // Fields the backup check treats as empty when null or missing get real values here, so a restored
+  // backup and a save that is already broken both open every screen: monster lists become {}, numbers
+  // become numbers. (On startup there is no check, so bad entries are simply dropped.)
+  const counts = o => {
+    const m = {};
+    if (o && typeof o === "object" && !Array.isArray(o)) for (const [k, v] of Object.entries(o)) if (Number.isFinite(v) && v >= 0) m[k] = Math.floor(v);
+    return m;
+  };
+  out.kills = counts(s.kills);
+  out.losses = counts(s.losses);
+  out.xp = count(s.xp, 0);
+  out.testResult = count(s.testResult, 0);
+  out.unlockedZones = Math.min(ZONES.length, Math.max(1, count(s.unlockedZones, 1)));
+  out.dungeonFloor = Math.min(DUNGEON.floors.length + 1, Math.max(1, count(s.dungeonFloor, 1)));
+  const st = s.stats && typeof s.stats === "object" && !Array.isArray(s.stats) ? s.stats : {};
+  out.stats = Object.fromEntries(["pushups", "fights", "wins", "bestSet", "biggestKill", "deepestFloor"].map(k => [k, count(st[k], 0)]));
   out.history = (Array.isArray(s.history) ? s.history : []).slice(0, 40).map(h => ({
     t: numOr(h && h.t, 0), id: str(h && h.id, 40) || undefined, name: str(h && h.name, 60),
     hp: numOr(h && h.hp, 0), reps: numOr(h && h.reps, 0), won: !!(h && h.won), where: str(h && h.where, 60),

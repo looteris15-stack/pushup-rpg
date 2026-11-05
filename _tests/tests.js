@@ -21,6 +21,14 @@ async function until(fn, ms = 5000, what = "condition") {
 function check(cond, msg) { if (!cond) throw new Error(msg); }
 const flat = s => (s || "").replace(/\s+/g, " ").trim();
 const saved = () => JSON.parse(localStorage.getItem(SAVE));
+const isPlainObject = v => !!v && typeof v === "object" && !Array.isArray(v);
+// an old-style (PRPG1, no seal) backup code of a save, like ones made before the seal existed
+const oldCode = save => "PRPG1." + btoa(JSON.stringify(save));
+// a save that passes every backup check (15 pushups in the strength test = 15 XP), so a test changes one thing only
+const GOOD = { ...BASE, xp: 15 };
+// a new player who never took the strength test: lets number fields be null without breaking other checks
+const NEWBIE = { ...BASE, xp: 0, tested: false, testResult: 0, unlockedZones: 1,
+  stats: { pushups: 0, fights: 0, wins: 0, bestSet: 0, biggestKill: 0, deepestFloor: 0 } };
 
 // a fresh start: both windows closed, the same save in the browser and on the test server
 async function reset(save = BASE) {
@@ -80,6 +88,24 @@ async function open(id) {
         await g.reps(1);
         if (room < 2) { d.querySelector("#btnFightNow").click(); await wait(300); }
       }
+    },
+    // pastes a backup code in Settings and taps Restore (twice: it asks to confirm); returns the message
+    async restoreCode(code) {
+      await g.goto("settings");
+      d.querySelector("#restoreText").value = code;
+      const b = d.querySelector("#btnRestore");
+      b.click(); await wait(80);
+      if (b.dataset.armed) { b.click(); await wait(300); }
+      return g.text("#backupMsg");
+    },
+    // opens World map, Records and The Old Mine; returns any errors and the screens' text
+    async openScreens() {
+      const before = errors.length, seen = {};
+      for (const s of ["map", "records", "dungeon"]) {
+        try { await g.goto(s); } catch (e) { errors.push(`${s}: ${e.message}`); }
+        seen[s] = g.text("#" + s);
+      }
+      return { errors: errors.slice(before), seen };
     },
     // taps a backup button and returns the backup text the share menu would get (no real share sheet)
     async backupText(selector) {
@@ -225,6 +251,58 @@ const tests = [
     check(/floor 1 is saved/i.test(text), `missing "Floor 1 is saved": "${text.slice(0, 160)}"`);
     check(!/not saved|saving failed|could not save/i.test(text), "a saving warning showed although saving worked");
     check(saved().dungeonFloor === 2, "the floor was not saved");
+  }],
+  // ---------------------------------------------------------------- Bug #3: null fields in backups and saves
+  ["#3a A backup with kills: null restores, and World map + Records open", async () => {
+    await reset();
+    const A = await open("A");
+    const msg = await A.restoreCode(oldCode({ ...GOOD, kills: null }));
+    check(/restored/i.test(msg), `the backup was refused: "${msg}"`);
+    check(isPlainObject(A.state.kills) && isPlainObject(saved().kills), `kills was not repaired: ${JSON.stringify(A.state.kills)}`);
+    const r = await A.openScreens();
+    check(r.errors.length === 0, "a screen crashed: " + r.errors.join(" | "));
+    check(A.d.querySelectorAll("#mapZones .mrow").length > 0, "the World map shows no monsters");
+  }],
+  ["#3b The same null fields in a backup are all repaired (losses, areas, mine floor, numbers)", async () => {
+    await reset();
+    const A = await open("A");
+    const broken = { ...NEWBIE, kills: null, losses: null, unlockedZones: null, dungeonFloor: null, testResult: null,
+      stats: { pushups: null, fights: null, wins: null, bestSet: null, biggestKill: null, deepestFloor: null } };
+    const msg = await A.restoreCode(oldCode(broken));
+    check(/restored/i.test(msg), `the backup was refused: "${msg}"`);
+    const s = saved();
+    check(isPlainObject(s.losses), "losses was not repaired");
+    check(s.unlockedZones >= 1 && s.dungeonFloor >= 1, `areas/floor not repaired: ${s.unlockedZones} / ${s.dungeonFloor}`);
+    check(Number.isFinite(s.testResult) && Number.isFinite(s.stats.deepestFloor) && Number.isFinite(s.stats.biggestKill), "a number was left as null");
+    const r = await A.openScreens();
+    check(r.errors.length === 0, "a screen crashed: " + r.errors.join(" | "));
+    check(A.d.querySelectorAll("#mapZones .zone:not(.locked)").length >= 1, "every area shows as locked");
+    check(!Object.values(r.seen).some(t => /\bnull\b/.test(t)), "a screen shows the word null");
+  }],
+  ["#3c A save that is already broken opens cleanly when the game starts", async () => {
+    await reset({ ...BASE, kills: null, losses: null, unlockedZones: null, dungeonFloor: null, testResult: null, stats: { ...BASE.stats, deepestFloor: null } });
+    const A = await open("A");
+    const r = await A.openScreens();
+    check(r.errors.length === 0, "a screen crashed: " + r.errors.join(" | "));
+    check(isPlainObject(A.state.kills) && isPlainObject(A.state.losses), "kills/losses were not repaired in memory");
+    check(A.d.querySelectorAll("#mapZones .zone:not(.locked)").length >= 1, "every area shows as locked");
+    check(!Object.values(r.seen).some(t => /\bnull\b/.test(t)), "a screen shows the word null");
+  }],
+  ["#3d Malformed kills are refused before anything is written", async () => {
+    await reset();
+    const A = await open("A");
+    for (const kills of [[], "abc", 123, { "field-mouse": -1 }, { "field-mouse": 1.5 }, { "field-mouse": "3" }, { "field-mouse": null }]) {
+      const before = localStorage.getItem(SAVE);
+      const msg = await A.restoreCode(oldCode({ ...GOOD, kills }));
+      check(!/restored/i.test(msg), `kills = ${JSON.stringify(kills)} was accepted: "${msg}"`);
+      check(localStorage.getItem(SAVE) === before, `kills = ${JSON.stringify(kills)}: the save changed`);
+    }
+    for (const losses of [[], 7]) {
+      const msg = await A.restoreCode(oldCode({ ...GOOD, losses }));
+      check(!/restored/i.test(msg), `losses = ${JSON.stringify(losses)} was accepted`);
+    }
+    // the good save itself is accepted, so the refusals above are about kills / losses only
+    check(/restored/i.test(await A.restoreCode(oldCode(GOOD))), "test setup: the good save was refused");
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
