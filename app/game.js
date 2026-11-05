@@ -1,5 +1,5 @@
-import { createTracker, initAudio, sfx, say, hush, audio } from "./core.js";
-import { RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
+import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles } from "./core.js";
+import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
 const SAVE_KEY = "pushupRPG.save.v1";
@@ -1113,9 +1113,69 @@ document.addEventListener("visibilitychange", () => {
   if (rest) rest.endsAt += d;
 });
 
+// ---------- installable app + offline ----------
+
+const standalone = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+let installEvent = null, offlineReady = false;
+window.addEventListener("beforeinstallprompt", e => { e.preventDefault(); installEvent = e; renderAppStatus(); });
+window.addEventListener("appinstalled", () => { installEvent = null; renderAppStatus("Installed. Open Pushup RPG from your home screen."); });
+async function askInstall() {
+  if (!installEvent) return;
+  const ev = installEvent;
+  installEvent = null;
+  ev.prompt();
+  const { outcome } = await ev.userChoice.catch(() => ({}));
+  renderAppStatus(outcome === "accepted" ? "Installing. Look for the Pushup RPG icon on your home screen." : null);
+}
+$("btnInstall").addEventListener("click", askInstall);
+$("btnInstallCamp").addEventListener("click", askInstall);
+
+function renderAppStatus(msg) {
+  const canInstall = !!installEvent && !standalone();
+  $("btnInstall").hidden = $("installRow").hidden = !canInstall;
+  const lines = [msg || (standalone() ? "You're using the installed app."
+    : canInstall ? "Install it for a home-screen icon and a full-screen game."
+    : "To install: open Chrome's menu (⋮) and tap \"Install app\" or \"Add to Home screen\".")];
+  lines.push(offlineReady ? "Works without internet: yes, the game is saved on this phone."
+    : "Works without internet: getting ready. Keep the game open for a minute while online.");
+  $("appStatus").textContent = lines.join(" ");
+}
+
+// is everything needed for a fight saved on the phone?
+async function checkOffline() {
+  try {
+    const want = [/\/game\.js$/, /\/core\.js$/, /\.wasm$/, new RegExp(`pose_landmarker_${state.settings.model}`)];
+    const urls = [];
+    for (const n of (await caches.keys()).filter(n => n.startsWith("rpg-"))) urls.push(...(await (await caches.open(n)).keys()).map(r => r.url));
+    return want.every(re => urls.some(u => re.test(u)));
+  } catch { return false; }
+}
+
+async function makeOffline(reg) {
+  // on the very first visit the offline helper starts after the page, so wait until it's in charge
+  if (!navigator.serviceWorker.controller) {
+    await new Promise(r => navigator.serviceWorker.addEventListener("controllerchange", r, { once: true }));
+  }
+  // fetch the tracking files once through the helper so it keeps a copy (instant if already saved)
+  for (const u of await trackingFiles(state.settings.model).catch(() => [])) await fetch(u).catch(() => {});
+  offlineReady = await checkOffline();
+  renderAppStatus();
+  // then all monster pictures, so the map has them offline too
+  const urls = [...ART].flatMap(id => [artUrl(id, true), artUrl(id)]).map(u => new URL(u, location.href).href);
+  (reg.active || navigator.serviceWorker.controller)?.postMessage({ type: "warm", urls });
+}
+
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register("sw.js")
+    .then(() => navigator.serviceWorker.ready)
+    .then(reg => setTimeout(() => makeOffline(reg).catch(() => {}), 4000))
+    .catch(err => console.warn("Offline helper failed", err));
+}
+
 // ---------- start ----------
 
 applySettings();
+renderAppStatus();
 show("camp");
 saveIfMigrated();
 syncFromPc();

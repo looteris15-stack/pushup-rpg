@@ -194,6 +194,13 @@ export function hush() {
 
 const friendly = msg => Object.assign(new Error(msg), { friendly: msg });
 
+// every outside file that body tracking needs, so the installed app can keep them for offline use
+export async function trackingFiles(name) {
+  const { FilesetResolver } = await import(LIB);
+  const files = await FilesetResolver.forVisionTasks(WASM);
+  return [LIB, files.wasmLoaderPath, files.wasmBinaryPath, MODELS[name] || MODELS.full];
+}
+
 async function loadPoseLandmarker(name) {
   const { PoseLandmarker, FilesetResolver } = await import(LIB);
   const files = await FilesetResolver.forVisionTasks(WASM);
