@@ -7,7 +7,9 @@ const SCREENS = ["camp", "map", "dungeon", "records", "settings", "fight"];
 const TESTED_STRICTNESS = { depth: 63, top: 160, bend: 20, knee: 135 };
 // bump when TESTED_STRICTNESS changes: old saves then get the new strictness once
 const STRICT_V = 3;
-const DEFAULT_SETTINGS = { ...TESTED_STRICTNESS, strictV: STRICT_V, voice: true, camera: "user", model: "full" };
+const DEFAULT_SETTINGS = { ...TESTED_STRICTNESS, strictV: STRICT_V, voice: true, sound: true, camera: "user", model: "full" };
+// the strictness sliders' ranges (index.html); a save with values outside them gets the tested ones
+const SETTING_RANGES = { depth: [40, 120], top: [140, 178], bend: [8, 40], knee: [120, 175] };
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -49,7 +51,7 @@ function loadLocal() {
   let raw = null;
   try {
     raw = localStorage.getItem(SAVE_KEY);
-    return raw ? normalize(JSON.parse(raw)) : freshState();
+    return raw ? normalize(cleanSave(JSON.parse(raw), true)) : freshState();
   } catch {
     if (raw) {
       brokenSave = true;
@@ -272,7 +274,7 @@ function levelInfo() {
   return { L, into: state.xp - base, need: next - base, title: titleFor(L) };
 }
 const num = n => n.toLocaleString("en-US"); // 30690 -> "30,690"
-const tile = ([label, value]) => `<div class="tile panel"><span class="label">${label}</span><b>${value}</b></div>`;
+const tile = ([label, value]) => `<div class="tile panel"><span class="label">${label}</span><b>${esc(value)}</b></div>`;
 // small picture for lists; an empty tile keeps rows lined up when a monster has no picture yet
 const thumb = id => {
   const url = artUrl(id, true);
@@ -301,7 +303,7 @@ function renderCamp() {
   const t = now();
   const status =
     state.restUntil > t ? `<span class="chip warn">Recovering</span> Your muscles are resting after a hard set. Fights open in ${until(state.restUntil)} (${fmtAt(state.restUntil)}).`
-    : state.run ? `<span class="chip warn">In the mine</span> Your run on floor ${state.run.floor} is not finished. Go to The Old Mine to continue it.`
+    : state.run ? `<span class="chip warn">In the mine</span> Your run on floor ${esc(state.run.floor)} is not finished. Go to The Old Mine to continue it.`
     : `<span class="chip good">Ready</span> You are rested. Pick a fight.`;
   const test = state.tested ? ""
     : `<div class="row"><button type="button" class="primary" data-action="prefight" data-id="test">Take the strength test</button><span class="fine">It picks the area where you start.</span></div>`;
@@ -453,7 +455,7 @@ function renderDungeon() {
     status = `<span class="chip warn">Run not finished</span> You are on floor ${run.floor}, room ${run.room + 1}. You get a short break first.`;
     button = `<button type="button" class="primary" data-action="continueRun">Continue the run</button>`;
   } else if (state.dungeonLockedUntil > t) {
-    status = `<span class="chip bad">Closed</span> You lost in the mine. It opens again in ${until(state.dungeonLockedUntil)} (${fmtAt(state.dungeonLockedUntil)}).`;
+    status = `<span class="chip bad">Closed</span> The mine is closed after your last run. It opens again in ${until(state.dungeonLockedUntil)} (${fmtAt(state.dungeonLockedUntil)}).`;
   } else if (state.restUntil > t) {
     status = `<span class="chip warn">Recovering</span> Your muscles are resting. You can enter in ${until(state.restUntil)}.`;
   } else if (F > total) {
@@ -499,12 +501,12 @@ function renderRecords() {
     .sort((a, b) => (typeof a.d.hp === "number" ? a.d.hp : 999) - (typeof b.d.hp === "number" ? b.d.hp : 999));
   $("recBeasts").innerHTML = rows.length
     ? `<thead><tr><th>Monster</th><th>Where</th><th class="num">HP</th><th class="num">Slain</th><th class="num">Lost to</th></tr></thead>
-       <tbody>${rows.map(({ id, d }) => `<tr><td><span class="beast">${thumb(id)}${esc(d.name)}</span></td><td>${esc(d.where)}</td><td class="num">${d.hp}</td><td class="num">${state.kills[id] || 0}</td><td class="num">${state.losses[id] || 0}</td></tr>`).join("")}</tbody>`
+       <tbody>${rows.map(({ id, d }) => `<tr><td><span class="beast">${thumb(id)}${esc(d.name)}</span></td><td>${esc(d.where)}</td><td class="num">${esc(d.hp)}</td><td class="num">${esc(state.kills[id] || 0)}</td><td class="num">${esc(state.losses[id] || 0)}</td></tr>`).join("")}</tbody>`
     : `<tbody><tr><td class="fine">No fights yet.</td></tr></tbody>`;
   $("recHistory").innerHTML = state.history.length
     ? state.history.map(h => h.id === "test"
-      ? `<li class="won"><span><b>Strength test</b>: ${plural(h.reps, "pushup")}</span><span class="fine">${fmtAt(h.t)}</span></li>`
-      : `<li class="${h.won ? "won" : "lost"}"><span><b>${h.won ? "Won" : "Lost"}</b> vs ${esc(h.name)} (${h.hp} HP): ${plural(h.reps, "hit")}</span><span class="fine">${esc(h.where)} · ${fmtAt(h.t)}</span></li>`).join("")
+      ? `<li class="won"><span><b>Strength test</b>: ${esc(plural(h.reps, "pushup"))}</span><span class="fine">${esc(fmtAt(h.t))}</span></li>`
+      : `<li class="${h.won ? "won" : "lost"}"><span><b>${h.won ? "Won" : "Lost"}</b> vs ${esc(h.name)} (${esc(h.hp)} HP): ${esc(plural(h.reps, "hit"))}</span><span class="fine">${esc(h.where)} · ${esc(fmtAt(h.t))}</span></li>`).join("")
     : `<li class="fine">No fights yet.</li>`;
 }
 
@@ -531,6 +533,10 @@ async function checkStorage() {
 }
 function applySettings() {
   audio.voice = state.settings.voice;
+  // the fight screen's Sound on/off button is remembered between fights
+  audio.on = state.settings.sound !== false;
+  $("btnSound").textContent = audio.on ? "Sound on" : "Sound off";
+  $("btnSound").setAttribute("aria-pressed", String(audio.on));
 }
 for (const [s, o, k] of SLIDERS) {
   $(s).addEventListener("input", e => { state.settings[k] = Number(e.target.value); $(o).textContent = e.target.value + "°"; saveSoon(); });
@@ -606,7 +612,7 @@ function checkSave(s) {
   const st = s.stats || {};
   const kills = s.kills || {}, losses = s.losses || {};
   if (![s.xp, s.testResult ?? 0, s.unlockedZones ?? 1, s.dungeonFloor ?? 1].every(whole)) return "a number in it is not a normal number";
-  if (!["pushups", "fights", "wins", "bestSet", "deepestFloor"].every(k => whole(st[k] ?? 0))) return "a stat in it is not a normal number";
+  if (!["pushups", "fights", "wins", "bestSet", "biggestKill", "deepestFloor"].every(k => whole(st[k] ?? 0))) return "a stat in it is not a normal number";
   if (![...Object.values(kills), ...Object.values(losses)].every(whole)) return "a monster count is not a normal number";
   const wander = id => WANDERERS.find(w => `wanderer-${w.id}` === id);
   const unknown = [...Object.keys(kills), ...Object.keys(losses)].find(id => id !== "champion" && !wander(id) && !findMonster(id));
@@ -649,7 +655,43 @@ function checkSave(s) {
   if (deepest > DUNGEON.floors.length || floor < 1 || floor > deepest + 1) return `mine floor ${floor} doesn't fit ${deepest} floors cleared`;
   const tooDeep = Object.keys({ ...kills, ...losses }).map(id => findMonster(id)).find(f => f && f.floor && f.floor > floor);
   if (tooDeep) return `it beat or met a monster on mine floor ${tooDeep.floor} without reaching it`;
+  // a mine run in progress is always on the current floor, in one of its rooms
+  const run = s.run;
+  if (run != null) {
+    const rooms = DUNGEON.floors[floor - 1];
+    if (typeof run !== "object" || run.floor !== floor || !rooms || !whole(run.room) || run.room >= rooms.length) return "it has a mine run that can't exist";
+  }
+  if (!Array.isArray(s.history ?? [])) return "its fight list is broken";
   return null;
+}
+
+// Everything else in a restored save gets cleaned, so nothing in it can break a screen or put its own
+// HTML into the page: text is cut short, numbers must be numbers, settings stay in their slider ranges.
+// A half-finished fight (fightMark) is dropped: a backup is restored on purpose, not after a crash.
+function cleanSave(s, keepMark = false) {
+  const str = (v, n) => (typeof v === "string" ? v.slice(0, n) : "");
+  const numOr = (v, d) => (Number.isFinite(v) ? v : d);
+  const out = { ...s };
+  out.history = (Array.isArray(s.history) ? s.history : []).slice(0, 40).map(h => ({
+    t: numOr(h && h.t, 0), id: str(h && h.id, 40) || undefined, name: str(h && h.name, 60),
+    hp: numOr(h && h.hp, 0), reps: numOr(h && h.reps, 0), won: !!(h && h.won), where: str(h && h.where, 60),
+  }));
+  const set = { ...DEFAULT_SETTINGS, ...(s.settings && typeof s.settings === "object" ? s.settings : {}) };
+  for (const [k, [lo, hi]] of Object.entries(SETTING_RANGES)) {
+    if (!(Number.isFinite(set[k]) && set[k] >= lo && set[k] <= hi)) set[k] = TESTED_STRICTNESS[k];
+  }
+  if (!["user", "environment"].includes(set.camera)) set.camera = DEFAULT_SETTINGS.camera;
+  if (!["full", "lite"].includes(set.model)) set.model = DEFAULT_SETTINGS.model;
+  set.voice = set.voice !== false;
+  set.sound = set.sound !== false;
+  out.settings = set;
+  for (const k of ["restUntil", "dungeonLockedUntil", "lastBackupAt", "backupFights", "savedAt", "rev"]) out[k] = numOr(s[k], 0);
+  out.wandererDone = str(s.wandererDone, 20);
+  const w = s.wanderToday;
+  out.wanderToday = w && typeof w === "object" && typeof w.key === "string" && Number.isFinite(w.hp) ? { key: w.key.slice(0, 20), hp: w.hp } : null;
+  if (out.run) out.run = { floor: out.run.floor, room: out.run.room, ...(Number.isFinite(out.run.breakEndsAt) ? { breakEndsAt: out.run.breakEndsAt } : {}) };
+  if (!keepMark) out.fightMark = null;
+  return out;
 }
 
 function backupInfo() {
@@ -731,7 +773,7 @@ $("btnRestore").addEventListener("click", e => {
   const saved = r.save;
   confirmTap(e.currentTarget, "Tap again to replace your progress", () => {
     const rev = state.rev;
-    state = normalize(saved);
+    state = normalize(cleanSave(saved));
     needsSave = false;
     state.rev = Math.max(rev, state.rev || 0);
     applySettings();
@@ -1464,10 +1506,10 @@ $("btnQuitRun").addEventListener("click", e => confirmTap(e.currentTarget, "Tap 
   rest = null;
   lose(reason);
 }));
-$("btnSound").addEventListener("click", e => {
-  audio.on = !audio.on;
-  e.currentTarget.textContent = audio.on ? "Sound on" : "Sound off";
-  e.currentTarget.setAttribute("aria-pressed", String(audio.on));
+$("btnSound").addEventListener("click", () => {
+  state.settings.sound = !audio.on;
+  applySettings();
+  saveSoon();
   if (audio.on) initAudio(); else hush();
 });
 $("dbgRep").addEventListener("click", () => { if (fight && !fight.over && !rest) hit(); });

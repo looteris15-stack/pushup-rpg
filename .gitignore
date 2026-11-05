@@ -1,2 +1,7 @@
 # your game save from the PC server stays private
 save/
+
+# PC-only tools: they stay on the PC but are not published on the website
+counter-test/
+serve.ps1
+start.ps1
