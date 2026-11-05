@@ -1,4 +1,4 @@
-import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles } from "./core.js";
+import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles, downSecsOf } from "./core.js";
 import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
@@ -518,7 +518,7 @@ const tracker = createTracker({
   video: $("video"), canvas: $("overlay"), frame: $("frame"),
   getCfg: () => state.settings,
   onEvent: ev => onRepEvent(ev),
-  onFrame: m => onTrackFrame(m),
+  onFrame: (m, now) => onTrackFrame(m, now),
 });
 
 // fight.where: "world" | "wander" | "champion" | "test" | "dungeon"
@@ -565,6 +565,7 @@ function beginFight(m, where, timedStart, label) {
     openEnded: where === "test", overkill: false,
   };
   tracker.counter.reset();
+  resetDepthMeter();
   lastBeep = 0;
   $("fMonster").classList.toggle("test", where === "test");
   showFightHud();
@@ -607,6 +608,52 @@ function renderFightHud() {
     : f.label];
   if (f.rounds.length > 1) bits.push(`round ${f.round + 1} of ${f.rounds.length}`);
   $("fWhere").innerHTML = esc(bits.join(" · ")) + (f.m.slow ? ` <span class="chip slow">Slow reps · ${slowSecs(f.m)} s down</span>` : "");
+  $("downTime").hidden = !slowSecs(f.m);
+  // the line on the depth bar sits where counting depth is
+  $("depthBox").style.setProperty("--line-at", ((state.settings.top - state.settings.depth) / (state.settings.top - depthFloor())) * 100 + "%");
+}
+
+// ---------- live depth meter ----------
+// The bar runs from straight arms (top angle) to a bit below counting depth, so a deep rep
+// visibly passes the line. On slow monsters it also shows the seconds of the way down, measured
+// exactly like the rule (core.js downSecsOf), so the number you see is the number that's judged.
+const depthFloor = () => state.settings.depth - 18;
+let meter = { cycle: null, okPlayed: false, last: null, lastAt: 0 };
+function resetDepthMeter() {
+  meter = { cycle: null, okPlayed: false, last: null, lastAt: 0 };
+  $("depthFill").style.height = "0%";
+  $("depthBox").classList.remove("reached");
+  $("depthBox").classList.add("off");
+  $("downTime").textContent = "0.0 s";
+  $("downTime").classList.remove("ok");
+}
+function renderDepth(m, now) {
+  if (!fight || fight.over || rest) return;
+  const { top, depth } = state.settings;
+  const st = tracker.counter.state, c = tracker.counter.cycle;
+  const inPlank = !!m && m.visible && (st === "up" || st === "down");
+  const frac = inPlank ? Math.min(1, Math.max(0, (top - m.elbow) / (top - depthFloor()))) : 0;
+  $("depthFill").style.height = frac * 100 + "%";
+  $("depthBox").classList.toggle("off", !inPlank);
+  $("depthBox").classList.toggle("reached", inPlank && !!c && c.depth);
+
+  const need = slowSecs(fight.m);
+  if (!need) return;
+  if (c !== meter.cycle) {
+    // a rep just ended: keep its time on screen; a new one started: fresh sound
+    if (meter.cycle && !c) { meter.last = downSecsOf(meter.cycle); meter.lastAt = now; }
+    meter.cycle = c;
+    meter.okPlayed = false;
+  }
+  let secs;
+  if (c) secs = downSecsOf(c);                                     // going down (or at the bottom)
+  else if (st === "up" && m && m.elbow < top) secs = +((now - tracker.counter.topAt) / 1000).toFixed(1); // just left the top
+  else if (meter.last != null && now - meter.lastAt < 3000) secs = meter.last;                         // show the last rep a moment
+  else secs = 0;
+  secs = secs || 0;
+  $("downTime").textContent = secs.toFixed(1) + " s";
+  $("downTime").classList.toggle("ok", secs >= need);
+  if (c && st === "down" && secs >= need && !meter.okPlayed) { meter.okPlayed = true; sfx.slowOk(); }
 }
 
 const STATE_TEXT = {
@@ -690,7 +737,8 @@ function fightTick() {
 }
 setInterval(fightTick, 200);
 
-function onTrackFrame(m) {
+function onTrackFrame(m, now = performance.now()) {
+  renderDepth(m, now);
   $("debug").textContent = m
     ? `elbow ${Math.round(m.elbow)}° · body ${Math.round(m.bodyBend)}° · knee ${Math.round(m.knee)}° · ${tracker.fps} fps`
     : `no body found · ${tracker.fps} fps`;
@@ -1008,6 +1056,7 @@ function resumeRound() {
   const t = performance.now();
   Object.assign(f, { started: false, timedStart: true, waitSince: t, lastRepAt: t, leftSince: 0, roundReps: 0 });
   tracker.counter.reset();
+  resetDepthMeter();
   showFightHud();
   renderFightHud();
   renderBanner();
@@ -1191,6 +1240,9 @@ if (DEBUG) {
     timeTravel(hours) { timeOffset += hours * 3600e3; renderCurrent(); },
     skipRest() { if (rest) rest.endsAt = performance.now(); },
     repEvent: ev => onRepEvent(ev),
+    // feed one body measurement through the real rep counter and the HUD, like a camera frame would
+    frame: (m, t) => { tracker.counter.update(m, t).forEach(onRepEvent); onTrackFrame(m, t); },
+    get counter() { return tracker.counter; },
     wanderer: () => todaysWanderer(),
   };
 }

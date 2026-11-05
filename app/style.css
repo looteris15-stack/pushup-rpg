@@ -263,10 +263,28 @@ output { color: var(--torch); font-family: var(--display); font-weight: 700; fon
   padding-right: max(14px, env(safe-area-inset-right, 0px));
   pointer-events: none;
 }
+.hud-left { display: flex; align-items: stretch; gap: 8px; flex: none; }
 .count-box { padding: 8px 18px 10px; text-align: center; min-width: 100px; }
+/* depth meter: a vertical bar that fills downward like the rep; the line marks counting depth */
+.depth-box { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 8px 10px 10px; min-width: 52px; }
+.depth-bar { position: relative; flex: 1; min-height: 56px; width: 22px; }
+.depth-track { position: absolute; inset: 0; border-radius: 11px; background: rgba(238, 243, 236, 0.12); overflow: hidden; }
+#depthFill { position: absolute; left: 0; right: 0; top: 0; height: 0; background: var(--torch); }
+/* the target mark sticks out on both sides so it reads over an empty or a full bar */
+.depth-line { position: absolute; left: -6px; right: -6px; top: var(--line-at, 84%); height: 3px; margin-top: -1px; border-radius: 2px; background: var(--fg); box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6); }
+.depth-box.reached #depthFill { background: var(--good); }
+.depth-box.reached .label { color: var(--good); }
+.depth-box.off { opacity: 0.45; }
+#downTime { font: 700 clamp(14px, 3.6vmin, 20px)/1 var(--display); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--warn); }
+#downTime.ok { color: var(--good); }
+/* upright phone: not enough width for hits + meter + monster in a row, so the meter goes under the hits */
+@media (max-width: 520px) {
+  .hud-left { flex-direction: column; }
+  .depth-box { min-height: 130px; }
+}
 #fHits { display: block; font: 800 clamp(44px, 13vmin, 112px)/1 var(--display); font-variant-numeric: tabular-nums; }
 #fHits.bump { animation: bump 0.35s ease-out; }
-.monster { width: min(58vw, 420px); padding: 10px 12px 12px 10px; display: flex; align-items: center; gap: 10px; }
+.monster { width: min(58vw, 420px); min-width: 0; padding: 10px 12px 12px 10px; display: flex; align-items: center; gap: 10px; }
 .m-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 #fArt { flex: none; width: clamp(56px, 20vmin, 104px); aspect-ratio: 1; border-radius: 10px; object-fit: cover; border: 1px solid var(--line); }
 .m-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }

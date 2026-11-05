@@ -52,6 +52,15 @@ export function analyzePose(lm, w, h, prevSide) {
   };
 }
 
+// "Slow reps" time of a rep (or of one still going down): from straight arms to arriving at the bottom
+// (first moment within 3° of the lowest angle so far), so a pause at the bottom doesn't count.
+// Measuring only the middle of the way down timed about half of a real rep and turned honest 2 s reps
+// into "too fast". The live depth meter uses this too, so what it shows is what gets judged.
+export function downSecsOf(c) {
+  const low = c.trace.find(p => p.e <= c.minElbow + 3);
+  return low ? +((low.t - c.topAt) / 1000).toFixed(1) : null;
+}
+
 // Rep = arms locked out -> elbows at depth -> locked out again, with body and legs straight the whole way.
 export function createRepCounter(getCfg) {
   // topAt: last moment the arms were straight (elbow >= top), where a slow rep's clock starts
@@ -59,15 +68,8 @@ export function createRepCounter(getCfg) {
   const summary = (c, t) => ({
     minElbow: Math.round(c.minElbow), maxBend: Math.round(c.maxBend), bendDir: c.bendDir,
     minKnee: Math.round(c.minKnee), secs: +((t - c.t0) / 1000).toFixed(1),
-    depth: c.depth, downSecs: downSecs(c),
+    depth: c.depth, downSecs: downSecsOf(c),
   });
-  // "slow reps" time: from straight arms to arriving at the bottom (first moment within 3° of the
-  // lowest angle), so a pause at the bottom doesn't count. Measuring only the middle of the way down
-  // timed about half of a real rep and turned honest 2 s reps into "too fast".
-  function downSecs(c) {
-    const low = c.trace.find(p => p.e <= c.minElbow + 3);
-    return low ? +((low.t - c.topAt) / 1000).toFixed(1) : null;
-  }
 
   function update(m, t) {
     const cfg = getCfg();
@@ -135,6 +137,7 @@ export function createRepCounter(getCfg) {
     get count() { return count; },
     get state() { return state; },
     get cycle() { return cycle; },
+    get topAt() { return topAt; },
   };
 }
 
@@ -167,6 +170,8 @@ function tone(freq, dur, type = "sine", gain = 0.25, when = 0, slideTo = 0) {
 export const sfx = {
   hit() { tone(190, 0.18, "square", 0.2, 0, 55); tone(950, 0.06, "triangle", 0.14); },
   depth() { tone(1500, 0.05, "sine", 0.12); },
+  // slow monsters: you've gone down long enough, reaching the bottom now counts
+  slowOk() { tone(660, 0.07, "sine", 0.12); tone(990, 0.09, "sine", 0.12, 0.07); },
   norep() { tone(140, 0.16, "sawtooth", 0.16); tone(105, 0.24, "sawtooth", 0.16, 0.17); },
   tick() { tone(880, 0.07, "square", 0.1); },
   start() { tone(330, 0.12, "triangle", 0.2); tone(660, 0.18, "triangle", 0.2, 0.12); },
@@ -344,7 +349,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     frames++;
     if (now - fpsT > 1000) { fps = Math.round(frames * 1000 / (now - fpsT)); frames = 0; fpsT = now; }
     counter.update(m, now).forEach(onEvent);
-    onFrame(m);
+    onFrame(m, now);
     draw(lm, m);
   }
 

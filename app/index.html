@@ -158,7 +158,15 @@
     </div>
   </div>
   <header class="hud-top">
-    <div class="count-box panel"><span class="label">Hits</span><span id="fHits">0</span></div>
+    <div class="hud-left">
+      <div class="count-box panel"><span class="label">Hits</span><span id="fHits">0</span></div>
+      <!-- live depth meter: fills as you go down, green once the rep is deep enough -->
+      <div class="depth-box panel off" id="depthBox" aria-hidden="true">
+        <span class="label">Depth</span>
+        <div class="depth-bar"><div class="depth-track"><div id="depthFill"></div></div><div class="depth-line"></div></div>
+        <span id="downTime" hidden>0.0 s</span>
+      </div>
+    </div>
     <div class="monster panel" id="fMonster">
       <img id="fArt" alt="" hidden>
       <div class="m-info">
