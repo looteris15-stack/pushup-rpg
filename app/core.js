@@ -215,6 +215,10 @@ export async function trackingFiles(name) {
   return [LIB, files.wasmLoaderPath, files.wasmBinaryPath, MODELS[name] || MODELS.full];
 }
 
+// automated tests (game.js ?debug) can swap in a slow fake model loader; players always get the real one
+let modelLoader = name => loadPoseLandmarker(name);
+export const testHooks = { setModelLoader(fn) { modelLoader = fn || (name => loadPoseLandmarker(name)); } };
+
 async function loadPoseLandmarker(name) {
   const { PoseLandmarker, FilesetResolver } = await import(LIB);
   const files = await FilesetResolver.forVisionTasks(WASM);
@@ -250,7 +254,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     modelName = name;
     try { landmarker?.close(); } catch {}
     landmarker = null;
-    loading = loadPoseLandmarker(name)
+    loading = modelLoader(name)
       .then(({ lm, used }) => { landmarker = lm; delegate = used; return lm; })
       .catch(err => { console.error(err); loading = null; throw err; });
     return loading;
@@ -284,7 +288,10 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     video.srcObject = null;
   }
 
-  async function startCamera(facing, model) {
+  // token: { cancelled } set by the game when the player taps Back during startup. Whatever arrives
+  // after that (a late camera, a finished model) is switched off and ignored instead of starting a fight.
+  const cancelled = () => Object.assign(new Error("Startup was cancelled."), { cancelled: true });
+  async function startCamera(facing, model, token = null) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw friendly(window.isSecureContext
         ? "This browser cannot use the camera. Try Chrome."
@@ -301,18 +308,24 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
       if (e.name === "NotFoundError" || e.name === "OverconstrainedError") throw friendly("No camera found.");
       throw friendly("Could not start the camera: " + (e.message || e.name));
     }
+    // the player went back while the camera question was open: switch this late camera off
+    if (token?.cancelled) { s.getTracks().forEach(t => t.stop()); throw cancelled(); }
     stopStream();
     stream = s;
     video.srcObject = s;
     video.muted = true;
     frame.classList.toggle("mirror", facing === "user");
     await video.play();
+    if (token?.cancelled) { stopStream(); throw cancelled(); }
     try {
       await ensureModel(model);
     } catch {
       stopStream();
+      if (token?.cancelled) throw cancelled();
       throw friendly("Could not load body tracking. Check the internet connection and try again.");
     }
+    // the player went back while body tracking was loading: ignore it (the camera was already stopped)
+    if (token?.cancelled) { stopStream(); throw cancelled(); }
     counter.reset();
     side = null;
     resetSmooth();

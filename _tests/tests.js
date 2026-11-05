@@ -74,6 +74,33 @@ async function open(id) {
       await until(() => (w.PushupRPG.fight && !w.PushupRPG.fight.over) || w.PushupRPG.rest || g.modal(), 8000, `window ${id} to start or show a message`).catch(() => {});
       await wait(300);
     },
+    // which screen is showing
+    screen: () => ["camp", "map", "dungeon", "records", "settings", "fight"].find(s => !d.getElementById(s).hidden),
+    // tap Fight / Enter floor / Continue without waiting for the start (for startup tests)
+    async tapFight(monsterId) {
+      await g.goto("map");
+      d.querySelector(`.mrow[data-id="${monsterId}"]`).click(); await wait(200);
+      [...d.querySelectorAll("#modal button")].find(x => /fight/i.test(x.textContent) && !x.disabled).click();
+      await wait(300);
+    },
+    async tapEnterFloor() { await g.goto("dungeon"); d.querySelector('[data-action="enterFloor"]').click(); await wait(300); },
+    async tapContinue() { await g.goto("dungeon"); d.querySelector('[data-action="continueRun"]').click(); await wait(300); },
+    // a fake camera picture source (its tracks can be checked for "ended")
+    fakeStream() { const c = d.createElement("canvas"); c.width = 64; c.height = 48; c.getContext("2d").fillRect(0, 0, 8, 8); return c.captureStream(5); },
+    // the browser's camera question stays open until answer() is called; answer() returns the stream it gave
+    slowCamera() {
+      let give;
+      w.navigator.mediaDevices.getUserMedia = () => new Promise(r => { give = r; });
+      return () => { const s = g.fakeStream(); give(s); return s; };
+    },
+    // the camera starts at once with a fake stream
+    fastCamera() { w.navigator.mediaDevices.getUserMedia = async () => g.fakeStream(); },
+    // body tracking keeps loading until finish() is called
+    slowModel() {
+      let done;
+      w.PushupRPG.hooks.setModelLoader(() => new Promise(r => { done = r; }));
+      return () => done({ lm: { detectForVideo: () => ({ landmarks: [] }), close() {} }, used: "CPU" });
+    },
     rep() { try { w.PushupRPG.repEvent({ type: "rep", count: 1, depth: true, downSecs: 3 }); } catch (e) { errors.push("thrown: " + e.message); } },
     async reps(n) { for (let i = 0; i < n; i++) { g.rep(); await wait(40); } await wait(300); },
     // from now on, saving in this window fails like a full or blocked phone storage
@@ -120,6 +147,17 @@ async function open(id) {
   return g;
 }
 const close = id => { document.getElementById(id).src = "about:blank"; return wait(200); };
+// leaving before a fight really began must cost nothing: no loss, no rest, no mine lock, no leftover fight
+function noPenalty(g, { run = false } = {}) {
+  const s = saved();
+  check(Object.keys(s.losses || {}).length === 0, "a loss was recorded");
+  check(!(s.restUntil > Date.now()), "a 10-hour rest started");
+  check(!(s.dungeonLockedUntil > Date.now()), "the mine got locked");
+  check(!s.fightMark, "an unfinished fight was left in the save");
+  if (!run) check(!s.run, "a mine run was left behind");
+  check(!localStorage.getItem(ALIVE), "the 'fight running' signal was left on (other windows would be blocked)");
+  check(g.errors.length === 0, "errors: " + g.errors.join(" | "));
+}
 
 // ---------------------------------------------------------------- Bug #1: a second window
 const tests = [
@@ -303,6 +341,88 @@ const tests = [
     }
     // the good save itself is accepted, so the refusals above are about kills / losses only
     check(/restored/i.test(await A.restoreCode(oldCode(GOOD))), "test setup: the good save was refused");
+  }],
+  // ---------------------------------------------------------------- Bug #4: stuck while the fight starts
+  ["#4a Back works while the camera question is unanswered, and a late camera is switched off", async () => {
+    await reset();
+    const A = await open("A");
+    const answer = A.slowCamera();
+    await A.tapFight("field-mouse");
+    check(A.screen() === "fight" && /starting camera/i.test(A.text("#banner")), "test setup: not on the starting screen");
+    const back = A.d.querySelector("#btnFlee");
+    check(!back.hidden && /back|cancel/i.test(back.textContent), `no Back button while the camera starts ("${back.hidden ? "hidden" : back.textContent}")`);
+    back.click(); await wait(300);
+    check(A.screen() === "map", `Back did not return to the map (on ${A.screen()})`);
+    const stream = answer(); // the browser answers the camera question late
+    await wait(600);
+    check(stream.getTracks().every(t => t.readyState === "ended"), "the late camera was left on");
+    check(!A.fight && A.screen() === "map", "the fight started in the background");
+    noPenalty(A);
+  }],
+  ["#4b After 8 s of waiting, a note says why", async () => {
+    await reset();
+    const A = await open("A");
+    const answer = A.slowCamera();
+    await A.tapFight("field-mouse");
+    await wait(8700);
+    const t = A.text("#banner");
+    check(/taking longer/i.test(t) && /camera/i.test(t) && /slow connection|download/i.test(t), `no slow-start note after 8 s: "${t}"`);
+    A.d.querySelector("#btnFlee").click(); await wait(200);
+    answer();
+  }],
+  ["#4c Back while body tracking loads stops the camera; the model is ignored when it arrives", async () => {
+    await reset();
+    const A = await open("A");
+    A.fastCamera();
+    const finishModel = A.slowModel();
+    await A.tapFight("field-mouse");
+    const stream = await until(() => A.d.querySelector("#video").srcObject, 3000, "the camera to start");
+    const back = A.d.querySelector("#btnFlee");
+    check(!back.hidden && /back|cancel/i.test(back.textContent), "no Back button while body tracking loads");
+    back.click(); await wait(200);
+    check(stream.getTracks().every(t => t.readyState === "ended"), "the camera stayed on after Back");
+    finishModel(); // body tracking finishes loading after the player left
+    await wait(600);
+    check(!A.fight && !A.api.trackerRunning && A.screen() === "map", "the fight started after the model loaded");
+    noPenalty(A);
+  }],
+  ["#4d Backing out of a mine start costs nothing (new run and continued run)", async () => {
+    await reset();
+    let A = await open("A");
+    let answer = A.slowCamera();
+    await A.tapEnterFloor();
+    check(A.screen() === "fight", "test setup: not on the starting screen");
+    A.d.querySelector("#btnFlee").click(); await wait(300);
+    check(A.screen() === "dungeon", `Back did not return to the mine (on ${A.screen()})`);
+    check(saved().run === null && saved().dungeonFloor === 1, "the new run was not cancelled");
+    answer(); await wait(400);
+    check(!A.fight && !A.api.rest, "the run started in the background");
+    noPenalty(A);
+    // a run that was going on: Continue, then Back, leaves it exactly as it was
+    const run = { floor: 1, room: 1, breakEndsAt: Date.now() + 60000 };
+    await reset({ ...BASE, run });
+    A = await open("A");
+    answer = A.slowCamera();
+    await A.tapContinue();
+    A.d.querySelector("#btnFlee").click(); await wait(300);
+    check(A.screen() === "dungeon", `Back did not return to the mine (on ${A.screen()})`);
+    check(JSON.stringify(saved().run) === JSON.stringify(run), `the run changed: ${JSON.stringify(saved().run)}`);
+    answer(); await wait(400);
+    check(!A.fight && !A.api.rest, "the run started in the background");
+    noPenalty(A, { run: true });
+  }],
+  ["#4e A normal start (camera and body tracking both fine) still begins the fight", async () => {
+    await reset();
+    const A = await open("A");
+    A.fastCamera();
+    A.api.hooks.setModelLoader(async () => ({ lm: { detectForVideo: () => ({ landmarks: [] }), close() {} }, used: "CPU" }));
+    await A.tapFight("field-mouse");
+    await until(() => A.fight && !A.fight.over, 3000, "the fight to begin");
+    check(A.api.trackerRunning, "body tracking is not running");
+    check(/run away/i.test(A.text("#btnFlee")), `the button should be Run away now, it says "${A.text("#btnFlee")}"`);
+    A.d.querySelector("#btnFlee").click(); await wait(300); // Run away before the first rep: free
+    check(A.screen() === "map" && !A.api.trackerRunning, "Run away did not end it cleanly");
+    noPenalty(A);
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

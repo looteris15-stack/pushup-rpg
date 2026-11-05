@@ -1,4 +1,4 @@
-import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake } from "./core.js";
+import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake, testHooks } from "./core.js";
 import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
@@ -851,6 +851,9 @@ let hiddenAt = 0, flashUntil = 0, flashTimer = 0, lastBeep = 0;
 const fakeReps = () => DEBUG && !tracker.running;
 const plankState = () => (fakeReps() ? "up" : tracker.counter.state);
 
+// Fight startup (camera question, then body tracking) can take a while. A Back button works the whole
+// time; going back counts for nothing, because no fight has begun yet. Returns true when the fight can begin.
+let startup = null; // { token, backTo, cancel } while the camera and body tracking start
 async function openFightScreen(backTo) {
   initAudio();
   applySettings();
@@ -858,16 +861,28 @@ async function openFightScreen(backTo) {
   show("fight");
   $("restPanel").hidden = true;
   $("banner").hidden = false;
-  $("btnFlee").hidden = true;
+  $("btnFlee").hidden = false;
+  disarm($("btnFlee"));
+  $("btnFlee").textContent = "Back";
   updateThreat(null);
   setBanner("Starting camera…", "");
   $("debug").textContent = "Starting camera…";
   $("dbgRep").hidden = $("dbgNoRep").hidden = !DEBUG;
   beat(); // other windows see a fight starting here, even while the camera is still starting
+  const token = { cancelled: false };
+  let onCancel;
+  const backTapped = new Promise(r => { onCancel = r; });
+  startup = { token, backTo, cancel: () => { token.cancelled = true; onCancel("back"); } };
+  const slowNote = setTimeout(() => {
+    if (startup && startup.token === token) setBanner("Taking longer than usual: waiting for the camera permission question, or downloading body tracking on a slow connection. Tap Back to leave.", "warn");
+  }, 8000);
+  const camera = tracker.startCamera(state.settings.camera, state.settings.model, token);
+  camera.catch(() => {}); // after Back, its late "cancelled" error is expected
   try {
-    await tracker.startCamera(state.settings.camera, state.settings.model);
+    if ((await Promise.race([camera.then(() => "ready"), backTapped])) === "back") return false;
     return true;
   } catch (e) {
+    if (token.cancelled) return false;
     if (DEBUG) { $("debug").textContent = "debug: no camera, use the fake buttons"; return true; }
     tracker.stop();
     stopBeat();
@@ -875,7 +890,20 @@ async function openFightScreen(backTo) {
     openModal(`<p class="eyebrow">Camera</p><h2>The fight can't start</h2><p>${esc(e.friendly || "Could not start the camera.")}</p>
       <div class="row"><button type="button" class="primary" data-action="closeModal">OK</button></div>`);
     return false;
+  } finally {
+    clearTimeout(slowNote);
+    if (startup && startup.token === token) startup = null;
   }
+}
+// Back during startup: switch off whatever already started, go back, and leave no trace of a fight
+function cancelStartup() {
+  const s = startup;
+  if (!s) return;
+  startup = null;
+  s.cancel();
+  tracker.stop(); // stops a camera that is already on (body tracking was still loading)
+  stopBeat();
+  show(s.backTo);
 }
 
 function beginFight(m, where, timedStart, label) {
@@ -1580,6 +1608,7 @@ document.addEventListener("click", e => {
 });
 
 $("btnFlee").addEventListener("click", e => {
+  if (startup) { cancelStartup(); return; } // still starting: Back, free of charge
   if (!fight || fight.over) return;
   if (canLeaveFree()) {
     // not started yet: no penalty
@@ -1716,6 +1745,8 @@ if (DEBUG) {
     // feed one body measurement through the real rep counter and the HUD, like a camera frame would
     frame: (m, t) => { tracker.counter.update(m, t).forEach(onRepEvent); onTrackFrame(m, t); },
     get counter() { return tracker.counter; },
+    get trackerRunning() { return tracker.running; },
+    hooks: testHooks,
     wanderer: () => todaysWanderer(),
   };
 }
