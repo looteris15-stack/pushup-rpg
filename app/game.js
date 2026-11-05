@@ -487,8 +487,23 @@ $("btnDefaults").addEventListener("click", () => { Object.assign(state.settings,
 // ---------- backups ----------
 // The save lives in the phone's browser. If its data gets cleared, a backup is the only way back.
 // backup code = the whole save as text, so progress can move to another link or phone.
-const BACKUP_PREFIX = "PRPG1.";
-const backupCode = () => BACKUP_PREFIX + btoa(asciiJson(state));
+// New codes: PRPG2.<save as base64>.<seal>. The seal is a fingerprint of the code, so a code changed by hand
+// no longer matches it. It only stops casual edits: the recipe is in this file. Old PRPG1 codes have no seal,
+// so they only get the sanity checks (still accepted, so an old backup is never useless).
+const SEAL_SALT = "pushup-rpg/backup-seal/v2";
+function cyrb53(str) { // small, well-known string hash
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+const seal = b64 => cyrb53(SEAL_SALT + b64).toString(36);
+const backupCode = () => { const b64 = btoa(asciiJson(state)); return `PRPG2.${b64}.${seal(b64)}`; };
 const backupName = () => {
   const d = new Date(now()), p = n => String(n).padStart(2, "0");
   return `pushup-rpg-backup-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.txt`; // local date, not UTC
@@ -497,16 +512,88 @@ const backupText = () =>
   `Pushup RPG backup · level ${levelFromXp(state.xp)} · ${plural(state.stats.pushups, "pushup")} · ${fmtAt(now())}\n` +
   `To restore: open the game, Settings → Backup → Open backup file, or paste this whole text there.\n\n${backupCode()}\n`;
 
-// read a backup out of any text: a pasted code, a whole message, or a backup file
+// Read a backup out of any text: a pasted code, a whole message, or a backup file.
+// Returns null (no code in it) or { save, problem }, where problem says why it can't be used.
 function readBackup(text) {
-  const m = /PRPG1\.([A-Za-z0-9+/=\s]+)/.exec(text || "");
-  if (!m) return null;
-  const b64 = m[1].replace(/\s+/g, "");
-  // words after the code (an email signature, "sent from my phone") stick to it once spaces are
+  text = text || "";
+  const m2 = /PRPG2\.([A-Za-z0-9+/=\s]+)\.([a-z0-9]+)/.exec(text);
+  if (m2) {
+    const b64 = m2[1].replace(/\s+/g, "");
+    let save = null;
+    try { save = JSON.parse(atob(b64)); } catch {}
+    if (!save || typeof save !== "object" || !save.stats) return { save: null, problem: "The code is damaged. Copy the whole code and try again." };
+    if (m2[2] !== seal(b64)) return { save, problem: "This backup was changed after it was made, so it can't be used." };
+    const bad = checkSave(save);
+    return { save, problem: bad && `This backup doesn't add up: ${bad}.` };
+  }
+  const m1 = /PRPG1\.([A-Za-z0-9+/=\s]+)/.exec(text);
+  if (!m1) return null;
+  const b64 = m1[1].replace(/\s+/g, "");
+  // words after an old code (an email signature, "sent from my phone") stick to it once spaces are
   // removed, so cut letters off the end until it reads as a save again
   for (let end = b64.length; end > 0 && end > b64.length - 400; end--) {
-    try { const s = JSON.parse(atob(b64.slice(0, end))); if (s && typeof s === "object" && s.stats) return s; } catch {}
+    try {
+      const save = JSON.parse(atob(b64.slice(0, end)));
+      if (save && typeof save === "object" && save.stats) {
+        const bad = checkSave(save);
+        return { save, problem: bad && `This backup doesn't add up: ${bad}. It may have been changed by hand.` };
+      }
+    } catch {}
   }
+  return { save: null, problem: "The code is damaged. Copy the whole code and try again." };
+}
+
+// Rules every real save follows. A backup that breaks one was changed by hand (or is broken).
+// Returns what is wrong, or null when it all adds up.
+const WANDER_HP_MAX = Math.max(...ZONES.flatMap(z => z.monsters.filter(m => !m.slow && !m.rounds).map(m => m.hp)));
+function checkSave(s) {
+  const whole = v => Number.isFinite(v) && v >= 0 && Math.floor(v) === v;
+  const st = s.stats || {};
+  const kills = s.kills || {}, losses = s.losses || {};
+  if (![s.xp, s.testResult ?? 0, s.unlockedZones ?? 1, s.dungeonFloor ?? 1].every(whole)) return "a number in it is not a normal number";
+  if (!["pushups", "fights", "wins", "bestSet", "deepestFloor"].every(k => whole(st[k] ?? 0))) return "a stat in it is not a normal number";
+  if (![...Object.values(kills), ...Object.values(losses)].every(whole)) return "a monster count is not a normal number";
+  const wander = id => WANDERERS.find(w => `wanderer-${w.id}` === id);
+  const unknown = [...Object.keys(kills), ...Object.keys(losses)].find(id => id !== "champion" && !wander(id) && !findMonster(id));
+  if (unknown) return `it has a monster the game doesn't know (${unknown})`;
+
+  const sum = o => Object.values(o).reduce((a, b) => a + b, 0);
+  const wins = st.wins || 0, fights = st.fights || 0, pushups = st.pushups || 0, best = st.bestSet || 0;
+  if (wins !== sum(kills)) return `${num(wins)} wins, but ${num(sum(kills))} monsters slain`;
+  if (fights !== wins + sum(losses)) return `${num(fights)} fights, but ${num(wins)} wins and ${num(sum(losses))} losses`;
+
+  const test = s.tested ? s.testResult || 0 : 0;
+  // most reps one fight can give: the monster's HP (a lost fight gives fewer); the Champion: one set, so your best set
+  const repsCap = id => id === "champion" ? best : wander(id) ? WANDER_HP_MAX : findMonster(id).m.hp;
+  const fought = { ...losses };
+  for (const [id, k] of Object.entries(kills)) fought[id] = (fought[id] || 0) + k;
+  const maxPushups = test + Object.entries(fought).reduce((a, [id, k]) => a + k * repsCap(id), 0);
+  if (pushups > maxPushups) return `${num(pushups)} pushups, but its fights could give at most ${num(maxPushups)}`;
+  if (best > pushups || best < test) return `a best set of ${num(best)} doesn't fit ${num(pushups)} pushups in total`;
+
+  // most XP: the strength test, every win at its full reward, and the bonus of each mine floor cleared
+  const xpCap = id => {
+    if (id === "champion") return best * RULES.championXpPerRep;
+    const w = wander(id);
+    if (w) return Math.round(WANDER_HP_MAX * RULES.wandererXpMult * (w.slow ? RULES.specialXpMult : 1));
+    const f = findMonster(id);
+    return xpReward(f.m, f.zone ? "world" : "dungeon");
+  };
+  const deepest = st.deepestFloor || 0;
+  const maxXp = test + Object.entries(kills).reduce((a, [id, k]) => a + k * xpCap(id), 0) + RULES.floorBonusXp * deepest * (deepest + 1) / 2;
+  if (s.xp > maxXp) return `${num(s.xp)} XP, but its wins could give at most ${num(maxXp)}`;
+
+  // areas open only through the strength test and then each area's boss in turn
+  let canOpen = s.tested ? startZoneFor(test) + 1 : 1;
+  while (canOpen < ZONES.length && kills[ZONES[canOpen - 1].monsters.find(m => m.boss).id]) canOpen++;
+  const open = s.unlockedZones ?? 1;
+  if (open < 1 || open > canOpen) return `${open} areas open, but only ${canOpen} could be`;
+
+  // the mine goes floor by floor
+  const floor = s.dungeonFloor ?? 1;
+  if (deepest > DUNGEON.floors.length || floor < 1 || floor > deepest + 1) return `mine floor ${floor} doesn't fit ${deepest} floors cleared`;
+  const tooDeep = Object.keys({ ...kills, ...losses }).map(id => findMonster(id)).find(f => f && f.floor && f.floor > floor);
+  if (tooDeep) return `it beat or met a monster on mine floor ${tooDeep.floor} without reaching it`;
   return null;
 }
 
@@ -572,17 +659,20 @@ $("restoreFile").addEventListener("change", async e => {
   e.target.value = "";
   if (!f) return;
   const text = await f.text().catch(() => "");
-  const s = readBackup(text);
-  if (!s) { $("backupMsg").textContent = "That file has no Pushup RPG backup in it."; return; }
+  const r = readBackup(text);
+  if (!r) { $("backupMsg").textContent = "That file has no Pushup RPG backup in it."; return; }
+  if (r.problem) { $("backupMsg").textContent = r.problem; return; }
   $("restoreText").value = text;
-  $("backupMsg").textContent = `Backup found: level ${levelFromXp(s.xp || 0)}, ${plural((s.stats && s.stats.pushups) || 0, "pushup")}. Tap Restore to use it.`;
+  $("backupMsg").textContent = `Backup found: level ${levelFromXp(r.save.xp || 0)}, ${plural(r.save.stats.pushups || 0, "pushup")}. Tap Restore to use it.`;
 });
 $("btnRestore").addEventListener("click", e => {
-  const saved = readBackup($("restoreText").value);
-  if (!saved) {
+  const r = readBackup($("restoreText").value);
+  if (!r) {
     $("backupMsg").textContent = "That doesn't look like a backup code. Copy the whole code and try again.";
     return;
   }
+  if (r.problem) { $("backupMsg").textContent = r.problem; return; }
+  const saved = r.save;
   confirmTap(e.currentTarget, "Tap again to replace your progress", () => {
     const rev = state.rev;
     state = normalize(saved);
