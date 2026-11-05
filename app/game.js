@@ -23,6 +23,7 @@ function freshState(settings = DEFAULT_SETTINGS) {
     xp: 0, restUntil: 0, dungeonLockedUntil: 0, dungeonFloor: 1, run: null, unlockedZones: 1,
     tested: false, testResult: 0, wandererDone: "",
     lastBackupAt: 0, backupFights: 0, // when the last backup was made, and stats.fights at that time
+    fightMark: null, // a fight that has started (see markFight), so closing the game still counts it
     kills: {}, losses: {}, history: [],
     stats: { pushups: 0, fights: 0, wins: 0, bestSet: 0, biggestKill: 0, deepestFloor: 0 },
     settings: { ...settings },
@@ -360,6 +361,10 @@ function openPrefight(id) {
     if (rounds.length > 1) special.push(["torch", `<b>${rounds.length} rounds:</b> ${rounds.join(" + ")} pushups, with <b>${RULES.roundRestSec} s rest</b> between rounds. Each round is one set.`]);
     if (where === "champion") special.push(["torch", `<b>Record fight:</b> it has your best set + 1 HP. After it falls, <b>keep going</b> for a bigger record, then tap Finish.`]);
     if (where === "wander") special.push(["torch", `<b>Today only:</b> double XP. It's gone at midnight.`]);
+    // everyone sees this one: leaving mid-fight used to dodge the rest time
+    special.push(["leave", where === "champion"
+      ? `<b>Stay in the game:</b> once your first rep counts, leaving the app (closing it, switching apps or locking the phone) for more than ${RULES.leaveAppSec} seconds counts as giving up, with ${RULES.restHoursAfterLoss} hours of rest. After the Champion falls, leaving just ends your set and the record counts.`
+      : `<b>Stay in the game:</b> once your first rep counts, leaving the app (closing it, switching apps or locking the phone) for more than ${RULES.leaveAppSec} seconds counts as giving up, with ${RULES.restHoursAfterLoss} hours of rest.`]);
     const rules = [];
     if (rounds.length === 1) rules.push(`Do <b>${m.hp} strict pushups in one set</b> to win. Each rep is 1 hit.`);
     rules.push("Take your time getting into position. The timer starts with your first strict rep.");
@@ -419,7 +424,8 @@ function renderDungeon() {
     <li>Fight ${rooms.length} rooms in a row. Each monster is one set.</li>
     <li>You get ${RULES.restBetweenRoomsSec} seconds of rest between rooms. Then do your first rep within ${RULES.dungeonStartSec} seconds.</li>
     <li>Reach the safe room to save the floor and get +${RULES.floorBonusXp} XP times the floor number.</li>
-    <li>Lose or leave before the safe room: the mine closes for ${RULES.dungeonLockDays} days and you recover ${RULES.restHoursAfterLoss} hours.</li>`;
+    <li>Lose or leave before the safe room: the mine closes for ${RULES.dungeonLockDays} days and you recover ${RULES.restHoursAfterLoss} hours.</li>
+    <li><b>Stay in the game during the run.</b> Leaving the app for more than ${RULES.leaveAppSec} seconds in a room, or longer than a break, counts as leaving the mine.</li>`;
   const here = run ? run.floor : F;
   $("dgLadder").innerHTML = DUNGEON.floors.map((_, i) => {
     const f = i + 1;
@@ -665,6 +671,8 @@ function beginFight(m, where, timedStart, label) {
   tracker.counter.reset();
   resetDepthMeter();
   lastBeep = 0;
+  if (where === "dungeon" && state.run) delete state.run.breakEndsAt;
+  if (timedStart) markFight(); else if (where === "dungeon") save();
   $("fMonster").classList.toggle("test", where === "test");
   showFightHud();
   renderFightHud();
@@ -683,6 +691,41 @@ function showFightHud() {
 }
 
 const canLeaveFree = () => fight && !fight.started && !fight.timedStart;
+// a fight is on the line once your first rep counted, or when it has a start timer (mine rooms, later rounds).
+// The strength test never is.
+const committed = f => !!f && !f.over && !f.openEnded && (f.started || f.timedStart);
+// A fight on the line is written into the save, so closing the game can't make it disappear:
+// the next time the game opens, settleLeftFight() counts it as given up.
+function markFight() {
+  const f = fight;
+  if (!committed(f)) return;
+  state.fightMark = {
+    id: f.m.id, name: f.m.name, hp: f.m.hp, key: f.m.key || "", boss: !!f.m.boss,
+    where: f.where, label: f.label, reps: f.reps, maxSet: f.maxSet, total: f.total,
+    rounds: f.rounds, round: f.round, overkill: !!f.overkill,
+  };
+  save();
+}
+function settleLeftFight() {
+  const mk = state.fightMark;
+  if (mk) {
+    state.fightMark = null;
+    fight = {
+      m: { id: mk.id, name: mk.name, hp: mk.hp, key: mk.key, boss: mk.boss }, where: mk.where, label: mk.label,
+      rounds: mk.rounds || [mk.total], round: mk.round || 0, total: mk.total, hpLeft: mk.total - mk.reps, roundLeft: 0,
+      reps: mk.reps, roundReps: 0, maxSet: mk.maxSet, over: false, openEnded: false, overkill: !!mk.overkill,
+    };
+    if (fight.overkill) win(); // the Champion was already down: the record counts
+    else lose("The game was closed during the fight.");
+    return;
+  }
+  // closed during a break in the mine and gone longer than the break plus the start time
+  const br = state.run && state.run.breakEndsAt;
+  if (br && now() > br + RULES.dungeonStartSec * 1000) {
+    fight = null;
+    lose("The game was closed during a break in the mine, longer than the break.");
+  }
+}
 function resetFleeBtn() {
   const b = $("btnFlee");
   disarm(b);
@@ -707,6 +750,9 @@ function renderFightHud() {
   if (f.rounds.length > 1) bits.push(`round ${f.round + 1} of ${f.rounds.length}`);
   $("fWhere").innerHTML = esc(bits.join(" · ")) + (f.m.slow ? ` <span class="chip slow">Slow reps · ${slowSecs(f.m)} s down</span>` : "");
   $("downTime").hidden = !slowSecs(f.m);
+  $("stayNote").hidden = !committed(f);
+  if (f.overkill) $("stayNote").textContent = "Leaving now ends your set. The record counts.";
+  else $("stayNote").textContent = "Stay in the app: leaving now counts as giving up.";
   // the line on the depth bar sits where counting depth is
   $("depthBox").style.setProperty("--line-at", ((state.settings.top - state.settings.depth) / (state.settings.top - depthFloor())) * 100 + "%");
 }
@@ -884,6 +930,7 @@ function hit(downSecs = null) {
   f.maxSet = Math.max(f.maxSet, f.roundReps);
   f.lastRepAt = performance.now();
   lastBeep = 0;
+  markFight();
   sfx.hit();
   replay($("fMonster"), "hit");
   replay($("fHits"), "bump");
@@ -899,6 +946,7 @@ function hit(downSecs = null) {
   if (f.hpLeft <= 0) {
     if (f.where === "champion") {
       f.overkill = true;
+      markFight(); // from here on, leaving keeps the record instead of losing
       renderFightHud();
       resetFleeBtn();
       sfx.win();
@@ -947,6 +995,7 @@ function levelUpLine(before, lines) {
 function win() {
   const f = fight;
   f.over = true;
+  state.fightMark = null;
   updateThreat(null);
   const levelBefore = levelFromXp(state.xp);
   const prevBest = state.stats.bestSet;
@@ -1009,6 +1058,7 @@ function lose(reason) {
   const f = fight;
   const where = f ? f.where : "dungeon";
   const prevBest = state.stats.bestSet;
+  state.fightMark = null;
   let prev = null;
   if (f) {
     prev = state.history.find(h => h.id === f.m.id || (!h.id && h.name === f.m.name));
@@ -1048,6 +1098,7 @@ function lose(reason) {
 function finishTest() {
   const f = fight;
   f.over = true;
+  state.fightMark = null;
   updateThreat(null);
   const reps = f.reps;
   if (!reps) {
@@ -1087,6 +1138,7 @@ function finishTest() {
 function endFight(screen) {
   fight = null;
   rest = null;
+  if (state.fightMark) { state.fightMark = null; save(); }
   tracker.stop();
   $("restPanel").hidden = true;
   show(screen);
@@ -1127,9 +1179,11 @@ function restTick(t) {
 }
 function endRest() {
   if (!rest) return;
-  const next = rest.onDone;
+  const { onDone, endsAt } = rest;
   rest = null;
-  next();
+  onDone();
+  // a break that ran out while you were away: the start timer counts from the end of the break
+  if (fight && fight.timedStart && !fight.started) fight.waitSince = Math.min(fight.waitSince, endsAt);
 }
 
 function roundBreak() {
@@ -1145,7 +1199,7 @@ function roundBreak() {
     next: `Next: round ${f.round + 1}, <b>${f.roundLeft} pushups</b>. ${f.hpLeft} HP left in total.`,
     quitLabel: "Give up",
     quitReason: "You gave up between rounds.",
-    warn: "Giving up counts as a loss.",
+    warn: "Giving up counts as a loss. Leaving the app longer than the break does too.",
     onDone: resumeRound,
   });
 }
@@ -1153,6 +1207,7 @@ function resumeRound() {
   const f = fight;
   const t = performance.now();
   Object.assign(f, { started: false, timedStart: true, waitSince: t, lastRepAt: t, leftSince: 0, roundReps: 0 });
+  markFight();
   tracker.counter.reset();
   resetDepthMeter();
   showFightHud();
@@ -1164,6 +1219,9 @@ function resumeRound() {
 function mineBreak(sec, title, lines) {
   fight = null;
   const run = state.run;
+  // remembered in the save: closing the game can't stretch a break (see settleLeftFight)
+  run.breakEndsAt = now() + sec * 1000;
+  save();
   const rooms = DUNGEON.floors[run.floor - 1];
   const next = rooms[run.room];
   startRest({
@@ -1172,7 +1230,7 @@ function mineBreak(sec, title, lines) {
     next: `${lines.length ? lines.join("<br>") + "<br>" : ""}Next: <b>${esc(next.name)}</b>, ${next.hp} HP (room ${run.room + 1} of ${rooms.length})${next.slow ? `<br><span class="chip slow">Slow reps · ${slowSecs(next)} s down</span>` : ""}`,
     quitLabel: "Leave the mine",
     quitReason: "You left the mine before the safe room.",
-    warn: `Leaving now closes the mine for ${RULES.dungeonLockDays} days.`,
+    warn: `Leaving now closes the mine for ${RULES.dungeonLockDays} days. Leaving the app longer than the break does too.`,
     onDone: () => beginFight(next, "dungeon", true, DUNGEON.name),
   });
   // show the next monster in the HUD during the break
@@ -1204,7 +1262,9 @@ async function enterFloor() {
 async function continueRun() {
   if (!state.run || fight) return;
   if (!(await openFightScreen("dungeon"))) return;
-  mineBreak(60, "Back in the mine", []);
+  // back after the game was closed: only what was left of the break (a full minute if no break was on)
+  const left = state.run.breakEndsAt ? Math.ceil((state.run.breakEndsAt - now()) / 1000) : 60;
+  mineBreak(Math.max(5, left), "Back in the mine", []);
 }
 
 // ---------- controls ----------
@@ -1250,15 +1310,31 @@ $("btnSound").addEventListener("click", e => {
 $("dbgRep").addEventListener("click", () => { if (fight && !fight.over && !rest) hit(); });
 $("dbgNoRep").addEventListener("click", () => onRepEvent({ type: "norep", reasons: ["Go lower"] }));
 
-// a phone call or app switch pauses the fight timers instead of losing the fight
+// Leaving the app doesn't pause anything: the clock keeps running while you're away.
+// A quick look at a notification is fine, but leaving a fight that has started counts as giving up,
+// otherwise you could rest in another app (or close the game) to dodge a loss.
 document.addEventListener("visibilitychange", () => {
   const t = performance.now();
   if (document.hidden) { if (fight || rest) hiddenAt = t; return; }
   if (!hiddenAt) return;
-  const d = t - hiddenAt;
+  const away = t - hiddenAt;
   hiddenAt = 0;
-  if (fight) { fight.lastRepAt += d; fight.waitSince += d; if (fight.leftSince) fight.leftSince += d; }
-  if (rest) rest.endsAt += d;
+  if (rest) {
+    // a break keeps going while you're away; gone longer than the break plus the start time = you left
+    if (t > rest.endsAt + RULES.dungeonStartSec * 1000) {
+      rest = null;
+      lose(fight ? "You were away longer than the break." : "You were away longer than the break between rooms.");
+    }
+    return;
+  }
+  if (fight && !fight.over && committed(fight) && away > RULES.leaveAppSec * 1000) {
+    if (fight.overkill) stopSet("You left the app. Your record counts."); // the Champion is already down
+    else lose("You left the app during the fight.");
+  }
+});
+// a closed or reloaded page can't be stopped on a phone, but on a computer the browser can ask first
+window.addEventListener("beforeunload", e => {
+  if ((fight && committed(fight)) || rest) { e.preventDefault(); e.returnValue = ""; }
 });
 
 // ---------- installable app + offline ----------
@@ -1326,6 +1402,7 @@ if ("serviceWorker" in navigator && window.isSecureContext) {
 applySettings();
 renderAppStatus();
 show("camp");
+settleLeftFight();
 saveIfMigrated();
 syncFromPc();
 // load body tracking early so the first fight starts fast

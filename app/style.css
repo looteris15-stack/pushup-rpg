@@ -148,6 +148,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .callout.slow b { color: #a9c4ff; }
 .callout.torch { background: rgba(240, 168, 60, 0.1); border-color: rgba(240, 168, 60, 0.5); }
 .callout.torch b { color: var(--torch); }
+.callout.leave { background: rgba(255, 107, 91, 0.1); border-color: rgba(255, 107, 91, 0.5); }
+.callout.leave b { color: var(--bad); }
+#stayNote { margin: 0; font: 600 12px/1.2 var(--display); color: var(--warn); }
 .mrow.locked { opacity: 0.55; }
 .monster.test #fHpFill { background: var(--torch); }
 

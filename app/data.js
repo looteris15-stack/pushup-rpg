@@ -9,6 +9,7 @@ export const RULES = {
   dungeonStartSec: 30,      // after a break, do the first rep within this time
   maxPauseSec: 15,          // after the first rep: no strict rep for this long = the monster gets you
   leavePlankSec: 3,         // stand up or sit back this long = you lose
+  leaveAppSec: 10,          // a fight that has started: away from the app longer than this = you gave up
   slowDownSec: 2,           // "slow reps": going down must take this long (2 early, 3 in later areas)
   slowHardSec: 3,
   specialHpMult: 0.7,       // slow-rep monsters get fewer HP, because each rep is harder
