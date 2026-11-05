@@ -1156,9 +1156,10 @@ async function makeOffline(reg) {
   if (!navigator.serviceWorker.controller) {
     await new Promise(r => navigator.serviceWorker.addEventListener("controllerchange", r, { once: true }));
   }
-  // fetch the tracking files once through the helper so it keeps a copy (instant if already saved)
-  for (const u of await trackingFiles(state.settings.model).catch(() => [])) await fetch(u).catch(() => {});
-  offlineReady = await checkOffline();
+  // fetch the tracking files once through the helper so it keeps a copy (instant if already saved);
+  // read each one to the end, because the helper saves it only after the whole file has arrived
+  for (const u of await trackingFiles(state.settings.model).catch(() => [])) await fetch(u).then(r => r.arrayBuffer()).catch(() => {});
+  for (let i = 0; i < 10 && !(offlineReady = await checkOffline()); i++) await new Promise(r => setTimeout(r, 2000));
   renderAppStatus();
   // then all monster pictures, so the map has them offline too
   const urls = [...ART].flatMap(id => [artUrl(id, true), artUrl(id)]).map(u => new URL(u, location.href).href);
