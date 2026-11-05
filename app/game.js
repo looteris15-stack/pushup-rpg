@@ -61,9 +61,11 @@ function loadLocal() {
   }
 }
 let state = loadLocal();
+// returns whether the save really reached the phone's storage
 function storeLocal() {
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(state)); saveFailed = false; }
   catch { saveFailed = true; } // storage full or blocked: the camp shows a warning
+  return !saveFailed;
 }
 function storedSave() {
   try { const raw = localStorage.getItem(SAVE_KEY); return raw ? JSON.parse(raw) : null; } catch { return null; }
@@ -92,14 +94,19 @@ window.addEventListener("focus", () => adoptIfNewer());
 const PC_SAVE = !location.hostname.endsWith("github.io");
 let pcChecked = false;
 const asciiJson = s => JSON.stringify(s).replace(/[\u007f-￿]/g, c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+// returns true when the progress is really saved on the phone (result screens only say "saved" then)
 function save() {
   // another window saved newer progress since this one last looked: take that instead of saving over it
-  if (adoptIfNewer()) return;
+  if (adoptIfNewer()) return false;
   state.rev = (state.rev || 0) + 1;
   state.savedAt = Date.now();
-  storeLocal();
+  const ok = storeLocal();
   pushToPc();
+  return ok;
 }
+// shown on a victory screen when saving failed: the progress is only in this session until backed up
+const NOT_SAVED = `<span class="chip bad">Not saved</span> Saving failed: the phone's storage is full or blocked, so this is only kept until you close the game. Make a backup now (button below, or Settings → Backup) before you close or reload it.`;
+const BACKUP_NOW_BTN = `<button type="button" class="primary" data-action="backupNow">Back up now</button>`;
 let saveTimer = 0;
 function saveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(save, 500); }
 
@@ -1261,11 +1268,12 @@ function win() {
     if (f.where === "wander") { state.wandererDone = f.m.key; lines.push("It wanders off. Another one may come tomorrow."); }
     if (f.where === "champion") lines.push(`The next Champion will have ${state.stats.bestSet + 1} HP.`);
     levelUpLine(levelBefore, lines);
-    save();
+    const ok = save();
+    if (!ok) lines.push(NOT_SAVED);
     say(f.where === "champion" ? `New record. ${f.reps}!` : `${f.m.name} defeated!`);
     endFight("map");
     resultModal({ tone: "won", eyebrow: "Victory", title: `${f.m.name} defeated`, lines,
-      buttons: `<button type="button" class="primary" data-action="closeModal">Back to the map</button>` });
+      buttons: (ok ? "" : BACKUP_NOW_BTN) + `<button type="button"${ok ? ' class="primary"' : ""} data-action="closeModal">Back to the map</button>` });
     return;
   }
 
@@ -1287,15 +1295,21 @@ function win() {
   state.stats.deepestFloor = Math.max(state.stats.deepestFloor, cleared);
   state.dungeonFloor = cleared + 1;
   state.run = null;
-  lines.push(`Safe room reached! Floor ${cleared} is saved. +${bonus} XP.`);
+  const safeAt = lines.length;
   levelUpLine(levelBefore, lines);
-  save();
+  // only say the floor is saved when it really is; the progress stays in this session either way
+  const ok = save();
+  lines.splice(safeAt, 0, ok
+    ? `Safe room reached! Floor ${cleared} is saved. +${bonus} XP.`
+    : `Safe room reached! Floor ${cleared} cleared, +${bonus} XP.`);
+  if (!ok) lines.push(NOT_SAVED);
   say("Safe room reached!");
   endFight("dungeon");
   const more = state.dungeonFloor <= DUNGEON.floors.length;
   resultModal({ tone: "won", eyebrow: "Victory", title: `Floor ${cleared} cleared`, lines,
-    buttons: (more ? `<button type="button" class="primary" data-action="deeper">Go deeper: floor ${state.dungeonFloor}</button>` : "")
-      + `<button type="button"${more ? "" : ' class="primary"'} data-action="closeModal">Leave the mine</button>` });
+    buttons: (ok ? "" : BACKUP_NOW_BTN)
+      + (more ? `<button type="button"${ok ? ' class="primary"' : ""} data-action="deeper">Go deeper: floor ${state.dungeonFloor}</button>` : "")
+      + `<button type="button"${more || !ok ? "" : ' class="primary"'} data-action="closeModal">Leave the mine</button>` });
 }
 
 function lose(reason) {

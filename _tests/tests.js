@@ -68,6 +68,28 @@ async function open(id) {
     },
     rep() { try { w.PushupRPG.repEvent({ type: "rep", count: 1, depth: true, downSecs: 3 }); } catch (e) { errors.push("thrown: " + e.message); } },
     async reps(n) { for (let i = 0; i < n; i++) { g.rep(); await wait(40); } await wait(300); },
+    // from now on, saving in this window fails like a full or blocked phone storage
+    breakStorage() { w.Storage.prototype.setItem = function () { throw new w.DOMException("full", "QuotaExceededError"); }; },
+    // clears the current mine floor (3 rooms, skipping the breaks); onLastRep runs just before the final rep
+    async clearFloor(onLastRep = () => {}) {
+      await g.enterFloor();
+      for (let room = 0; room < 3; room++) {
+        await until(() => w.PushupRPG.fight && !w.PushupRPG.fight.over, 5000, `room ${room + 1}`);
+        await g.reps(w.PushupRPG.fight.total - 1);
+        if (room === 2) onLastRep();
+        await g.reps(1);
+        if (room < 2) { d.querySelector("#btnFightNow").click(); await wait(300); }
+      }
+    },
+    // taps a backup button and returns the backup text the share menu would get (no real share sheet)
+    async backupText(selector) {
+      let shared = null;
+      w.navigator.canShare = () => true;
+      w.navigator.share = async data => { shared = data; };
+      d.querySelector(selector).click();
+      await until(() => shared, 3000, "the backup to be shared");
+      return shared.files ? await shared.files[0].text() : shared.text;
+    },
   };
   return g;
 }
@@ -160,6 +182,49 @@ const tests = [
     const B = await open("B");
     await B.fightMonster("cave-rat");
     check(B.fight && !B.fight.over, `B could not start: "${B.modal().slice(0, 90)}"`);
+  }],
+  // ---------------------------------------------------------------- Bug #2: saving fails
+  ["#2a Safe room: when saving fails, it says so and keeps the floor in this session", async () => {
+    await reset();
+    const A = await open("A");
+    const xp0 = A.state.xp;
+    await A.clearFloor(() => A.breakStorage());
+    const text = A.modal();
+    check(/floor 1 cleared/i.test(text), `no safe-room screen: "${text.slice(0, 80)}"`);
+    check(!/is saved/i.test(text), `it still claims the floor was saved: "${text.slice(0, 160)}"`);
+    check(/not saved|saving failed|could not save/i.test(text), `no clear saving warning: "${text.slice(0, 160)}"`);
+    check(/backup/i.test(text), "it doesn't tell the player to make a backup");
+    // the progress stays in this session
+    check(A.state.dungeonFloor === 2 && A.state.stats.deepestFloor === 1, "the cleared floor was dropped from memory");
+    check(A.state.xp > xp0, "the XP was dropped from memory");
+    check(saved().dungeonFloor === 1, "test setup: storage should really have failed");
+    // ...and a backup made now carries it
+    const backup = await A.backupText('#modal [data-action="backupNow"]');
+    const code = backup.match(/PRPG2\.([A-Za-z0-9+/=]+)\./);
+    check(code, "the warning has no working backup button");
+    const inBackup = JSON.parse(atob(code[1]));
+    check(inBackup.dungeonFloor === 2 && inBackup.xp === A.state.xp, "the backup doesn't have the cleared floor");
+  }],
+  ["#2b A normal win says so too when saving fails", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("field-mouse");
+    await A.reps(2);
+    A.breakStorage();
+    await A.reps(1);
+    const text = A.modal();
+    check(/defeated/i.test(text), `no victory screen: "${text.slice(0, 80)}"`);
+    check(/not saved|saving failed|could not save/i.test(text), `no saving warning on the victory screen: "${text.slice(0, 160)}"`);
+    check(A.state.stats.wins === 1, "the win was dropped from memory");
+  }],
+  ["#2c When saving works, the safe room still says the floor is saved", async () => {
+    await reset();
+    const A = await open("A");
+    await A.clearFloor();
+    const text = A.modal();
+    check(/floor 1 is saved/i.test(text), `missing "Floor 1 is saved": "${text.slice(0, 160)}"`);
+    check(!/not saved|saving failed|could not save/i.test(text), "a saving warning showed although saving worked");
+    check(saved().dungeonFloor === 2, "the floor was not saved");
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
