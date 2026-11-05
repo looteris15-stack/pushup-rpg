@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pushup RPG tests</title>
+<!-- Automated tests: two copies of the game side by side share one save, like two tabs.
+     Run with _tests\run.ps1 (hidden Edge), or open http://localhost:8002/_tests/ by hand.
+     The folder starts with "_" so GitHub Pages does not publish it. -->
+<style>
+  body { margin: 0; padding: 12px; font: 14px/1.4 system-ui, sans-serif; background: #111; color: #eee; }
+  .frames { display: flex; gap: 8px; }
+  iframe { width: 420px; height: 640px; border: 1px solid #444; background: #000; }
+  .pass { color: #6fe08a; } .fail { color: #ff6b5b; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="frames"><iframe id="A" title="Window A"></iframe><iframe id="B" title="Window B"></iframe></div>
+<pre id="log"></pre>
+<script type="module" src="tests.js"></script>
+</body>
+</html>

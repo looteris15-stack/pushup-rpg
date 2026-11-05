@@ -77,6 +77,8 @@ function adoptIfNewer() {
   needsSave = false;
   applySettings();
   if (current !== "fight") renderCurrent();
+  // this window was in a mine fight or break, and the run is gone in the newer save
+  if (!state.run && ((fight && !fight.over && fight.where === "dungeon") || (rest && !fight))) syncLost();
   return true;
 }
 window.addEventListener("storage", e => { if (e.key === SAVE_KEY) adoptIfNewer(); });
@@ -833,12 +835,14 @@ async function openFightScreen(backTo) {
   setBanner("Starting camera…", "");
   $("debug").textContent = "Starting camera…";
   $("dbgRep").hidden = $("dbgNoRep").hidden = !DEBUG;
+  beat(); // other windows see a fight starting here, even while the camera is still starting
   try {
     await tracker.startCamera(state.settings.camera, state.settings.model);
     return true;
   } catch (e) {
     if (DEBUG) { $("debug").textContent = "debug: no camera, use the fake buttons"; return true; }
     tracker.stop();
+    stopBeat();
     show(backTo);
     openModal(`<p class="eyebrow">Camera</p><h2>The fight can't start</h2><p>${esc(e.friendly || "Could not start the camera.")}</p>
       <div class="row"><button type="button" class="primary" data-action="closeModal">OK</button></div>`);
@@ -850,6 +854,7 @@ function beginFight(m, where, timedStart, label) {
   const t = performance.now();
   const rounds = m.rounds || [m.hp];
   rest = null;
+  beat();
   fight = {
     m, where, label, rounds, round: 0, total: m.hp, hpLeft: m.hp, roundLeft: rounds[0],
     reps: 0, roundReps: 0, maxSet: 0,
@@ -897,19 +902,56 @@ function markFight() {
   };
   save();
 }
+// ---------- one fight at a time across windows ----------
+// The installed app and Chrome tabs share one save. A window with a fight or break running writes an
+// "alive" signal every 2 s, in its own small entry (not the save, so the save isn't rewritten all the time).
+// Other windows treat the fight as still going while that signal is under 10 s old: they don't start a
+// fight of their own and don't count it as given up. Once it stops (the game was closed, or left for more
+// than 10 s, which the leaving rule counts as giving up anyway), the unfinished fight is settled.
+// A plain timer drives it, not the camera loop, so a slow camera start or dropped frames can't stall it.
+const ALIVE_KEY = "pushupRPG.alive", ALIVE_EVERY = 2000, ALIVE_FRESH = 10000;
+const WINDOW_ID = Math.random().toString(36).slice(2);
+function readAlive() { try { return JSON.parse(localStorage.getItem(ALIVE_KEY) || "null"); } catch { return null; } }
+function beat() { try { localStorage.setItem(ALIVE_KEY, JSON.stringify({ id: WINDOW_ID, at: Date.now() })); } catch {} }
+function stopBeat() { try { const a = readAlive(); if (a && a.id === WINDOW_ID) localStorage.removeItem(ALIVE_KEY); } catch {} }
+setInterval(() => { if (fight || rest) beat(); }, ALIVE_EVERY);
+// a fight or break is running in ANOTHER window right now
+function otherWindowBusy() {
+  const a = readAlive();
+  return !!a && a.id !== WINDOW_ID && Date.now() - a.at < ALIVE_FRESH;
+}
+// shown instead of starting a second fight (or settling one that is still going)
+function blockedByOtherWindow() {
+  if (!otherWindowBusy()) return false;
+  openModal(`<p class="eyebrow">One fight at a time</p><h2>Fight is still active in another tab</h2>
+    <p>The game is open in another tab or window, and a fight or mine break is running there. Finish it there first.</p>
+    <p class="fine">If you just closed that one, wait about 10 seconds and try again.</p>
+    <div class="row"><button type="button" class="primary" data-action="closeModal">OK</button></div>`);
+  return true;
+}
+// the mine run this window was fighting in was changed or ended in another window: stop without counting
+function syncLost() {
+  if (fight) fight.over = true;
+  rest = null;
+  endFight("dungeon");
+  resultModal({ tone: "info", eyebrow: "Changed in another window", title: "This fight was stopped",
+    lines: ["Your mine run was changed in another tab or window, so this fight can't go on here. Nothing was counted for it."],
+    buttons: `<button type="button" class="primary" data-action="closeModal">OK</button>` });
+}
+
 let settleTimer = 0;
-function settleLeftFight(force = false) {
+function settleLeftFight() {
+  if (fight) return; // this window is the one fighting
   const mk = state.fightMark;
-  if (mk && fight) return; // this window is the one fighting
+  const br = !mk && state.run && state.run.breakEndsAt;
+  if (!mk && !br) return;
+  // still going in another window: look again later instead of ending a fight that isn't over
+  if (otherWindowBusy()) {
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(() => { adoptIfNewer(); settleLeftFight(); }, ALIVE_FRESH / 2);
+    return;
+  }
   if (mk) {
-    // a mark from the last 20 s may belong to a fight still going on in another window of the game:
-    // look again later (that window keeps updating it) instead of ending a fight that isn't over
-    const age = now() - (mk.at || 0);
-    if (!force && age >= 0 && age < 20000) {
-      clearTimeout(settleTimer);
-      settleTimer = setTimeout(() => { adoptIfNewer(); settleLeftFight(); }, 20000 - age + 500);
-      return;
-    }
     state.fightMark = null;
     fight = {
       m: { id: mk.id, name: mk.name, hp: mk.hp, key: mk.key, boss: mk.boss }, where: mk.where, label: mk.label,
@@ -921,8 +963,7 @@ function settleLeftFight(force = false) {
     return;
   }
   // closed during a break in the mine and gone longer than the break plus the start time
-  const br = state.run && state.run.breakEndsAt;
-  if (br && now() > br + RULES.dungeonStartSec * 1000) {
+  if (now() > br + RULES.dungeonStartSec * 1000) {
     fight = null;
     lose("The game was closed during a break in the mine, longer than the break.");
   }
@@ -945,7 +986,7 @@ function renderFightHud() {
     : f.overkill ? `defeated · +${f.reps - f.total} extra`
     : `${f.hpLeft} / ${f.total} HP`;
   $("fHpFill").style.width = f.openEnded ? "100%" : (f.hpLeft / f.total) * 100 + "%";
-  const bits = [f.where === "dungeon"
+  const bits = [f.where === "dungeon" && state.run
     ? `${DUNGEON.name} · floor ${state.run.floor} · room ${state.run.room + 1} of ${DUNGEON.floors[state.run.floor - 1].length}`
     : f.label];
   if (f.rounds.length > 1) bits.push(`round ${f.round + 1} of ${f.rounds.length}`);
@@ -1122,6 +1163,8 @@ function onRepEvent(ev) {
 // downSecs: how long the way down took, shown on slow monsters
 function hit(downSecs = null) {
   const f = fight;
+  // the mine run vanished (changed in another window): stop cleanly instead of crashing
+  if (f.where === "dungeon" && !state.run) { syncLost(); return; }
   if (!f.started) {
     f.started = true;
     resetFleeBtn();
@@ -1340,6 +1383,7 @@ function endFight(screen) {
   fight = null;
   rest = null;
   if (state.fightMark) { state.fightMark = null; save(); }
+  stopBeat(); // a clean end frees the other windows right away
   tracker.stop();
   $("restPanel").hidden = true;
   show(screen);
@@ -1359,6 +1403,7 @@ function resultModal({ tone, eyebrow, title, lines, buttons }) {
 
 function startRest(o) {
   rest = { endsAt: performance.now() + o.sec * 1000, beeped: 0, onDone: o.onDone, quitReason: o.quitReason };
+  beat(); // a break counts as busy too: no other window may take over the run
   $("restTitle").textContent = o.title;
   $("restNext").innerHTML = o.next;
   $("restWarn").textContent = o.warn;
@@ -1445,9 +1490,20 @@ function mineBreak(sec, title, lines) {
 
 // ----- starting fights -----
 
+// Before any fight starts: a fight or break running in another window blocks it, and an unfinished
+// fight from a closed game is settled first, so a new fight can't wipe it away.
+function mayStartHere() {
+  if (fight || rest) return false;
+  if (blockedByOtherWindow()) return false;
+  if (state.fightMark || (state.run && state.run.breakEndsAt && now() > state.run.breakEndsAt + RULES.dungeonStartSec * 1000)) {
+    closeModal();
+    settleLeftFight();
+    return false;
+  }
+  return true;
+}
 async function startFight(id) {
-  // an unfinished fight from a closed game is settled first, so a new fight can't wipe it away
-  if (state.fightMark && !fight) { closeModal(); settleLeftFight(true); return; }
+  if (!mayStartHere()) return;
   const r = resolveMonster(id);
   if (!r || fight || state.run) return;
   if (r.where !== "test" && (state.restUntil > now() || bossLock(r.m, r.zone))) return;
@@ -1455,7 +1511,7 @@ async function startFight(id) {
   beginFight(r.m, r.where, false, r.label);
 }
 async function enterFloor() {
-  if (state.fightMark && !fight) { closeModal(); settleLeftFight(true); return; }
+  if (!mayStartHere()) return;
   const t = now();
   if (fight || state.run || state.restUntil > t || state.dungeonLockedUntil > t || state.dungeonFloor > DUNGEON.floors.length) return;
   state.run = { floor: state.dungeonFloor, room: 0 };
@@ -1464,8 +1520,8 @@ async function enterFloor() {
   beginFight(DUNGEON.floors[state.run.floor - 1][0], "dungeon", false, DUNGEON.name);
 }
 async function continueRun() {
-  if (state.fightMark && !fight) { closeModal(); settleLeftFight(true); return; }
-  if (!state.run || fight) return;
+  if (!mayStartHere()) return;
+  if (!state.run) return;
   if (!(await openFightScreen("dungeon"))) return;
   // back after the game was closed: only what was left of the break (a full minute if no break was on)
   const left = state.run.breakEndsAt ? Math.ceil((state.run.breakEndsAt - now()) / 1000) : 60;
