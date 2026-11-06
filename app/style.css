@@ -81,7 +81,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   padding: 5px 8px;
   border-radius: 6px;
   background: rgba(238, 243, 236, 0.1);
-  vertical-align: 2px;
+  /* centred on the text around it: lining up on its own letters' baseline made the whole line 1 px
+     taller or shorter when the Oxanium font swapped in late, nudging the Camp buttons below it */
+  vertical-align: middle;
   white-space: nowrap;
 }
 .chip.good { background: rgba(111, 224, 138, 0.16); color: var(--good); }

@@ -11,8 +11,14 @@
 <meta name="mobile-web-app-capable" content="yes">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700;800&display=swap">
+<!-- The font is only decoration, so nothing waits for it: it is fetched alongside the page and swaps in
+     when it arrives. Until then (or offline, or when its server hangs) the fallback fonts in style.css show. -->
+<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700;800&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700;800&display=swap"></noscript>
 <link rel="stylesheet" href="style.css">
+<!-- game.js imports these two: fetch them at the same time as game.js instead of after it -->
+<link rel="modulepreload" href="core.js">
+<link rel="modulepreload" href="data.js">
 </head>
 <body>
 

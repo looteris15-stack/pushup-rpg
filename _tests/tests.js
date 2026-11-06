@@ -176,6 +176,42 @@ async function open(id) {
   return g;
 }
 const close = id => { document.getElementById(id).src = "about:blank"; return wait(200); };
+// ---- the font (fonts.googleapis.com / fonts.gstatic.com): run.ps1 answers those requests. Modes:
+// "block" (fail at once, the default), "fail" (as if offline), "hold" for ms, then "ok" (a stand-in
+// Oxanium with other letter widths) or "fail". Each call also clears run.ps1's list of seen font
+// requests and of console errors.
+async function fontMode(mode, ms = 0, then = "fail") {
+  const r = await fetch(`/__fonts/set?mode=${mode}&ms=${ms}&then=${then}&clear=1`).catch(() => null);
+  check(r && r.ok && /json/.test(r.headers.get("content-type") || ""), "the font control is missing: run the tests with _tests\\run.ps1");
+  return r.json();
+}
+const fontStatus = async () => (await fetch("/__fonts/status")).json();
+const BLOCKED_HOSTS = /fonts\.googleapis\.com|fonts\.gstatic\.com|cdn\.jsdelivr\.net|storage\.googleapis\.com/;
+// opens the game in a window without waiting for the page to finish loading, and with no offline
+// helper in charge (so its requests go out where they can be watched); ready = ms until Camp works
+async function openTimed(id, limit = 6000) {
+  for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+  const el = document.getElementById(id);
+  const t0 = performance.now();
+  el.src = `${GAME}&win=${id}${Date.now()}`;
+  let ready = null;
+  while (performance.now() - t0 < limit) {
+    try {
+      const d = el.contentDocument;
+      if (el.contentWindow.PushupRPG && !d.getElementById("camp").hidden && d.getElementById("campTitle").textContent) { ready = performance.now() - t0; break; }
+    } catch {}
+    await wait(5);
+  }
+  return { w: el.contentWindow, d: el.contentDocument, ready };
+}
+// taps a Camp menu button and the Back button on that screen; false if either didn't work
+function campTrip(d, to) {
+  d.querySelector(`#camp [data-action="goto"][data-to="${to}"]`).click();
+  const went = !d.getElementById(to).hidden;
+  d.querySelector(`#${to} [data-action="goto"][data-to="camp"]`).click();
+  return went && !d.getElementById("camp").hidden;
+}
+const frame = w => new Promise(r => w.requestAnimationFrame(() => w.requestAnimationFrame(r)));
 // n characters of base64 made from random bytes (looks like a backup code, but holds no save)
 function randomB64(n) {
   const bytes = new Uint8Array(Math.ceil(n * 3 / 4));
@@ -642,6 +678,89 @@ const tests = [
     check(n.atob === 0, `the confirm tap decoded the code again (${n.atob} atob calls)`);
     check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
   }],
+  // ------------------------------------------- Item 2 (audit finding #5): the font must not hold up Camp
+  ["Item 2a A font server that hangs for 3.5 s doesn't hold up Camp (paint, buttons, page load)", async () => {
+    await reset();
+    try {
+      await fontMode("hold", 3500, "fail");
+      const g = await openTimed("A");
+      check(g.ready != null, "Camp didn't work within 6 s");
+      const usable = campTrip(g.d, "settings");
+      // Camp can be working before the browser has painted it: wait for the first paint's record
+      const fcp = await until(() => g.w.performance.getEntriesByName("first-contentful-paint")[0], 1500, "first paint").catch(() => null);
+      const st = await fontStatus();
+      check(g.ready < 1000, `Camp took ${g.ready.toFixed(0)} ms to work (limit 1,000)`);
+      check(fcp && fcp.startTime < 1000, `first paint at ${fcp ? fcp.startTime.toFixed(0) + " ms" : "never"} (limit 1,000)`);
+      check(usable, "Settings → Back didn't work");
+      check(st.held >= 1 && st.seen.some(u => /fonts\.googleapis\.com/.test(u)), `test setup: the font request wasn't held: ${JSON.stringify(st).slice(0, 200)}`);
+      // the page counts as loaded although the font is still on its way (nothing waits on it)
+      await until(() => g.d.readyState === "complete", 2000, "the page to finish loading").catch(() => {});
+      const loaded = g.d.readyState === "complete", stillHeld = (await fontStatus()).held >= 1;
+      check(loaded && stillHeld, `the page load waited for the font (readyState ${g.d.readyState}, font still held: ${stillHeld})`);
+      return `Camp working at ${g.ready.toFixed(0)} ms, first paint ${fcp.startTime.toFixed(0)} ms, page loaded while the font was still held`;
+    } finally { await fontMode("block"); }
+  }],
+  ["Item 2b With the font failing (offline), Camp loads cleanly and works", async () => {
+    await reset();
+    try {
+      await fontMode("fail");
+      const g = await openTimed("A");
+      check(g.ready != null && g.ready < 1000, `Camp took ${g.ready == null ? "over 6,000" : g.ready.toFixed(0)} ms to work`);
+      await until(() => g.d.readyState === "complete", 3000, "the page to finish loading");
+      for (const to of ["settings", "map", "records", "dungeon"]) check(campTrip(g.d, to), `Camp → ${to} → Back didn't work`);
+      const menu = [...g.d.querySelectorAll("#camp .menu button")];
+      check(menu.length === 4 && menu.every(b => b.getBoundingClientRect().height >= 42), "the Camp buttons lost their size");
+      await wait(300);
+      const st = await fontStatus();
+      check(st.seen.some(u => /fonts\.googleapis\.com/.test(u)), "test setup: the font was never asked for");
+      // only the blocked outside servers may show up as failed requests (and the monster pictures,
+      // which run.ps1 doesn't copy); nothing else may complain
+      const bad = st.log.filter(l => !BLOCKED_HOSTS.test(l) && !/404 \(Not Found\) \S+\/app\/img\//.test(l));
+      check(bad.length === 0, "console errors: " + bad.join(" | "));
+      return `Camp working at ${g.ready.toFixed(0)} ms; browser log: ${st.log.filter(l => BLOCKED_HOSTS.test(l)).length} failed outside request(s) ` +
+        `(${st.log.filter(l => /fonts\.g/.test(l)).length} of them the font), ${st.log.length - bad.length - st.log.filter(l => BLOCKED_HOSTS.test(l)).length} missing test pictures, nothing else`;
+    } finally { await fontMode("block"); }
+  }],
+  ["Item 2c core.js + data.js load alongside game.js, once each; a late font doesn't move Camp's buttons", async () => {
+    // 1. index.html asks for game.js's imports itself, at the same addresses game.js uses
+    const base = new URL("../app/", location.href).href;
+    const html = await (await fetch(base + "index.html", { cache: "no-store" })).text();
+    const pre = [...new DOMParser().parseFromString(html, "text/html").querySelectorAll('link[rel="modulepreload"]')]
+      .map(l => new URL(l.getAttribute("href"), base).href);
+    const src = await (await fetch(base + "game.js", { cache: "no-store" })).text();
+    const imports = [...src.matchAll(/^import\s[^;]*?from\s+["']([^"']+)["']/gm)].map(m => new URL(m[1], base + "game.js").href);
+    check(imports.length >= 2, "test setup: game.js's imports weren't found");
+    for (const u of imports) check(pre.includes(u), `index.html doesn't preload ${u.slice(base.length)} (it preloads: ${pre.map(p => p.slice(base.length)).join(", ") || "nothing"})`);
+    await reset();
+    try {
+      // 2. open with the font arriving after 1.5 s (a stand-in with other letter widths)
+      await fontMode("hold", 1500, "ok");
+      const g = await openTimed("A"), d = g.d, w = g.w;
+      check(g.ready != null && g.ready < 1000, `Camp took ${g.ready == null ? "over 6,000" : g.ready.toFixed(0)} ms to work`);
+      const res = f => w.performance.getEntriesByType("resource").filter(e => new URL(e.name).pathname.endsWith("/app/" + f));
+      for (const f of ["game.js", "core.js", "data.js"]) check(res(f).length === 1, `${f} was fetched ${res(f).length} times`);
+      const game = res("game.js")[0];
+      for (const f of ["core.js", "data.js"]) {
+        check(res(f)[0].startTime < game.responseEnd, `${f} was only asked for after game.js arrived (${res(f)[0].startTime.toFixed(1)} ms vs ${game.responseEnd.toFixed(1)} ms)`);
+      }
+      // 3. Camp's boxes before and after the font swaps in
+      const boxes = () => [...d.querySelectorAll("#camp .hero, #camp .menu button, #campTiles .tile")].map(e => {
+        const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].map(v => +v.toFixed(1));
+      });
+      const textW = () => { const r = d.createRange(); r.selectNodeContents(d.querySelector("#camp .menu b")); return r.getBoundingClientRect().width; };
+      await frame(w);
+      const before = boxes(), w0 = textW();
+      check((await fontStatus()).held >= 1, "test setup: the font arrived before Camp could be measured");
+      await until(() => Math.abs(textW() - w0) > 1, 5000, "the stand-in font to swap in");
+      await frame(w);
+      const after = boxes();
+      const moved = before.map((b, i) => [i, b, after[i]]).filter(([, b, a]) => b.some((v, k) => Math.abs(v - a[k]) > 0.5));
+      check(before.length >= 5, `test setup: only ${before.length} Camp boxes found`);
+      check(moved.length === 0, `Camp boxes moved when the font swapped in ([index, before, after]): ${JSON.stringify(moved)}`);
+      return `core.js/data.js asked for at ${res("core.js")[0].startTime.toFixed(0)}/${res("data.js")[0].startTime.toFixed(0)} ms, game.js arrived ${game.responseEnd.toFixed(0)} ms; ` +
+        `"World map" ${w0.toFixed(1)} → ${textW().toFixed(1)} px wide, ${before.length} Camp boxes unchanged`;
+    } finally { await fontMode("block"); }
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();
@@ -660,7 +779,9 @@ const tests = [
 // ---------------------------------------------------------------- runner
 const log = document.getElementById("log");
 window.__results = [];
+const only = new URLSearchParams(location.search).get("only"); // run.ps1 -Only "Item 2": just those tests
 for (const [name, fn] of tests) {
+  if (only && !name.includes(only)) continue;
   const t0 = performance.now();
   let pass = true, detail = "", note = "";
   try { note = (await fn()) || ""; } catch (e) { pass = false; detail = e.message; }
