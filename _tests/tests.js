@@ -164,6 +164,24 @@ async function open(id) {
       }));
       return h;
     },
+    // body tracking loads that wait: every load asked for is kept in ml.loads ({ name, give(used), fail() }).
+    // give() hands out a counted fake model ({ id, name, frames, closes }), also kept in ml.models.
+    // ml.auto = true: later loads give their model at once
+    heldModels() {
+      const ml = { loads: [], models: [], auto: false };
+      w.PushupRPG.hooks.setModelLoader(name => new Promise((res, rej) => {
+        const id = ml.loads.length + 1;
+        const load = { name,
+          give(used = "CPU") {
+            const m = { id, name, frames: 0, closes: 0, detectForVideo() { this.frames++; return { landmarks: [] }; }, close() { this.closes++; } };
+            ml.models.push(m); res({ lm: m, used }); return m;
+          },
+          fail() { rej(new Error("network down")); } };
+        ml.loads.push(load);
+        if (ml.auto) load.give();
+      }));
+      return ml;
+    },
     // the camera: every request is counted (rec.gum) and every stream kept (rec.streams). hold = true:
     // the next request waits until give() or refuse(errorName); deny = "SomeError": the next request
     // fails at once with it; otherwise a fake stream comes at once
@@ -323,6 +341,15 @@ async function whileHidden(g, cam, wl, loop, inf, ms = 400) {
     loopRuns: loop.runs - r0, frames: (inf.frames || 0) - f0, fightReady: !!g.fight };
 }
 const liveTracks = streams => streams.filter(Boolean).flatMap(s => s.getTracks()).filter(t => t.readyState === "live").length;
+// ---- body tracking: picks a model in Settings (this asks for it to load, like a player would)
+function pickModel(g, v) { const s = g.d.querySelector("#sModel"); s.value = v; s.dispatchEvent(new g.w.Event("change")); }
+// the game loads body tracking by itself 1.5 s after it opens (the warm-up). This lets that load fail
+// at once (as if offline) and waits until it has happened, so a test's own loads are the only ones
+async function skipWarmUp(g) {
+  g.api.hooks.setModelLoader(() => Promise.reject(new Error("warm-up skipped")));
+  await wait(1300);
+}
+const byModel = (ml, k) => Object.fromEntries(ml.models.map(m => [`${m.name}#${m.id}`, m[k]]));
 // ---- sound: the base save has sound off; this one has it on (voice stays off)
 const SOUND_ON = { ...BASE, settings: { ...BASE.settings, sound: true } };
 // does the audio engine's clock still move (it stops while the engine sleeps)?
@@ -1560,6 +1587,84 @@ const tests = [
     check(res.returnCamera && !res.stillShown && !res.returnCameraLive && !res.liveTracks && !res.locks && !res.lockAsks && !res.loopStarts && !res.loopRuns && !res.frames,
       JSON.stringify(res));
     check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return JSON.stringify(res);
+  }],
+  // ---------------- Item 6 (audit finding #6): one body-tracking model at a time, kept between fights
+  ["Item 6a Body tracking asked Full → Lite → Full, answered newest first: the newest Full tracks; each old model is closed once", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const ml = A.heldModels(), cam = {};
+    A.camera(cam); A.fakeWakeLock(false);
+    for (const m of ["full", "lite", "full"]) pickModel(A, m);
+    check(ml.loads.map(l => l.name).join() === "full,lite,full", `test setup: loads asked: ${ml.loads.map(l => l.name).join()}`);
+    ml.loads[2].give("GPU"); await wait(50); // the newest answers first
+    ml.loads[1].give("CPU"); await wait(50);
+    ml.loads[0].give("CPU"); await wait(50);
+    const afterAnswers = { closes: byModel(ml, "closes"), delegate: A.api.delegate };
+    await A.fightMonster("field-mouse"); // Full is the setting now
+    await wait(500);
+    const fight = { fightReady: !!A.fight, error: A.modal().slice(0, 70), loads: ml.loads.length, frames: byModel(ml, "frames"), delegate: A.api.delegate };
+    await tapFlee(A);
+    const end = { closes: byModel(ml, "closes") };
+    const [m1, m2, m3] = ml.models.slice().sort((a, b) => a.id - b.id);
+    check(fight.fightReady && !fight.error && fight.loads === 3 && m3.frames > 0 && m1.frames === 0 && m2.frames === 0 && fight.delegate === "GPU"
+      && m1.closes === 1 && m2.closes === 1 && m3.closes === 0,
+      `after the answers: ${JSON.stringify(afterAnswers)}; fight: ${JSON.stringify(fight)}; after the fight: ${JSON.stringify(end)}`);
+    noPenalty(A);
+    return `after the answers: ${JSON.stringify(afterAnswers)}; fight: ${JSON.stringify(fight)}; after the fight: ${JSON.stringify(end)}`;
+  }],
+  ["Item 6b An old body-tracking load fails while the current one is still loading: a fight for the current type shares that load", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const ml = A.heldModels(), cam = {};
+    A.camera(cam); A.fakeWakeLock(false);
+    pickModel(A, "full"); pickModel(A, "lite"); // Lite is the current request (and the setting)
+    check(ml.loads.map(l => l.name).join() === "full,lite", `test setup: loads asked: ${ml.loads.map(l => l.name).join()}`);
+    ml.loads[0].fail(); await wait(100); // the old Full load fails
+    await A.tapFight("field-mouse"); // a second caller for Lite
+    const loadsWhileWaiting = ml.loads.length;
+    ml.loads[1].give();
+    await until(() => A.fight || A.modal(), 3000, "the fight").catch(() => {});
+    await wait(300);
+    const res = { loadsWhileWaiting, loads: ml.loads.length, fightReady: !!A.fight, error: A.modal().slice(0, 70), frames: byModel(ml, "frames"), closes: byModel(ml, "closes") };
+    const lite = ml.models.find(m => m.id === 2);
+    for (const l of ml.loads.slice(2)) l.give(); // let any extra load end
+    await tapFlee(A);
+    check(res.loadsWhileWaiting === 2 && res.loads === 2 && res.fightReady && !res.error && lite && lite.frames > 0 && lite.closes === 0, JSON.stringify(res));
+    noPenalty(A);
+    return JSON.stringify(res);
+  }],
+  ["Item 6c The current body-tracking load fails, then the same type is asked again: the retry loads, and later fights reuse it", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const ml = A.heldModels(), cam = {};
+    A.camera(cam); A.fakeWakeLock(false);
+    // 1. the fight's load fails
+    await A.tapFight("field-mouse");
+    await until(() => ml.loads.length === 1, 3000, "the fight's load");
+    ml.loads[0].fail();
+    await until(() => A.modal(), 3000, "a message").catch(() => {});
+    const failed = { error: /could not load body tracking/i.test(A.modal()), fightReady: !!A.fight, trackerRunning: A.api.trackerRunning };
+    // 2. the same fight again: a retry load (it answers at once), then two more fights
+    ml.auto = true;
+    const fights = [];
+    for (let i = 0; i < 3; i++) {
+      await A.fightMonster("field-mouse");
+      const m = ml.models[0], f0 = m ? m.frames : 0;
+      await wait(400);
+      fights.push({ ready: !!A.fight, error: A.modal().slice(0, 50), loads: ml.loads.length, framesThisFight: m ? m.frames - f0 : 0, closes: m ? m.closes : null });
+      await tapFlee(A);
+    }
+    const res = { failed, fights, models: ml.models.length, closes: byModel(ml, "closes") };
+    check(failed.error && !failed.fightReady && !failed.trackerRunning
+      && fights.every(f => f.ready && !f.error && f.loads === 2 && f.framesThisFight > 0 && f.closes === 0) && ml.models.length === 1, JSON.stringify(res));
+    noPenalty(A);
     return JSON.stringify(res);
   }],
   // ------------------------------------------------------------ earlier fixes keep working

@@ -296,15 +296,29 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   let frames = 0, fpsT = 0, fps = 0;
   const sm = {};
 
+  // Body tracking: a load of the asked type that is still going is shared, and a ready model is kept for
+  // later fights. modelGen: the newest request. Only it may install its model (and its delegate) or clear
+  // the pending load. A model that arrives for an older request is closed; so is the installed model
+  // when another type is asked for.
+  let modelGen = 0;
+  const closeModel = lm => { try { lm?.close(); } catch {} };
   function ensureModel(name) {
-    if (loading && name === modelName) return loading;
+    if (name === modelName && (loading || landmarker)) return loading || Promise.resolve(landmarker);
+    const g = ++modelGen;
     modelName = name;
-    try { landmarker?.close(); } catch {}
+    closeModel(landmarker);
     landmarker = null;
-    loading = modelLoader(name)
-      .then(({ lm, used }) => { landmarker = lm; delegate = used; return lm; })
-      .catch(err => { console.error(err); loading = null; throw err; });
-    return loading;
+    const p = modelLoader(name).then(({ lm, used }) => {
+      if (g !== modelGen) { closeModel(lm); return loading || landmarker; } // too late: the newer request counts
+      landmarker = lm; delegate = used; loading = null;
+      return lm;
+    }, err => {
+      if (g === modelGen) loading = null;
+      console.error(err);
+      throw err;
+    });
+    loading = p;
+    return p;
   }
 
   function setDims() {

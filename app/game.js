@@ -1799,6 +1799,7 @@ if (DEBUG) {
     get counter() { return tracker.counter; },
     get meterCycle() { return meter.cycle; }, // the rep the live depth meter is following
     get trackerRunning() { return tracker.running; },
+    get delegate() { return tracker.delegate; }, // GPU or CPU: how the installed body-tracking model runs
     set strictCamera(v) { strictCamera = !!v; },
     hooks: testHooks,
     wanderer: () => todaysWanderer(),
