@@ -886,6 +886,7 @@ const plankState = () => (fakeReps() ? "up" : tracker.counter.state);
 // Fight startup (camera question, then body tracking) can take a while. A Back button works the whole
 // time; going back counts for nothing, because no fight has begun yet. Returns true when the fight can begin.
 let startup = null; // { token, backTo, cancel } while the camera and body tracking start
+let strictCamera = false; // tests (?debug): a camera problem shows the real error instead of fake-rep mode
 async function openFightScreen(backTo) {
   applySettings();
   initAudio(); // after applySettings: with sound off, the audio engine isn't made or woken
@@ -915,7 +916,7 @@ async function openFightScreen(backTo) {
     return true;
   } catch (e) {
     if (token.cancelled) return false;
-    if (DEBUG) { $("debug").textContent = "debug: no camera, use the fake buttons"; return true; }
+    if (DEBUG && !strictCamera) { $("debug").textContent = "debug: no camera, use the fake buttons"; return true; }
     tracker.stop();
     quietAudio(); // no fight, no sound to finish
     stopBeat();
@@ -1798,6 +1799,7 @@ if (DEBUG) {
     get counter() { return tracker.counter; },
     get meterCycle() { return meter.cycle; }, // the rep the live depth meter is following
     get trackerRunning() { return tracker.running; },
+    set strictCamera(v) { strictCamera = !!v; },
     hooks: testHooks,
     wanderer: () => todaysWanderer(),
   };

@@ -154,8 +154,37 @@ async function open(id) {
       }
       return n;
     },
-    // body tracking loads at once (a fake model that never finds anyone)
-    fastModel() { w.PushupRPG.hooks.setModelLoader(async () => ({ lm: fakeModel(), used: "CPU" })); },
+    // body tracking loads at once (a fake model that never finds anyone; rec counts its frames)
+    fastModel(rec) { w.PushupRPG.hooks.setModelLoader(async () => ({ lm: fakeModel(rec), used: "CPU" })); },
+    // body tracking keeps loading until done() / fail(); the fake model it gives counts frames in rec
+    heldModel(rec) {
+      const h = {};
+      w.PushupRPG.hooks.setModelLoader(() => new Promise((res, rej) => {
+        h.done = () => res({ lm: fakeModel(rec), used: "CPU" }); h.fail = () => rej(new Error("network down"));
+      }));
+      return h;
+    },
+    // the camera: every request is counted (rec.gum) and every stream kept (rec.streams). hold = true:
+    // the next request waits until give(); otherwise a fake stream comes at once
+    camera(rec) {
+      rec.gum = 0; rec.streams = []; rec.hold = false;
+      w.navigator.mediaDevices.getUserMedia = () => {
+        rec.gum++;
+        const make = () => { const s = g.fakeStream(); rec.streams.push(s); return s; };
+        if (!rec.hold) return Promise.resolve(make());
+        rec.hold = false;
+        return new Promise(r => { rec.give = () => r(make()); });
+      };
+    },
+    // the next video.play() waits until rec.playGo() (like a slow camera picture)
+    holdPlay(rec) {
+      const play = w.HTMLVideoElement.prototype.play;
+      w.HTMLVideoElement.prototype.play = function () {
+        w.HTMLVideoElement.prototype.play = play;
+        const p = play.call(this);
+        return new Promise((res, rej) => { rec.playGo = () => p.then(res, rej); });
+      };
+    },
     // a fake "keep the screen on" (wake lock). hold = true: answers wait until grantAll(). Records every
     // request (and whether the fight screen was showing then) and every lock handed out
     fakeWakeLock(hold) {
@@ -262,7 +291,25 @@ function campTrip(d, to) {
   return went && !d.getElementById("camp").hidden;
 }
 const frame = w => new Promise(r => w.requestAnimationFrame(() => w.requestAnimationFrame(r)));
-const fakeModel = () => ({ detectForVideo: () => ({ landmarks: [] }), close() {} });
+// a fake body-tracking model that never finds anyone. rec (optional) counts the frames it was given,
+// with what was true at each: was the fight already marked ready, and which camera stream was showing
+const fakeModel = rec => ({
+  detectForVideo(video) {
+    if (rec) { rec.frames = (rec.frames || 0) + 1; (rec.seen ||= []).push({ ready: !!video.ownerDocument.defaultView.PushupRPG.fight, stream: video.srcObject }); }
+    return { landmarks: [] };
+  },
+  close() {},
+});
+const A_video = d => d.querySelector("#video").srcObject;
+const heldLocks = wl => wl.sentinels.filter(x => !x.released).length;
+const inFightAsks = wl => wl.calls.filter(c => c.inFight).length;
+// everything that is on or counted while the game is hidden, over ms
+async function whileHidden(g, cam, wl, loop, inf, ms = 400) {
+  const r0 = loop.runs, f0 = inf.frames || 0, a0 = inFightAsks(wl);
+  await wait(ms);
+  return { liveTracks: liveTracks(cam.streams), shown: !!A_video(g.d), locks: heldLocks(wl), lockAsks: inFightAsks(wl) - a0,
+    loopRuns: loop.runs - r0, frames: (inf.frames || 0) - f0, fightReady: !!g.fight };
+}
 const liveTracks = streams => streams.filter(Boolean).flatMap(s => s.getTracks()).filter(t => t.readyState === "live").length;
 // ---- sound: the base save has sound off; this one has it on (voice stays off)
 const SOUND_ON = { ...BASE, settings: { ...BASE.settings, sound: true } };
@@ -1196,6 +1243,164 @@ const tests = [
     check(live === 0 && held === 0 && runs === 0 && !A.api.trackerRunning, `left on: ${live} camera tracks, ${held} screen locks, loop ran ${runs} times`);
     check(ctx && ctx.state === "suspended", `the audio engine is "${ctx ? ctx.state : "none made"}"`);
     return `0 losses, 0 history; ${live} live tracks, ${held} locks held, ${runs} loop runs, audio "${ctx.state}"`;
+  }],
+  // ---- Item 5 follow-up: hidden (another app, screen locked) while the fight is still starting.
+  // These run the normal startup path: a camera problem shows the real error, not fake-rep mode.
+  ["Item 5e Hidden while the camera question is open: the late camera is switched off unseen; back, a fresh one starts the fight", async () => {
+    await reset();
+    const A = await open("A");
+    A.api.strictCamera = true;
+    const cam = {}, inf = {};
+    A.camera(cam);
+    const model = A.heldModel(inf), wl = A.fakeWakeLock(false), loop = A.countLoop();
+    // body tracking is already loading (like the warm-up when the game opens)
+    const sel = A.d.querySelector("#sModel");
+    sel.value = A.state.settings.model; sel.dispatchEvent(new A.w.Event("change"));
+    cam.hold = true;
+    await A.tapFight("field-mouse");
+    check(cam.gum === 1 && cam.give, "test setup: the camera question isn't open");
+    A.setVisible(false); await wait(100);
+    cam.give(); // the camera arrives while hidden; body tracking still loading
+    const late = await until(() => cam.streams[0], 1000, "the late camera");
+    const h = await whileHidden(A, cam, wl, loop, inf);
+    check(!h.liveTracks && !h.shown && !h.locks && !h.lockAsks && !h.loopRuns && !h.frames && !h.fightReady, `while hidden: ${JSON.stringify(h)}`);
+    // back, then body tracking finishes: the start completes, with a fresh camera
+    A.setVisible(true); await wait(100);
+    model.done();
+    await until(() => A.fight, 3000, "the fight").catch(() => {});
+    const fresh = A_video(A.d), first = inf.seen && inf.seen[0];
+    const after = { fightReady: !!A.fight, error: /can't start/i.test(A.modal()), freshLive: !!fresh && fresh !== late && liveTracks([fresh]) > 0,
+      cameraAsks: cam.gum, firstFrameBeforeReady: !!first && !first.ready, firstFrameFromFresh: !!first && first.stream === fresh, locks: heldLocks(wl) };
+    check(after.fightReady && !after.error && after.freshLive && after.firstFrameBeforeReady && after.firstFrameFromFresh && after.locks === 1, `after coming back: ${JSON.stringify(after)}`);
+    await tapFlee(A);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `hidden: ${JSON.stringify(h)}; back: ${JSON.stringify(after)}`;
+  }],
+  ["Item 5f Hidden while body tracking loads (camera on), back after 2 s, then it loads: one start, fresh camera, tracking works first", async () => {
+    await reset();
+    const A = await open("A");
+    A.api.strictCamera = true;
+    const cam = {}, inf = {};
+    A.camera(cam);
+    const model = A.heldModel(inf), wl = A.fakeWakeLock(false), loop = A.countLoop(), clock = A.shiftClock();
+    await A.tapFight("field-mouse");
+    const first = await until(() => liveTracks(cam.streams) && A_video(A.d), 3000, "the camera");
+    A.setVisible(false);
+    const h = await whileHidden(A, cam, wl, loop, inf);
+    check(!h.liveTracks && !h.locks && !h.loopRuns && !h.fightReady, `while hidden: ${JSON.stringify(h)}`);
+    clock.skip(2000); A.setVisible(true); await wait(200);
+    model.done();
+    const fights = new Set();
+    await until(() => { if (A.fight) fights.add(A.fight); return A.fight; }, 3000, "the fight").catch(() => {});
+    for (let i = 0; i < 10; i++) { if (A.fight) fights.add(A.fight); await wait(50); }
+    const fresh = A_video(A.d), f1 = inf.seen && inf.seen[0];
+    const r0 = loop.runs, f0 = inf.frames || 0;
+    await wait(500);
+    const after = { fightsStarted: fights.size, error: /can't start/i.test(A.modal()), cameraAsks: cam.gum,
+      freshLive: !!fresh && fresh !== first && liveTracks([fresh]) > 0, firstFrameBeforeReady: !!f1 && !f1.ready, firstFrameFromFresh: !!f1 && f1.stream === fresh,
+      loopRuns500ms: loop.runs - r0, frames500ms: (inf.frames || 0) - f0, locks: heldLocks(wl), liveTracks: liveTracks(cam.streams) };
+    check(after.fightsStarted === 1 && !after.error && after.cameraAsks === 2 && after.freshLive && after.firstFrameBeforeReady && after.firstFrameFromFresh
+      && after.loopRuns500ms > 0 && after.frames500ms > 0 && after.locks === 1 && after.liveTracks === 1, `after coming back: ${JSON.stringify(after)}`);
+    await tapFlee(A);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `hidden: ${JSON.stringify(h)}; back: ${JSON.stringify(after)}`;
+  }],
+  ["Item 5g The start's screen-lock answer comes after a hide and return: it is let go; the fresh camera and loop keep going", async () => {
+    await reset();
+    const A = await open("A");
+    A.api.strictCamera = true;
+    const cam = {}, inf = {};
+    A.camera(cam); A.fastModel(inf);
+    const wl = A.fakeWakeLock(true), loop = A.countLoop(), clock = A.shiftClock();
+    await A.tapFight("field-mouse");
+    await until(() => inFightAsks(wl) === 1, 3000, "the start's screen-lock request");
+    A.setVisible(false); await wait(200);
+    clock.skip(2000);
+    wl.hold = false; // from now on the phone answers at once (the start's answer stays waiting)
+    A.setVisible(true);
+    const fresh = await until(() => { const s = A_video(A.d); return s && s !== cam.streams[0] && liveTracks([s]) && s; }, 3000, "a fresh camera").catch(() => null);
+    await wait(300);
+    const readyBeforeOldAnswer = !!A.fight;
+    const n0 = wl.sentinels.length;
+    wl.grantAll(); // the start's old answer arrives now
+    await wait(400);
+    const lateLocks = wl.sentinels.slice(n0), r0 = loop.runs, f0 = inf.frames || 0;
+    await wait(500);
+    const after = { freshCamera: !!fresh, error: /can't start/i.test(A.modal()), onFightScreen: A.screen() === "fight", fightReady: !!A.fight, readyBeforeOldAnswer,
+      lateLocksKept: lateLocks.filter(s => !s.released).length, locks: heldLocks(wl), freshStillShown: !!fresh && A_video(A.d) === fresh && liveTracks([fresh]) > 0,
+      loopRuns500ms: loop.runs - r0, frames500ms: (inf.frames || 0) - f0 };
+    check(after.freshCamera && !after.error && after.onFightScreen && after.fightReady && after.readyBeforeOldAnswer && after.lateLocksKept === 0 && after.locks === 1
+      && after.freshStillShown && after.loopRuns500ms > 0 && after.frames500ms > 0, `after the old answer: ${JSON.stringify(after)}`);
+    await tapFlee(A);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return JSON.stringify(after);
+  }],
+  ["Item 5h Hidden during video.play(), and Back after a hidden start: no fight while hidden, no penalty; a fight still recovers or is lost once", async () => {
+    // 1. hidden while the camera picture is starting (video.play() pending)
+    await reset();
+    let A = await open("A");
+    A.api.strictCamera = true;
+    let cam = {}, inf = {}, pl = {};
+    A.camera(cam); A.fastModel(inf);
+    let wl = A.fakeWakeLock(false), loop = A.countLoop();
+    A.holdPlay(pl);
+    await A.tapFight("field-mouse");
+    await until(() => pl.playGo, 3000, "video.play() to wait");
+    A.setVisible(false); await wait(100);
+    pl.playGo();
+    const h1 = await whileHidden(A, cam, wl, loop, inf);
+    check(!h1.liveTracks && !h1.shown && !h1.locks && !h1.lockAsks && !h1.loopRuns && !h1.frames && !h1.fightReady, `hidden during play(): ${JSON.stringify(h1)}`);
+    A.setVisible(true);
+    await until(() => A.fight, 3000, "the fight").catch(() => {});
+    const fresh = A_video(A.d), s1 = inf.seen && inf.seen[0];
+    const back1 = { fightReady: !!A.fight, error: /can't start/i.test(A.modal()), freshLive: !!fresh && fresh !== cam.streams[0] && liveTracks([fresh]) > 0,
+      firstFrameBeforeReady: !!s1 && !s1.ready, firstFrameFromFresh: !!s1 && s1.stream === fresh };
+    check(back1.fightReady && !back1.error && back1.freshLive && back1.firstFrameBeforeReady && back1.firstFrameFromFresh, `back after play(): ${JSON.stringify(back1)}`);
+    await tapFlee(A);
+    noPenalty(A);
+    // 2. Back after a start that was interrupted by hiding (body tracking still loading); it loads late
+    await reset();
+    A = await open("A");
+    A.api.strictCamera = true;
+    cam = {}; inf = {};
+    A.camera(cam);
+    const model = A.heldModel(inf);
+    wl = A.fakeWakeLock(false); loop = A.countLoop();
+    let clock = A.shiftClock();
+    await A.tapFight("field-mouse");
+    await until(() => liveTracks(cam.streams), 3000, "the camera");
+    A.setVisible(false); await wait(200); clock.skip(2000); A.setVisible(true); await wait(200);
+    await tapFlee(A);
+    model.done();
+    const b = await whileHidden(A, cam, wl, loop, inf); // (visible now; same counts)
+    const st = saved();
+    const back2 = { screen: A.screen(), liveTracks: b.liveTracks, locks: b.locks, loopRuns: b.loopRuns, frames: b.frames, fight: b.fightReady,
+      trackerRunning: A.api.trackerRunning, losses: Object.keys(st.losses || {}).length, history: (st.history || []).length };
+    check(back2.screen === "map" && !back2.liveTracks && !back2.locks && !back2.loopRuns && !back2.frames && !back2.fight && !back2.trackerRunning
+      && !back2.losses && !back2.history, `Back after a hidden start: ${JSON.stringify(back2)}`);
+    noPenalty(A);
+    // 3. a fight that has begun: a 2 s look away recovers; 11 s away is one loss (and only one)
+    await reset();
+    A = await open("A");
+    A.api.strictCamera = true;
+    cam = {}; inf = {};
+    A.camera(cam); A.fastModel(inf);
+    wl = A.fakeWakeLock(false); loop = A.countLoop(); clock = A.shiftClock();
+    await A.fightMonster("cave-rat");
+    A.rep(); await wait(100);
+    A.setVisible(false); await wait(200); clock.skip(2000); A.setVisible(true);
+    await until(() => liveTracks(cam.streams) && A_video(A.d) !== cam.streams[0], 3000, "the camera after 2 s away").catch(() => {});
+    const r0 = loop.runs, f0 = inf.frames || 0; await wait(400);
+    const short = { fightGoesOn: !!A.fight && !A.fight.over, liveTracks: liveTracks(cam.streams), loopRuns: loop.runs - r0, frames: (inf.frames || 0) - f0, locks: heldLocks(wl) };
+    check(short.fightGoesOn && short.liveTracks === 1 && short.loopRuns > 0 && short.frames > 0 && short.locks === 1, `after 2 s away: ${JSON.stringify(short)}`);
+    A.setVisible(false); await wait(200); clock.skip(11000); A.setVisible(true); await wait(400);
+    A.setVisible(false); await wait(100); clock.skip(11000); A.setVisible(true); await wait(400);
+    const st3 = saved();
+    const long = { lostModal: /won this time/i.test(A.modal()), losses: st3.losses["cave-rat"] || 0, lostInHistory: st3.history.filter(x => !x.won).length,
+      liveTracks: liveTracks(cam.streams), locks: heldLocks(wl), trackerRunning: A.api.trackerRunning };
+    check(long.lostModal && long.losses === 1 && long.lostInHistory === 1 && !long.liveTracks && !long.locks && !long.trackerRunning, `after 11 s away: ${JSON.stringify(long)}`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `play(): hidden ${JSON.stringify(h1)}, back ${JSON.stringify(back1)}; Back: ${JSON.stringify(back2)}; 2 s: ${JSON.stringify(short)}; 11 s: ${JSON.stringify(long)}`;
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
