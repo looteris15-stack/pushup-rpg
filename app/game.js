@@ -584,9 +584,13 @@ const backupText = () =>
 
 // Read a backup out of any text: a pasted code, a whole message, or a backup file.
 // Returns null (no code in it) or { save, problem }, where problem says why it can't be used.
+// The biggest save the game can make gives a backup of about 17,000 characters (test Item 1c), so
+// anything much longer is refused before any decoding: a huge paste can't freeze the phone.
+const BACKUP_MAX_CHARS = 32768, BACKUP_MAX_FILE = 65536;
 function readBackup(text) {
   text = text || "";
-  const m2 = /PRPG2\.([A-Za-z0-9+/=\s]+)\.([a-z0-9]+)/.exec(text);
+  if (text.length > BACKUP_MAX_CHARS) return { save: null, problem: "That text is too long to be a backup. Paste only the backup code, or open the backup file." };
+  const m2 =/PRPG2\.([A-Za-z0-9+/=\s]+)\.([a-z0-9]+)/.exec(text);
   if (m2) {
     const b64 = m2[1].replace(/\s+/g, "");
     let save = null;
@@ -598,19 +602,36 @@ function readBackup(text) {
   }
   const m1 = /PRPG1\.([A-Za-z0-9+/=\s]+)/.exec(text);
   if (!m1) return null;
-  const b64 = m1[1].replace(/\s+/g, "");
-  // words after an old code (an email signature, "sent from my phone") stick to it once spaces are
-  // removed, so cut letters off the end until it reads as a save again
-  for (let end = b64.length; end > 0 && end > b64.length - 400; end--) {
+  const save = readOldCode(m1[1].replace(/\s+/g, ""));
+  if (!save) return { save: null, problem: "The code is damaged. Copy the whole code and try again." };
+  const bad = checkSave(save);
+  return { save, problem: bad && `This backup doesn't add up: ${bad}. It may have been changed by hand.` };
+}
+// Words after an old code (an email signature, "sent from my phone") stick to it once spaces are
+// removed. Base64 is read left to right, so decoding the whole run gives the save first and the
+// stuck-on words after it as junk bytes. So: decode once, then find where the save ends (it is JSON,
+// so at a "}"), trying at most 16 of them from the end. A damaged code fails after a few cheap tries.
+function readOldCode(b64) {
+  const eq = b64.indexOf("=");
+  let body = eq < 0 ? b64 : b64.slice(0, eq); // "=" (padding) can only come right after the code
+  if (body.length % 4 === 1) body = body.slice(0, -1); // one letter left over can't be base64
+  let bytes;
+  try { bytes = atob(body); } catch { return null; }
+  if (bytes[0] !== "{") return null;
+  for (let end = bytes.lastIndexOf("}"), tries = 0; end > 0 && tries < 16; end = bytes.lastIndexOf("}", end - 1), tries++) {
     try {
-      const save = JSON.parse(atob(b64.slice(0, end)));
-      if (save && typeof save === "object" && save.stats) {
-        const bad = checkSave(save);
-        return { save, problem: bad && `This backup doesn't add up: ${bad}. It may have been changed by hand.` };
-      }
+      const save = JSON.parse(bytes.slice(0, end + 1));
+      if (save && typeof save === "object" && save.stats) return save;
     } catch {}
   }
-  return { save: null, problem: "The code is damaged. Copy the whole code and try again." };
+  return null;
+}
+// Reading depends only on the text, so the Restore taps (and an opened file) reuse the last result
+// while the box holds exactly that text. Any edit, or another file, is read fresh.
+let lastRead = null;
+function readBackupOnce(text) {
+  if (!lastRead || lastRead.text !== text) lastRead = { text, r: readBackup(text) };
+  return lastRead.r;
 }
 
 // Rules every real save follows. A backup that breaks one was changed by hand (or is broken).
@@ -786,22 +807,33 @@ $("restoreFile").addEventListener("change", async e => {
   const f = e.target.files && e.target.files[0];
   e.target.value = "";
   if (!f) return;
+  // checked before reading, so a wrong (huge) file is never loaded into memory
+  if (f.size > BACKUP_MAX_FILE) { $("backupMsg").textContent = "That file is too big to be a Pushup RPG backup."; return; }
   const text = await f.text().catch(() => "");
-  const r = readBackup(text);
+  const r = readBackupOnce(text);
   if (!r) { $("backupMsg").textContent = "That file has no Pushup RPG backup in it."; return; }
   if (r.problem) { $("backupMsg").textContent = r.problem; return; }
   $("restoreText").value = text;
   $("backupMsg").textContent = `Backup found: level ${levelFromXp(r.save.xp || 0)}, ${plural(r.save.stats.pushups || 0, "pushup")}. Tap Restore to use it.`;
 });
+let restoreArmedText = null; // the exact text the first Restore tap checked
 $("btnRestore").addEventListener("click", e => {
-  const r = readBackup($("restoreText").value);
+  const btn = e.currentTarget, text = $("restoreText").value;
+  // the confirm tap restores only what the first tap checked; after an edit (or another file) start over
+  if (btn.dataset.armed && text !== restoreArmedText) disarm(btn);
+  const r = readBackupOnce(text);
   if (!r) {
     $("backupMsg").textContent = "That doesn't look like a backup code. Copy the whole code and try again.";
     return;
   }
   if (r.problem) { $("backupMsg").textContent = r.problem; return; }
   const saved = r.save;
-  confirmTap(e.currentTarget, "Tap again to replace your progress", () => {
+  if (!btn.dataset.armed) {
+    restoreArmedText = text;
+    $("backupMsg").textContent = `Backup found: level ${levelFromXp(saved.xp || 0)}, ${plural(saved.stats.pushups || 0, "pushup")}.`;
+  }
+  confirmTap(btn, "Tap again to replace your progress", () => {
+    lastRead = restoreArmedText = null;
     const rev = state.rev;
     state = normalize(cleanSave(saved));
     needsSave = false;

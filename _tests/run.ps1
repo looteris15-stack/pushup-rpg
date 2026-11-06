@@ -48,7 +48,7 @@ try {
     if (-not $results) { Write-Output "No results (did the test page load?)"; exit 99 }
     $failed = 0
     foreach ($r in $results) {
-        if ($r.pass) { Write-Output ("PASS  {0}  ({1} s)" -f $r.name, $r.secs) }
+        if ($r.pass) { Write-Output ("PASS  {0}  ({1} s)" -f $r.name, $r.secs); if ($r.note) { Write-Output ("      {0}" -f $r.note) } }
         else { $failed++; Write-Output ("FAIL  {0}  ({1} s)`n      {2}" -f $r.name, $r.secs, $r.detail) }
     }
     Write-Output ("{0} passed, {1} failed" -f ($results.Count - $failed), $failed)

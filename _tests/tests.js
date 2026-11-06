@@ -134,6 +134,35 @@ async function open(id) {
       }
       return { errors: errors.slice(before), seen };
     },
+    // counts the game's atob() and JSON.parse() calls from now on (backup decoding work)
+    countDecoding() {
+      const atob = w.atob, parse = w.JSON.parse, n = { atob: 0, parse: 0 };
+      w.atob = s => { n.atob++; return atob.call(w, s); };
+      w.JSON.parse = (...a) => { n.parse++; return parse.apply(w.JSON, a); };
+      return n;
+    },
+    // counts every way the game could read a file's contents (text, bytes, stream, FileReader)
+    countFileReads() {
+      const n = { reads: 0 };
+      for (const k of ["text", "arrayBuffer", "stream", "bytes"]) {
+        const f = w.Blob.prototype[k];
+        if (f) w.Blob.prototype[k] = function (...a) { n.reads++; return f.apply(this, a); };
+      }
+      for (const k of ["readAsText", "readAsArrayBuffer", "readAsDataURL", "readAsBinaryString"]) {
+        const f = w.FileReader.prototype[k];
+        w.FileReader.prototype[k] = function (...a) { n.reads++; return f.apply(this, a); };
+      }
+      return n;
+    },
+    // picks a file in Settings → Backup → Open backup file; returns the message
+    async openFile(parts, name = "backup.txt") {
+      const input = d.querySelector("#restoreFile"), dt = new w.DataTransfer();
+      dt.items.add(new w.File(parts, name, { type: "text/plain" }));
+      input.files = dt.files;
+      input.dispatchEvent(new w.Event("change", { bubbles: true }));
+      await wait(300);
+      return g.text("#backupMsg");
+    },
     // taps a backup button and returns the backup text the share menu would get (no real share sheet)
     async backupText(selector) {
       let shared = null;
@@ -147,6 +176,14 @@ async function open(id) {
   return g;
 }
 const close = id => { document.getElementById(id).src = "about:blank"; return wait(200); };
+// n characters of base64 made from random bytes (looks like a backup code, but holds no save)
+function randomB64(n) {
+  const bytes = new Uint8Array(Math.ceil(n * 3 / 4));
+  for (let i = 0; i < bytes.length; i += 65536) crypto.getRandomValues(bytes.subarray(i, i + 65536));
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return btoa(bin).slice(0, n);
+}
 // ---- body-tracking frames for the rep counter (30 frames per second, like a phone)
 const FRAME_MS = 33;
 const plank = elbow => ({ elbow, bodyBend: 5, bendDir: "sag", knee: 170, horizontal: true, visible: true });
@@ -478,6 +515,133 @@ const tests = [
         `${fx.video}: reps at ${JSON.stringify(reps)}, expected ${JSON.stringify(fx.expectedRepTimes)}`);
     }
   }],
+  // ------------------------------------------- Item 1 (audit finding #7): backup input bounds
+  ["Item 1a A huge or damaged old code (PRPG1) fails at once, with little decoding", async () => {
+    await reset();
+    const A = await open("A");
+    await A.goto("settings");
+    const before = localStorage.getItem(SAVE);
+    const box = A.d.querySelector("#restoreText"), b = A.d.querySelector("#btnRestore");
+    const junk = randomB64(512 * 1024);
+    const cases = [
+      ["512 KiB of junk", "PRPG1." + junk],
+      ["30 KB of junk (under the size limit)", "PRPG1." + junk.slice(0, 30000)],
+      // decodes to "{" and then thousands of "}": every one is a place where a save could end
+      ["30 KB that starts like a save", "PRPG1." + btoa("{" + "}".repeat(22000))],
+    ];
+    const notes = [];
+    for (const [what, code] of cases) {
+      box.value = code;
+      const n = A.countDecoding();
+      const t0 = performance.now();
+      b.click();
+      const ms = performance.now() - t0;
+      await wait(50);
+      const msg = A.text("#backupMsg");
+      check(ms < 20, `${what}: Restore took ${ms.toFixed(1)} ms (limit 20)`);
+      check(n.atob <= 16, `${what}: decoded ${n.atob} times`);
+      check(n.parse <= 16, `${what}: JSON.parse ran ${n.parse} times`);
+      check(/damaged|too long/i.test(msg), `${what}: no clear error: "${msg}"`);
+      check(!b.dataset.armed, `${what}: Restore asks to confirm a broken code`);
+      notes.push(`${what}: ${ms.toFixed(2)} ms, atob ${n.atob}, parse ${n.parse}`);
+    }
+    check(localStorage.getItem(SAVE) === before, "the save changed");
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return notes.join("; ");
+  }],
+  ["Item 1b A backup file over 64 KiB is refused before it is read", async () => {
+    await reset();
+    const A = await open("A");
+    await A.goto("settings");
+    const n = A.countFileReads();
+    // a real code, padded past 64 KiB: refused for its size alone
+    const msg = await A.openFile([`Pushup RPG backup\n\n${oldCode(GOOD)}\n`, " ".repeat(65 * 1024)]);
+    check(n.reads === 0, `the file was read ${n.reads} time(s) before it was refused`);
+    check(/too big/i.test(msg), `no "too big" message: "${msg}"`);
+    check(A.d.querySelector("#restoreText").value === "", "the file's text was put in the restore box");
+    // a normal backup file still opens (and the read counter does see reads)
+    const ok = await A.openFile([`Pushup RPG backup\n\n${oldCode(GOOD)}\n`]);
+    check(/backup found/i.test(ok), `a normal backup file was refused: "${ok}"`);
+    check(n.reads >= 1, "test setup: the read counter saw no read of the normal file");
+  }],
+  ["Item 1c Old codes with chat text after them still restore exactly; the biggest real backup fits", async () => {
+    await reset();
+    const A = await open("A");
+    const tails = [
+      " Sent from my phone",
+      "\n\nThanks see you tomorrow",
+      ". Keep this safe!",
+      "\nHere is the backup code you asked for yesterday evening keep it somewhere safe please ok bye",
+    ];
+    const pads = new Set(), notes = [];
+    let k = 0;
+    for (const tail of tails) for (let extra = 0; extra < 3; extra++) {
+      const xp = 14 - (k++ % 10); // a different XP each time, so each restore is told apart from the last
+      const src = { ...GOOD, xp, wandererDone: "x".repeat(extra) };
+      const code = oldCode(src);
+      pads.add((code.match(/=*$/)[0] || "").length);
+      const msg = await A.restoreCode("My backup: " + code + tail);
+      check(/restored/i.test(msg), `tail ${JSON.stringify(tail)} (pad ${extra}): refused: "${msg}"`);
+      const s = saved();
+      check(s.xp === xp && A.state.xp === xp, `tail ${JSON.stringify(tail)}: XP ${s.xp}, expected ${xp}`);
+      check(s.testResult === src.testResult && s.unlockedZones === src.unlockedZones &&
+        JSON.stringify(s.stats) === JSON.stringify(src.stats), `tail ${JSON.stringify(tail)}: restored save differs`);
+    }
+    check(pads.size === 3, `test setup: codes ended with only ${[...pads]} "=" (need 0, 1 and 2)`);
+    // the biggest save the game can make: 40 fights in the list (longest texts it keeps), a count for every monster
+    const { ZONES, DUNGEON, WANDERERS } = await import("../app/data.js");
+    const ids = [...ZONES.flatMap(z => z.monsters), ...DUNGEON.floors.flat()].map(m => m.id)
+      .concat(WANDERERS.map(x => `wanderer-${x.id}`));
+    const st = A.state;
+    st.history = Array.from({ length: 40 }, (_, i) => ({ t: Date.now(), id: "m".repeat(40), name: "N".repeat(60), hp: 999, reps: 999, won: i % 2 === 0, where: "W".repeat(60) }));
+    st.kills = Object.fromEntries([...ids, "champion"].map(id => [id, 99999]));
+    st.losses = { ...st.kills };
+    const text = await A.backupText("#btnShareBackup");
+    check(text.length < 32768, `the biggest backup is ${text.length} characters, over the 32,768 limit`);
+    notes.push(`biggest backup ${text.length} chars (${ids.length + 1} monsters)`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return notes.join("; ");
+  }],
+  ["Item 1d Editing the code after the first Restore tap means it is checked (and confirmed) again", async () => {
+    await reset();
+    const A = await open("A");
+    await A.goto("settings");
+    const box = A.d.querySelector("#restoreText"), b = A.d.querySelector("#btnRestore");
+    const X = oldCode({ ...GOOD, xp: 11 }), Y = oldCode({ ...GOOD, xp: 7 });
+    const tap = async (ms = 100) => { b.click(); await wait(ms); };
+    const before = localStorage.getItem(SAVE);
+    // 1. X checked, then damaged in the box: the second tap must not restore X
+    box.value = X; await tap();
+    check(b.dataset.armed, "the first tap did not ask to confirm");
+    const mid = X.length >> 1;
+    box.value = X.slice(0, mid) + "////////" + X.slice(mid + 8);
+    await tap(300);
+    check(localStorage.getItem(SAVE) === before && A.state.xp !== 11, "the code from before the edit was restored");
+    check(/damaged/i.test(A.text("#backupMsg")), `the edited code wasn't checked: "${A.text("#backupMsg")}"`);
+    check(!b.dataset.armed, "Restore still waits for a confirm tap after the edited code failed");
+    // 2. X checked, then replaced by another good code Y: Y needs its own confirm tap
+    box.value = X; await tap();
+    box.value = Y; await tap(300);
+    check(localStorage.getItem(SAVE) === before, "a code was restored without its own confirm tap");
+    check(b.dataset.armed, "the new code wasn't offered for confirming");
+    await tap(300);
+    check(saved().xp === 7 && A.state.xp === 7, `the new code wasn't restored (XP ${A.state.xp})`);
+    // 3. another file opened between the taps counts as an edit too
+    box.value = Y; await tap();
+    await A.openFile([X]);
+    await tap(300);
+    check(A.state.xp === 7, "the first code was restored after another file was opened");
+    check(b.dataset.armed, "the opened file wasn't offered for confirming");
+    await tap(300);
+    check(A.state.xp === 11, `the opened file wasn't restored (XP ${A.state.xp})`);
+    // 4. no edit: the confirm tap uses what the first tap read, without decoding again
+    box.value = Y; await tap();
+    const n = A.countDecoding();
+    await tap(300);
+    check(A.state.xp === 7, "the unchanged code was not restored");
+    check(n.atob === 0, `the confirm tap decoded the code again (${n.atob} atob calls)`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();
@@ -498,10 +662,10 @@ const log = document.getElementById("log");
 window.__results = [];
 for (const [name, fn] of tests) {
   const t0 = performance.now();
-  let pass = true, detail = "";
-  try { await fn(); } catch (e) { pass = false; detail = e.message; }
-  window.__results.push({ name, pass, detail, secs: +((performance.now() - t0) / 1000).toFixed(1) });
-  log.insertAdjacentHTML("beforeend", `<span class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</span> ${name}${detail ? " — " + detail.replace(/</g, "&lt;") : ""}\n`);
+  let pass = true, detail = "", note = "";
+  try { note = (await fn()) || ""; } catch (e) { pass = false; detail = e.message; }
+  window.__results.push({ name, pass, detail, note, secs: +((performance.now() - t0) / 1000).toFixed(1) });
+  log.insertAdjacentHTML("beforeend", `<span class="${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</span> ${name}${(detail || note) ? " — " + (detail || note).replace(/</g, "&lt;") : ""}\n`);
 }
 await reset();
 window.__done = true;
