@@ -491,9 +491,15 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     const startClock = () => { if (clockAt < 0) { clockAt = performance.now(); timer = setTimeout(timeUp, startBudget); } };
     const inTime = p => Promise.race([p, late]);
     try {
-      // 1. the camera first, so its permission question comes before body tracking downloads
-      try { await inTime(attachCamera(my, startClock)); }
-      catch (e) { if (stale()) throw cancelled(); if (e.retry) throw e; throw cameraError(e); }
+      // 1. the camera first, so its permission question comes before body tracking downloads. Stay here
+      //    until the camera is allowed (that starts the clock): a request made old by a hide that fails
+      //    is followed by a fresh one once the app is visible.
+      while (clockAt < 0) {
+        if (stale()) throw cancelled();
+        if (paused) { await changed(); continue; }
+        try { await inTime(attachCamera(my, startClock)); } // the grant starts the clock: play() is timed
+        catch (e) { if (stale()) throw cancelled(); if (e.retry) throw e; throw cameraError(e); }
+      }
       if (stale()) throw cancelled();
       // 2. body tracking
       try { await inTime(ensureModel(model)); }

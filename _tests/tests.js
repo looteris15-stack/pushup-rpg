@@ -1975,6 +1975,53 @@ const tests = [
     check(!bad.length, bad.join(" || "));
     return `${JSON.stringify(res)}; retry: ${JSON.stringify(retry)}`;
   }],
+  ["Item 7h The camera request from before a hide fails (AbortError), body tracking is stuck: a fresh camera is asked for at once, its grant starts the clock, Try again", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const LIMIT = 1200;
+    if (typeof A.api.hooks.setStartBudget === "function") A.api.hooks.setStartBudget(LIMIT);
+    const cam = {}, bad = [];
+    A.camera(cam);
+    const ml = A.heldModels(), wl = A.fakeWakeLock(false), loop = A.countLoop();
+    cam.hold = true; // the first camera request waits (the permission question is open)
+    await A.tapFight("field-mouse");
+    check(cam.gum === 1 && cam.refuse, "test setup: the camera question isn't open");
+    A.setVisible(false); await wait(200); A.setVisible(true); await wait(200);
+    const t0 = performance.now();
+    cam.refuse("AbortError"); // the request from before the hide fails; the next one is allowed at once
+    await until(() => cam.gum >= 2, 1000, "a fresh camera request").catch(() => {});
+    const askedMs = cam.gum >= 2 ? Math.round(performance.now() - t0) : null;
+    await until(() => /too long/i.test(A.modal()), LIMIT + 1500, "the time-out").catch(() => {});
+    const timedOut = /too long/i.test(A.modal());
+    const tOut = A.w.performance.now();
+    const r0 = loop.runs; await wait(400);
+    const st = saved();
+    const res = { freshCameraAskedAfterMs: askedMs, cameraAsks: cam.gum, timedOut, timedOutAfterGrantMs: timedOut && cam.grantedAt ? Math.round(tOut - cam.grantedAt) : null,
+      retryButton: !!A.d.querySelector('#modal [data-action="retryStart"]'), modelLoads: ml.loads.length, liveTracks: liveTracks(cam.streams), locks: heldLocks(wl),
+      loopRuns400ms: loop.runs - r0, trackerRunning: A.api.trackerRunning, screen: A.screen(), losses: Object.keys(st.losses || {}).length, history: (st.history || []).length };
+    if (!(res.freshCameraAskedAfterMs !== null && res.freshCameraAskedAfterMs < 500 && res.cameraAsks === 2 && res.timedOut && res.timedOutAfterGrantMs >= LIMIT - 100
+      && res.retryButton && res.modelLoads === 1 && !res.liveTracks && !res.locks && !res.loopRuns400ms && !res.trackerRunning && !res.losses && !res.history))
+      bad.push(`${JSON.stringify(res)} / "${A.modal().slice(0, 60)}"`);
+    try { noPenalty(A); } catch (e) { bad.push("penalty: " + e.message); }
+    // Try again: a fresh load (the stuck one was let go); it answers and the fight starts
+    let retry = null;
+    if (res.retryButton) {
+      A.d.querySelector('#modal [data-action="retryStart"]').click();
+      await until(() => ml.loads.length === 2, 3000, "the retry's load").catch(() => {});
+      if (ml.loads[1]) ml.loads[1].give();
+      await until(() => A.fight || /can't start/i.test(A.modal()), 3000, "the retry's fight").catch(() => {});
+      retry = { ready: !!A.fight, error: A.modal().slice(0, 60), modelLoads: ml.loads.length, liveTracks: liveTracks(cam.streams), locks: heldLocks(wl) };
+      if (!(retry.ready && !retry.error && retry.modelLoads === 2 && retry.liveTracks === 1 && retry.locks === 1)) bad.push(`retry: ${JSON.stringify(retry)}`);
+      await tapFlee(A);
+    }
+    if (ml.loads[0]) ml.loads[0].give(); // the stuck load ends at last: closed, nothing changes
+    await wait(200);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return `${JSON.stringify(res)}; retry: ${JSON.stringify(retry)}`;
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();
