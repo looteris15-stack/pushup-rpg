@@ -147,6 +147,19 @@ async function open(id) {
   return g;
 }
 const close = id => { document.getElementById(id).src = "about:blank"; return wait(200); };
+// ---- body-tracking frames for the rep counter (30 frames per second, like a phone)
+const FRAME_MS = 33;
+const plank = elbow => ({ elbow, bodyBend: 5, bendDir: "sag", knee: 170, horizontal: true, visible: true });
+const DOWN = [170, 168, 165, 160, 150, 140, 120, 100, 80, 65, 58, 55];      // from straight arms to the bottom
+const UP = [55, 60, 75, 100, 130, 155, 165, 170];                           // back up to straight arms
+const LOCKOUT = [170, 170, 171, 170];                                       // seen again with straight arms
+const unseen = ms => Array.from({ length: Math.round(ms / FRAME_MS) }, () => null); // nobody seen for about ms
+// feeds frames (elbow angles, null = nobody seen) through the game's real counter; returns the next time
+function playFrames(g, t, frames) {
+  for (const e of frames) { g.api.frame(e == null ? null : plank(e), t); t += FRAME_MS; }
+  return t;
+}
+
 // leaving before a fight really began must cost nothing: no loss, no rest, no mine lock, no leftover fight
 function noPenalty(g, { run = false } = {}) {
   const s = saved();
@@ -423,6 +436,47 @@ const tests = [
     A.d.querySelector("#btnFlee").click(); await wait(300); // Run away before the first rep: free
     check(A.screen() === "map" && !A.api.trackerRunning, "Run away did not end it cleanly");
     noPenalty(A);
+  }],
+  // ---------------------------------------------------------------- Bug #5: tracking gaps inside a rep
+  ["#5a Depth, then 400 ms unseen, then lockout: no hit, and it says why", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("field-mouse");
+    let t = 1e8;
+    t = playFrames(A, t, [...DOWN, ...unseen(400), ...LOCKOUT]);
+    await wait(100);
+    check(A.fight.reps === 0, `the rep counted (${A.fight.reps} hit)`);
+    check(/keep (your )?body in view/i.test(A.text("#banner")), `no feedback message: "${A.text("#banner")}"`);
+  }],
+  ["#5b Depth, then a 180 ms camera hitch, then lockout: still a hit", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("field-mouse");
+    playFrames(A, 1e8, [...DOWN, ...unseen(180), ...UP]);
+    await wait(100);
+    check(A.fight.reps === 1, `a short hitch cost the rep (${A.fight.reps} hits)`);
+  }],
+  ["#5c After a cancelled rep, the next clean pushup counts right away", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("field-mouse");
+    let t = playFrames(A, 1e8, [...DOWN, ...unseen(400), ...LOCKOUT]); // cancelled (as in #5a)
+    t = playFrames(A, t, [...DOWN, ...UP]);                            // one honest pushup from that plank
+    await wait(100);
+    check(A.fight.reps === 1, `expected exactly 1 hit, got ${A.fight.reps}`);
+  }],
+  ["#5d Your two recorded fights: every honest rep still counts exactly as before", async () => {
+    const { createRepCounter } = await import(`../app/core.js?t=${Date.now()}`);
+    for (const name of ["normal", "slow"]) {
+      const fx = await (await fetch(`fixtures/${name}.json`)).json();
+      const counter = createRepCounter(() => ({ depth: 63, top: 160, bend: 20, knee: 135 }));
+      const reps = [];
+      for (const [t, e] of fx.frames) {
+        for (const ev of counter.update(e == null ? null : plank(e), t)) if (ev.type === "rep") reps.push(t);
+      }
+      check(JSON.stringify(reps) === JSON.stringify(fx.expectedRepTimes),
+        `${fx.video}: reps at ${JSON.stringify(reps)}, expected ${JSON.stringify(fx.expectedRepTimes)}`);
+    }
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

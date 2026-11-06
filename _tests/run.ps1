@@ -9,7 +9,7 @@ $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $root = Join-Path $env:TEMP ("pushup-rpg-tests\run-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force "$root\app", "$root\_tests" | Out-Null
 Get-ChildItem "$repo\app" -File | Copy-Item -Destination "$root\app"
-Copy-Item "$repo\_tests\index.html", "$repo\_tests\tests.js" "$root\_tests"
+Copy-Item "$repo\_tests\*" "$root\_tests" -Recurse   # test page, tests and recorded-fight fixtures
 
 $server = Start-Job -ScriptBlock { param($s, $r, $p) & $s -Port $p -Root $r } -ArgumentList "$repo\serve.ps1", $root, $Port
 $edge = $null

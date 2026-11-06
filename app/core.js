@@ -61,6 +61,12 @@ export function downSecsOf(c) {
   return low ? +((low.t - c.topAt) / 1000).toFixed(1) : null;
 }
 
+// Unseen for longer than this in the middle of a rep (after leaving the top), and that rep doesn't count:
+// the bad part (knees down, hips up) could be hidden in the gap. Honest reps in the user's two recorded
+// fights had no gap at all; brief camera hitches (up to ~260 ms seen while setting up) still pass.
+// Outside a rep, the 800 ms "lost" limit below is unchanged.
+const GAP_IN_REP_MS = 300;
+
 // Rep = arms locked out -> elbows at depth -> locked out again, with body and legs straight the whole way.
 export function createRepCounter(getCfg) {
   // topAt: last moment the arms were straight (elbow >= top), where a slow rep's clock starts
@@ -75,9 +81,17 @@ export function createRepCounter(getCfg) {
     const cfg = getCfg();
     const ev = [];
     const setState = s => { state = s; ev.push({ type: "state", state: s }); };
+    // a rep in progress was unseen too long: cancel it. The player starts again from "idle", so the very
+    // next frame with straight arms in plank is ready for a new rep (no need to stand up or reset).
+    const cancelForGap = () => {
+      ev.push({ type: "norep", reasons: ["Keep your body in view"], gap: true, ...summary(cycle, t) });
+      cycle = null;
+      setState("idle");
+    };
 
     if (!m || !m.visible) {
       if (!lostSince) lostSince = t;
+      if (state === "down" && cycle && t - lostSince > GAP_IN_REP_MS) cancelForGap();
       if (t - lostSince > 800 && state !== "lost") {
         if (cycle && cycle.depth) ev.push({ type: "norep", reasons: ["Lost sight of you"], ...summary(cycle, t) });
         cycle = null;
@@ -85,6 +99,9 @@ export function createRepCounter(getCfg) {
       }
       return ev;
     }
+    // seen again: a gap longer than the limit inside a rep (even if no unseen frame was late enough to
+    // notice it, e.g. at a low frame rate) also cancels that rep
+    if (lostSince && state === "down" && cycle && t - lostSince > GAP_IN_REP_MS) cancelForGap();
     lostSince = 0;
     if (state === "lost") setState("idle");
 
