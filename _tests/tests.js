@@ -165,24 +165,29 @@ async function open(id) {
       return h;
     },
     // the camera: every request is counted (rec.gum) and every stream kept (rec.streams). hold = true:
-    // the next request waits until give(); otherwise a fake stream comes at once
+    // the next request waits until give() or refuse(errorName); deny = "SomeError": the next request
+    // fails at once with it; otherwise a fake stream comes at once
     camera(rec) {
-      rec.gum = 0; rec.streams = []; rec.hold = false;
+      rec.gum = 0; rec.streams = []; rec.hold = false; rec.deny = "";
       w.navigator.mediaDevices.getUserMedia = () => {
         rec.gum++;
         const make = () => { const s = g.fakeStream(); rec.streams.push(s); return s; };
+        if (rec.deny) { const n = rec.deny; rec.deny = ""; return Promise.reject(new w.DOMException(n, n)); }
         if (!rec.hold) return Promise.resolve(make());
         rec.hold = false;
-        return new Promise(r => { rec.give = () => r(make()); });
+        return new Promise((r, j) => { rec.give = () => r(make()); rec.refuse = n => j(new w.DOMException(n, n)); });
       };
     },
-    // the next video.play() waits until rec.playGo() (like a slow camera picture)
+    // the next video.play() waits until rec.playGo() (like a slow camera picture), or fails at rec.playFail()
     holdPlay(rec) {
       const play = w.HTMLVideoElement.prototype.play;
       w.HTMLVideoElement.prototype.play = function () {
         w.HTMLVideoElement.prototype.play = play;
         const p = play.call(this);
-        return new Promise((res, rej) => { rec.playGo = () => p.then(res, rej); });
+        return new Promise((res, rej) => {
+          rec.playGo = () => p.then(res, rej);
+          rec.playFail = () => { p.catch(() => {}); rej(new w.DOMException("The picture can't play.", "NotAllowedError")); };
+        });
       };
     },
     // a fake "keep the screen on" (wake lock). hold = true: answers wait until grantAll(). Records every
@@ -191,6 +196,7 @@ async function open(id) {
       const wl = { hold, calls: [], sentinels: [], waiting: [] };
       const give = () => { const s = { type: "screen", released: false, release() { this.released = true; return Promise.resolve(); }, addEventListener() {}, removeEventListener() {} }; wl.sentinels.push(s); return s; };
       wl.grantAll = () => { for (const r of wl.waiting.splice(0)) r(give()); };
+      wl.grantOldest = () => { const r = wl.waiting.shift(); if (r) r(give()); }; // only the oldest waiting answer
       Object.defineProperty(w.navigator, "wakeLock", { configurable: true, value: {
         request() {
           wl.calls.push({ inFight: !d.getElementById("fight").hidden });
@@ -199,10 +205,16 @@ async function open(id) {
       } });
       return wl;
     },
-    // counts runs of the tracker's frame loop (core.js "loop") from now on
+    // counts runs of the tracker's frame loop (core.js "loop") from now on, and its starts: a next
+    // frame asked for from outside a loop run (startLoop() runs the loop once directly)
     countLoop() {
-      const n = { runs: 0 }, raf = w.requestAnimationFrame.bind(w);
-      w.requestAnimationFrame = cb => raf(cb.name === "loop" ? ts => { n.runs++; cb(ts); } : cb);
+      const n = { runs: 0, starts: 0 }, raf = w.requestAnimationFrame.bind(w);
+      let inLoop = false;
+      w.requestAnimationFrame = cb => {
+        if (cb.name !== "loop") return raf(cb);
+        if (!inLoop) n.starts++;
+        return raf(ts => { n.runs++; inLoop = true; try { cb(ts); } finally { inLoop = false; } });
+      };
       return n;
     },
     // makes the game hidden (another app, phone locked) or visible again
@@ -1401,6 +1413,154 @@ const tests = [
     check(long.lostModal && long.losses === 1 && long.lostInHistory === 1 && !long.liveTracks && !long.locks && !long.trackerRunning, `after 11 s away: ${JSON.stringify(long)}`);
     check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
     return `play(): hidden ${JSON.stringify(h1)}, back ${JSON.stringify(back1)}; Back: ${JSON.stringify(back2)}; 2 s: ${JSON.stringify(short)}; 11 s: ${JSON.stringify(long)}`;
+  }],
+  ["Item 5i The camera request from before a hide fails late (AbortError): back, a fresh camera starts the fight; a refused current request still shows the error", async () => {
+    const bad = [], notes = [];
+    const setup = async () => {
+      await reset();
+      const A = await open("A");
+      A.api.strictCamera = true;
+      const cam = {}, inf = {};
+      A.camera(cam); A.fastModel(inf);
+      return { A, cam, inf, wl: A.fakeWakeLock(false), loop: A.countLoop() };
+    };
+    // 1. held camera request; hidden and back; then that (retired) request fails with AbortError
+    let { A, cam, inf, wl, loop } = await setup();
+    cam.hold = true;
+    await A.tapFight("field-mouse");
+    check(cam.gum === 1 && cam.refuse, "test setup: the camera question isn't open");
+    A.setVisible(false); await wait(200); A.setVisible(true); await wait(200);
+    cam.refuse("AbortError");
+    await until(() => A.fight || A.modal(), 3000, "the fight or a message").catch(() => {});
+    const fresh = A_video(A.d), f1 = inf.seen && inf.seen[0];
+    const retired = { fightReady: !!A.fight, error: A.modal().slice(0, 70), cameraAsks: cam.gum, freshLive: !!fresh && liveTracks([fresh]) > 0,
+      firstFrameBeforeReady: !!f1 && !f1.ready, firstFrameFromFresh: !!f1 && f1.stream === fresh, locks: heldLocks(wl) };
+    if (!(retired.fightReady && !retired.error && retired.cameraAsks === 2 && retired.freshLive && retired.firstFrameBeforeReady && retired.firstFrameFromFresh && retired.locks === 1))
+      bad.push(`old request failed after coming back: ${JSON.stringify(retired)}`);
+    notes.push(`old request failed: ${JSON.stringify(retired)}`);
+    await tapFlee(A);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    // 2. the same, but the fresh (current) request is refused: the permission error shows
+    ({ A, cam, inf, wl, loop } = await setup());
+    cam.hold = true;
+    await A.tapFight("field-mouse");
+    A.setVisible(false); await wait(200); A.setVisible(true); await wait(200);
+    cam.deny = "NotAllowedError";
+    cam.refuse("AbortError");
+    await until(() => A.modal(), 3000, "a message").catch(() => {});
+    let r0 = loop.runs; await wait(300);
+    const deniedFresh = { permissionError: /permission was blocked/i.test(A.modal()), cameraAsks: cam.gum, fightReady: !!A.fight, liveTracks: liveTracks(cam.streams),
+      locks: heldLocks(wl), loopRuns: loop.runs - r0, trackerRunning: A.api.trackerRunning };
+    if (!(deniedFresh.permissionError && deniedFresh.cameraAsks === 2 && !deniedFresh.fightReady && !deniedFresh.liveTracks && !deniedFresh.locks && !deniedFresh.loopRuns && !deniedFresh.trackerRunning))
+      bad.push(`fresh request refused: ${JSON.stringify(deniedFresh)} / "${A.modal().slice(0, 70)}"`);
+    notes.push(`fresh request refused: ${JSON.stringify(deniedFresh)}`);
+    try { noPenalty(A); } catch (e) { bad.push("fresh request refused: " + e.message); }
+    // 3. no hiding: the first (current) request is refused: the permission error shows
+    ({ A, cam, inf, wl, loop } = await setup());
+    cam.hold = true;
+    await A.tapFight("field-mouse");
+    cam.refuse("NotAllowedError");
+    await until(() => A.modal(), 3000, "a message").catch(() => {});
+    r0 = loop.runs; await wait(300);
+    const deniedNow = { permissionError: /permission was blocked/i.test(A.modal()), cameraAsks: cam.gum, fightReady: !!A.fight, locks: heldLocks(wl),
+      loopRuns: loop.runs - r0, trackerRunning: A.api.trackerRunning };
+    if (!(deniedNow.permissionError && deniedNow.cameraAsks === 1 && !deniedNow.fightReady && !deniedNow.locks && !deniedNow.loopRuns && !deniedNow.trackerRunning))
+      bad.push(`current request refused: ${JSON.stringify(deniedNow)} / "${A.modal().slice(0, 70)}"`);
+    notes.push(`current request refused: ${JSON.stringify(deniedNow)}`);
+    try { noPenalty(A); } catch (e) { bad.push("current request refused: " + e.message); }
+    check(!bad.length, bad.join(" || "));
+    return notes.join("; ");
+  }],
+  ["Item 5j Two quick looks away in a fight: the first return's late screen-lock answer is let go and starts nothing; the newer one starts one loop", async () => {
+    await reset();
+    const A = await open("A");
+    A.api.strictCamera = true;
+    const cam = {}, inf = {};
+    A.camera(cam); A.fastModel(inf);
+    const wl = A.fakeWakeLock(false), loop = A.countLoop(), clock = A.shiftClock();
+    await A.fightMonster("cave-rat");
+    A.rep(); await wait(100); // the fight is on
+    check(A.fight && !A.fight.over && A.api.trackerRunning, "test setup: the fight isn't on");
+    wl.hold = true; // from now on the phone's screen-lock answers wait
+    A.setVisible(false); await wait(200); clock.skip(1000); A.setVisible(true);
+    await until(() => wl.waiting.length === 1, 3000, "the first return's screen-lock request");
+    const s2 = A_video(A.d);
+    A.setVisible(false); await wait(200); clock.skip(1000); A.setVisible(true);
+    await until(() => wl.waiting.length === 2, 3000, "the second return's screen-lock request");
+    const s3 = A_video(A.d);
+    check(s2 && s3 && s3 !== s2 && liveTracks([s3]) === 1 && liveTracks([s2]) === 0, "test setup: the second return has no camera of its own");
+    // the first return's (old) answer comes now; the newer one is still waiting
+    const n0 = wl.sentinels.length, st0 = loop.starts, r0 = loop.runs, f0 = inf.frames || 0;
+    wl.grantOldest();
+    await wait(400);
+    const old = { oldReleased: wl.sentinels.length === n0 + 1 && wl.sentinels[n0].released, loopStarts: loop.starts - st0, loopRuns: loop.runs - r0,
+      frames: (inf.frames || 0) - f0, locks: heldLocks(wl) };
+    // the newer answer
+    const st1 = loop.starts, n1 = wl.sentinels.length;
+    wl.grantAll();
+    await wait(200);
+    const r1 = loop.runs, f1 = inf.frames || 0, k = (inf.seen || []).length;
+    await wait(500);
+    const seen = (inf.seen || []).slice(k);
+    const now = { loopStarts: loop.starts - st1, loopRuns500ms: loop.runs - r1, frames500ms: (inf.frames || 0) - f1, allFramesFromCurrent: seen.length > 0 && seen.every(x => x.stream === s3),
+      currentShown: A_video(A.d) === s3 && liveTracks([s3]) === 1, newerKept: !!wl.sentinels[n1] && !wl.sentinels[n1].released, locks: heldLocks(wl), liveTracks: liveTracks(cam.streams) };
+    check(old.oldReleased && old.loopStarts === 0 && old.loopRuns === 0 && old.frames === 0 && old.locks === 0
+      && now.loopStarts === 1 && now.loopRuns500ms > 0 && now.frames500ms > 0 && now.allFramesFromCurrent && now.currentShown && now.newerKept && now.locks === 1 && now.liveTracks === 1,
+      `old answer: ${JSON.stringify(old)}; newer answer: ${JSON.stringify(now)}`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `old answer: ${JSON.stringify(old)}; newer answer: ${JSON.stringify(now)}`;
+  }],
+  ["Item 5k Only one usable camera frame time: the first tracked frame, run right inside the loop start, still completes the start", async () => {
+    await reset();
+    const A = await open("A");
+    A.api.strictCamera = true;
+    const cam = {}, calls = [];
+    A.camera(cam);
+    const wl = A.fakeWakeLock(false), loop = A.countLoop();
+    A.api.hooks.setModelLoader(async () => ({ lm: {
+      detectForVideo(v) { calls.push({ loopRuns: loop.runs, ready: !!A.fight, stream: v.srcObject }); return { landmarks: [] }; }, close() {},
+    }, used: "CPU" }));
+    // the camera picture is ready and always reports the same time: only one frame can be tracked
+    const v = A.d.querySelector("#video");
+    Object.defineProperty(v, "currentTime", { configurable: true, get: () => 1, set() {} });
+    Object.defineProperty(v, "readyState", { configurable: true, get: () => 4 });
+    await A.tapFight("field-mouse");
+    await until(() => A.fight || A.modal(), 3000, "the fight").catch(() => {});
+    const r0 = loop.runs; await wait(300);
+    const c = calls[0];
+    const res = { fightReady: !!A.fight, error: A.modal().slice(0, 70), inferences: calls.length, firstInsideLoopStart: !!c && c.loopRuns === 0,
+      firstBeforeReady: !!c && !c.ready, firstFromShown: !!c && !!c.stream && c.stream === A_video(A.d), loopStarts: loop.starts, loopRuns300ms: loop.runs - r0, locks: heldLocks(wl) };
+    check(res.fightReady && !res.error && res.inferences === 1 && res.firstInsideLoopStart && res.firstBeforeReady && res.firstFromShown
+      && res.loopStarts === 1 && res.loopRuns300ms > 0 && res.locks === 1, JSON.stringify(res));
+    await tapFlee(A);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return JSON.stringify(res);
+  }],
+  ["Item 5l Back from a short look away, but the camera picture fails to play: that camera is let go and switched off; no screen lock, no loop", async () => {
+    await reset();
+    const A = await open("A");
+    A.api.strictCamera = true;
+    const cam = {}, inf = {}, pl = {};
+    A.camera(cam); A.fastModel(inf);
+    const wl = A.fakeWakeLock(false), loop = A.countLoop(), clock = A.shiftClock();
+    await A.fightMonster("cave-rat");
+    A.rep(); await wait(100); // the fight is on
+    check(A.fight && !A.fight.over && A.api.trackerRunning, "test setup: the fight isn't on");
+    A.setVisible(false); await wait(200); clock.skip(2000);
+    A.holdPlay(pl);
+    const a0 = inFightAsks(wl), st0 = loop.starts;
+    A.setVisible(true);
+    await until(() => pl.playFail, 3000, "the return's video.play()");
+    const s2 = A_video(A.d);
+    pl.playFail(); // this return's picture can't start
+    await wait(150);
+    const h = await whileHidden(A, cam, wl, loop, inf); // (visible now; counts over 400 ms)
+    const res = { returnCamera: !!s2 && s2 !== cam.streams[0], stillShown: h.shown, returnCameraLive: liveTracks([s2]), liveTracks: h.liveTracks, locks: h.locks,
+      lockAsks: inFightAsks(wl) - a0, loopStarts: loop.starts - st0, loopRuns: h.loopRuns, frames: h.frames, fightGoesOn: !!A.fight && !A.fight.over };
+    check(res.returnCamera && !res.stillShown && !res.returnCameraLive && !res.liveTracks && !res.locks && !res.lockAsks && !res.loopStarts && !res.loopRuns && !res.frames,
+      JSON.stringify(res));
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return JSON.stringify(res);
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

@@ -384,13 +384,16 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
 
   // Opens the camera for this session and shows it. Returns null (and never shows it) when the camera
   // arrives after a hide, a newer request or stop(); the same if that happens while the picture starts.
+  // A request made old that fails (e.g. AbortError after a hide) isn't this start's error: null too.
+  // A picture that can't play is switched off and let go before the error goes on.
   async function attachCamera(my) {
     const g = ++camGen;
     const mine = () => g === camGen && my === session && !paused;
-    const s = await openCamera(facingNow);
+    let s;
+    try { s = await openCamera(facingNow); } catch (e) { if (mine()) throw e; return null; }
     if (!mine()) { s.getTracks().forEach(t => t.stop()); return null; }
     showStream(s);
-    await video.play().catch(e => { if (mine()) throw e; });
+    try { await video.play(); } catch (e) { stopOwn(s); if (mine()) throw e; return null; }
     if (!mine()) { stopOwn(s); return null; }
     lastVideoTime = -1;
     resetSmooth();
@@ -442,8 +445,9 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
         await Promise.race([keepAwake(), changed()]);
         if (stale()) throw cancelled();
         if (paused || !liveStream()) continue;
+        const first = new Promise(r => { onFirstFrame = r; }); // before startLoop(): its first frame can be tracked at once
         startLoop();
-        const tracked = await Promise.race([new Promise(r => { onFirstFrame = r; }), changed()]);
+        const tracked = await Promise.race([first, changed()]);
         onFirstFrame = null;
         if (tracked) break;
       }
@@ -477,7 +481,8 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     try { s = await attachCamera(my); } catch { return; } // no camera now: the fight's timers decide
     if (!s || my !== session || !tracking()) return;
     await keepAwake();
-    if (my !== session || !tracking() || !liveStream()) return;
+    // still this return's camera? (hidden and back again meanwhile: the newer return starts the loop)
+    if (my !== session || !tracking() || stream !== s || !liveStream()) return;
     startLoop();
   }
 
