@@ -67,6 +67,11 @@ export function downSecsOf(c) {
 // Outside a rep, the 800 ms "lost" limit below is unchanged.
 const GAP_IN_REP_MS = 300;
 
+// A rep still going down (or held at the bottom) after this long is dropped: it would only keep collecting
+// frames (lying on the floor, or the phone left on). Real slow reps take a few seconds. After that the arms
+// must be straight again before a new rep can start, so staying down doesn't start the next 60 s at once.
+const MAX_REP_MS = 60000;
+
 // Rep = arms locked out -> elbows at depth -> locked out again, with body and legs straight the whole way.
 export function createRepCounter(getCfg) {
   // topAt: last moment the arms were straight (elbow >= top), where a slow rep's clock starts
@@ -116,6 +121,12 @@ export function createRepCounter(getCfg) {
       }
     } else if (state === "down") {
       const c = cycle;
+      if (t - c.t0 > MAX_REP_MS) {
+        ev.push({ type: "norep", reasons: ["Took too long"], expired: true, ...summary(c, t) });
+        cycle = null;
+        setState("idle");
+        return ev;
+      }
       c.trace.push({ t, e: m.elbow });
       c.minElbow = Math.min(c.minElbow, m.elbow);
       if (m.bodyBend > c.maxBend) { c.maxBend = m.bodyBend; c.bendDir = m.bendDir; }
@@ -358,6 +369,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   function stop() {
     running = false;
     cancelAnimationFrame(rafId);
+    counter.reset(); // a rep in progress (and its frames) isn't kept until the next fight
     stopStream();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     try { wakeLock?.release(); } catch {}

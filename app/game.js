@@ -1241,6 +1241,7 @@ function onRepEvent(ev) {
     }
     hit(need ? ev.downSecs : null);
   } else if (ev.type === "norep") {
+    if (ev.expired) resetDepthMeter(); // a rep held over 60 s was dropped: so is its slow-rep time
     // before the first counted rep, moves that never reached the bottom are just getting into
     // position (dropping to the knees, shifting the hands), so they don't buzz
     if (!fight.started && ev.depth === false) return;
@@ -1479,7 +1480,8 @@ function endFight(screen) {
   rest = null;
   if (state.fightMark) { state.fightMark = null; save(); }
   stopBeat(); // a clean end frees the other windows right away
-  tracker.stop();
+  tracker.stop(); // also clears the rep counter
+  resetDepthMeter(); // and the meter's copy of the last rep
   $("restPanel").hidden = true;
   show(screen);
 }
@@ -1499,6 +1501,9 @@ function resultModal({ tone, eyebrow, title, lines, buttons }) {
 function startRest(o) {
   rest = { endsAt: performance.now() + o.sec * 1000, beeped: 0, onDone: o.onDone, quitReason: o.quitReason };
   beat(); // a break counts as busy too: no other window may take over the run
+  // reps don't count in a break: drop a rep in progress now (the next fight or round starts fresh anyway)
+  tracker.counter.reset();
+  resetDepthMeter();
   $("restTitle").textContent = o.title;
   $("restNext").innerHTML = o.next;
   $("restWarn").textContent = o.warn;
@@ -1777,6 +1782,7 @@ if (DEBUG) {
     // feed one body measurement through the real rep counter and the HUD, like a camera frame would
     frame: (m, t) => { tracker.counter.update(m, t).forEach(onRepEvent); onTrackFrame(m, t); },
     get counter() { return tracker.counter; },
+    get meterCycle() { return meter.cycle; }, // the rep the live depth meter is following
     get trackerRunning() { return tracker.running; },
     hooks: testHooks,
     wanderer: () => todaysWanderer(),

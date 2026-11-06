@@ -227,6 +227,24 @@ const DOWN = [170, 168, 165, 160, 150, 140, 120, 100, 80, 65, 58, 55];      // f
 const UP = [55, 60, 75, 100, 130, 155, 165, 170];                           // back up to straight arms
 const LOCKOUT = [170, 170, 171, 170];                                       // seen again with straight arms
 const unseen = ms => Array.from({ length: Math.round(ms / FRAME_MS) }, () => null); // nobody seen for about ms
+const hold = (elbow, ms) => Array.from({ length: Math.round(ms / FRAME_MS) }, () => elbow); // still for about ms
+// straight arms, then down to the bottom in about secs, then back up (a "slow rep")
+function slowRep(secs) {
+  const n = Math.round(secs * 1000 / FRAME_MS);
+  return [170, 170, 170, ...Array.from({ length: n + 1 }, (_, i) => 160 - 105 * i / n), ...UP];
+}
+const COUNTER_CFG = () => ({ depth: 63, top: 160, bend: 20, knee: 135 });
+// feeds frames straight into a rep counter of its own (no game); returns its events and the next time
+function feed(counter, frames, t = 0) {
+  const out = [];
+  for (const e of frames) { for (const ev of counter.update(e == null ? null : plank(e), t)) out.push({ ...ev, t }); t += FRAME_MS; }
+  return { out, t };
+}
+// frames of an unfinished rep the game still keeps: the counter's rep in progress and the depth meter's copy
+function keptFrames(g) {
+  const held = new Set([g.api.counter.cycle, g.api.meterCycle].filter(Boolean));
+  return [...held].reduce((n, c) => n + c.trace.length, 0);
+}
 // feeds frames (elbow angles, null = nobody seen) through the game's real counter; returns the next time
 function playFrames(g, t, frames) {
   for (const e of frames) { g.api.frame(e == null ? null : plank(e), t); t += FRAME_MS; }
@@ -760,6 +778,122 @@ const tests = [
       return `core.js/data.js asked for at ${res("core.js")[0].startTime.toFixed(0)}/${res("data.js")[0].startTime.toFixed(0)} ms, game.js arrived ${game.responseEnd.toFixed(0)} ms; ` +
         `"World map" ${w0.toFixed(1)} → ${textW().toFixed(1)} px wide, ${before.length} Camp boxes unchanged`;
     } finally { await fontMode("block"); }
+  }],
+  // ------------------------------- Item 3 (audit finding #9): an unfinished rep is never kept around
+  ["Item 3a Leaving a fight, or a break starting, drops the rep in progress at once (0 frames kept)", async () => {
+    await reset();
+    const A = await open("A");
+    // 1. a slow monster (its depth meter follows the rep), 10 s held at the bottom, then Back to the map
+    await A.fightMonster("moss-slime");
+    let t = playFrames(A, 1e8, [...LOCKOUT, ...DOWN, ...hold(55, 10000)]);
+    const c = A.api.counter.cycle;
+    check(c && c.trace.length >= 300, `test setup: no rep in progress (${c ? c.trace.length : 0} frames)`);
+    const before = keptFrames(A);
+    A.d.querySelector("#btnFlee").click(); await wait(300);
+    check(A.screen() === "map", `Back didn't go to the map (${A.screen()})`);
+    const afterExit = keptFrames(A);
+    check(afterExit === 0, `after Back, ${afterExit} frames of the unfinished rep are still kept ` +
+      `(counter ${A.api.counter.cycle?.trace.length ?? 0}, depth meter ${A.api.meterCycle?.trace.length ?? 0})`);
+    check(A.api.counter.state === "idle", `the counter is still "${A.api.counter.state}" after leaving`);
+    // 2. a mine room cleared (fake hits) while a rep is in progress: the break starts with nothing kept
+    await A.enterFloor();
+    check(A.fight, "the mine fight didn't start");
+    t = playFrames(A, t + 1000, [...LOCKOUT, ...DOWN, ...hold(55, 10000)]);
+    const inMine = keptFrames(A);
+    check(inMine >= 300, `test setup: no rep in progress in the mine (${inMine} frames)`);
+    await A.reps(A.fight.total);
+    check(A.api.rest, "the break after the room didn't start");
+    const inRest = keptFrames(A);
+    check(inRest === 0, `when the break started, ${inRest} frames of the unfinished rep were still kept`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `kept frames: ${before} in the fight → ${afterExit} after Back; ${inMine} in the mine → ${inRest} in the break`;
+  }],
+  ["Item 3b 10 minutes held at the bottom: the rep is dropped after 60 s, no hit, and nothing builds up again", async () => {
+    const { createRepCounter } = await import(`../app/core.js?t=${Date.now()}`);
+    const counter = createRepCounter(COUNTER_CFG);
+    let { out: evs, t } = feed(counter, [...LOCKOUT, ...DOWN]);
+    const start = t;
+    let peak = 0, droppedAt = null;
+    for (let i = 0; i < 18000; i++) {               // 30 frames a second for 10 minutes
+      evs.push(...feed(counter, [55], t).out);
+      const n = counter.cycle ? counter.cycle.trace.length : 0;
+      peak = Math.max(peak, n);
+      if (droppedAt == null && n === 0) droppedAt = t - start;
+      t += FRAME_MS;
+    }
+    const end = counter.cycle ? counter.cycle.trace.length : 0;
+    check(end === 0, `${end} frames kept after 10 minutes at the bottom`);
+    check(peak <= 1850, `the rep in progress grew to ${peak} frames (60 s is about 1,800)`);
+    check(droppedAt != null && droppedAt <= 61000, `the hold was dropped only after ${droppedAt == null ? "never" : (droppedAt / 1000).toFixed(1) + " s"}`);
+    check(!evs.some(e => e.type === "rep"), "a rep was counted");
+    // still at the bottom after it was dropped: no new rep starts until the arms are straight again
+    const starts = evs.filter(e => e.type === "state" && e.state === "down").length;
+    check(starts === 1 && counter.state !== "down", `a rep in progress started ${starts} times (once expected); state now "${counter.state}"`);
+    const dropped = evs.filter(e => e.type === "norep");
+    check(dropped.length === 1 && dropped[0].expired, `expected one "took too long" no-rep, got ${JSON.stringify(dropped.map(e => e.reasons))}`);
+    // in the game: the slow-rep meter is cleared too, and no hit
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("moss-slime");
+    let gt = playFrames(A, 1e8, [...LOCKOUT, ...DOWN, ...hold(55, 30000)]);
+    check(A.api.counter.cycle && A.api.meterCycle === A.api.counter.cycle, "test setup: the slow-rep meter doesn't follow the rep");
+    playFrames(A, gt, hold(55, 35000));
+    check(keptFrames(A) === 0 && A.text("#downTime") === "0.0 s", `after 65 s the slow-rep meter still shows ${A.text("#downTime")} (${keptFrames(A)} frames kept)`);
+    check(A.fight.reps === 0, "a hit was counted");
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `peak ${peak} frames, dropped at ${(droppedAt / 1000).toFixed(1)} s, ${end} frames after 10 min (18,000 frames fed)`;
+  }],
+  ["Item 3c After a dropped hold: straight arms, then a normal rep and a 6 s slow rep count with the right times", async () => {
+    const { createRepCounter } = await import(`../app/core.js?t=${Date.now()}`);
+    const reps = out => out.filter(e => e.type === "rep");
+    // the same two reps on a fresh counter: what they must give after the dropped hold too
+    const fresh = reps(feed(createRepCounter(COUNTER_CFG), [...LOCKOUT, ...DOWN, ...UP, ...slowRep(6)]).out);
+    check(fresh.length === 2 && fresh[1].downSecs >= 5.5, `test setup: fresh counter gave ${JSON.stringify(fresh.map(r => r.downSecs))}`);
+    const a = createRepCounter(COUNTER_CFG);
+    let r = feed(a, [...LOCKOUT, ...DOWN, ...hold(55, 65000)]);
+    check(!a.cycle, "test setup: the hold wasn't dropped after 65 s");
+    const back = reps(feed(a, [...UP, ...LOCKOUT, ...DOWN, ...UP, ...slowRep(6)], r.t).out);
+    check(back.length === 2, `${back.length} reps counted after coming back up (2 expected)`);
+    for (const [i, k] of [[0, "downSecs"], [1, "downSecs"], [0, "secs"], [1, "secs"], [1, "minElbow"]]) {
+      check(back[i][k] === fresh[i][k], `rep ${i + 1} ${k}: ${back[i][k]}, a fresh counter gives ${fresh[i][k]}`);
+    }
+    // in the game, on the slow monster: the normal rep is "too fast", the slow one hits, both with the right time
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("moss-slime");
+    let t = playFrames(A, 1e8, [...LOCKOUT, ...DOWN, ...hold(55, 65000)]);
+    t = playFrames(A, t, [...UP, ...LOCKOUT, ...DOWN, ...UP]);
+    check(A.fight.reps === 0 && A.text("#banner").includes(`Too fast: ${fresh[0].downSecs.toFixed(1)} s down`), `normal rep: "${A.text("#banner")}"`);
+    playFrames(A, t, slowRep(6));
+    check(A.fight.reps === 1 && A.text("#banner").includes(`${fresh[1].downSecs.toFixed(1)} s down`), `slow rep: ${A.fight.reps} hits, "${A.text("#banner")}"`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `after the drop: normal rep ${back[0].downSecs} s, slow rep ${back[1].downSecs} s down (fresh counter: ${fresh[0].downSecs} / ${fresh[1].downSecs} s)`;
+  }],
+  ["Item 3d A slow rep that wins the fight is judged and paid in full before the fight is cleared away", async () => {
+    await reset();
+    const A = await open("A");
+    const { ZONES, xpReward } = await import("../app/data.js");
+    const m = ZONES.flatMap(z => z.monsters).find(x => x.id === "moss-slime");
+    const xp0 = A.state.xp, gain = xpReward(m, "world");
+    await A.fightMonster("moss-slime");
+    await A.reps(m.hp - 1);
+    check(A.fight && A.fight.hpLeft === 1, `test setup: ${A.fight ? A.fight.hpLeft : "no fight"} HP left`);
+    // a too-fast last rep: its time is read, and it doesn't win
+    let t = playFrames(A, 1e8, [...LOCKOUT, ...DOWN, ...UP]);
+    check(A.fight && !A.fight.over && A.fight.hpLeft === 1 && /too fast/i.test(A.text("#banner")), `a too-fast last rep: "${A.text("#banner")}"`);
+    // the slow last rep wins (frames end on the one that counts it: after that a real camera stops)
+    playFrames(A, t, slowRep(3).slice(0, -1));
+    await wait(300);
+    check(!A.fight && /defeated/i.test(A.modal()), `no victory: "${A.modal().slice(0, 80)}"`);
+    check(A.state.xp === xp0 + gain && saved().xp === xp0 + gain, `XP ${A.state.xp}, expected ${xp0} + ${gain} (with the slow-rep bonus)`);
+    check(A.modal().includes(`+${gain} XP`), `the victory doesn't say +${gain} XP: "${A.modal().slice(0, 120)}"`);
+    const h = saved().history[0];
+    check(h && h.id === "moss-slime" && h.won && h.reps === m.hp, `history: ${JSON.stringify(h)}`);
+    // and only then is the rep counter cleared
+    check(!A.api.counter.cycle && !A.api.meterCycle && A.api.counter.state === "idle",
+      `after the win: counter "${A.api.counter.state}", ${keptFrames(A)} frames kept`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `won with the slow rep: +${gain} XP, ${h.reps} reps in the history, counter cleared afterwards`;
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
