@@ -56,8 +56,21 @@ try {
     }
     function FailReq($rid, $why) { [void](Send 'Fetch.failRequest' @{ requestId = $rid; errorReason = $why }) }
     function AddLog($line) { if ($script:log.Count -lt 300) { [void]$script:log.Add($line) } }
+    # ---- the body-tracking library link: blocked like the rest of the internet, unless a test asks for
+    # the stand-in (/__lib/set?mode=fake answers it with fixtures\fake-vision.mjs; mode=block switches back)
+    $script:libMode = 'block'
+    $fakeLib = Get-Content -Raw "$root\_tests\fixtures\fake-vision.mjs"
     function OnPaused($p) {
         $u = $p.request.url
+        if ($u -like '*/__lib/*') {
+            if ($u -like '*mode=fake*') { $script:libMode = 'fake' } elseif ($u -like '*mode=block*') { $script:libMode = 'block' }
+            Fulfill $p.requestId 'application/json' (@{ mode = $script:libMode } | ConvertTo-Json -Compress)
+            return
+        }
+        if ($u -like '*://cdn.jsdelivr.net/*') {
+            if ($script:libMode -eq 'fake' -and $u -like '*/vision_bundle.mjs') { Fulfill $p.requestId 'text/javascript' $fakeLib } else { FailReq $p.requestId 'ConnectionRefused' }
+            return
+        }
         if ($u -like '*/__fonts/*') {
             if ($u -like '*/__fonts/set*') {
                 $q = @{}
@@ -119,7 +132,8 @@ try {
     }
     function Eval($code) { return (Call 'Runtime.evaluate' @{ expression = $code; returnByValue = $true }).result.result.value }
     $script:waitFor = $null
-    [void](Call 'Fetch.enable' @{ patterns = @(@{ urlPattern = '*://fonts.googleapis.com/*' }, @{ urlPattern = '*://fonts.gstatic.com/*' }, @{ urlPattern = '*/__fonts/*' }) })
+    [void](Call 'Fetch.enable' @{ patterns = @(@{ urlPattern = '*://fonts.googleapis.com/*' }, @{ urlPattern = '*://fonts.gstatic.com/*' }, @{ urlPattern = '*/__fonts/*' },
+        @{ urlPattern = '*://cdn.jsdelivr.net/*' }, @{ urlPattern = '*/__lib/*' }) })
     [void](Call 'Runtime.enable' @{})
     [void](Call 'Log.enable' @{})
     if ($CpuThrottle -gt 1) { [void](Call 'Emulation.setCPUThrottlingRate' @{ rate = $CpuThrottle }); Write-Output "CPU slowed down ${CpuThrottle}x" }

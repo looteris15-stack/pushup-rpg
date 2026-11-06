@@ -350,6 +350,35 @@ async function skipWarmUp(g) {
   await wait(1300);
 }
 const byModel = (ml, k) => Object.fromEntries(ml.models.map(m => [`${m.name}#${m.id}`, m[k]]));
+// ---- the game's own model loading, with a stand-in library: run.ps1 answers the library link with
+// fixtures/fake-vision.mjs while this is "fake" (and blocks it again with "block")
+const LIB_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+async function libMode(mode) {
+  const r = await fetch(`/__lib/set?mode=${mode}`).catch(() => null);
+  check(r && r.ok && /json/.test(r.headers.get("content-type") || ""), "the library control is missing: run the tests with _tests\\run.ps1");
+}
+// opens the game with its warm-up load skipped and its own loading code on (with the stand-in library)
+async function openRealLoader(id, fake) {
+  const g = await open(id);
+  await skipWarmUp(g);
+  g.api.hooks.setModelLoader(null);
+  g.w.__fakeVision = { log: [], ...fake };
+  return g;
+}
+// model downloads by the page (fetch of a pose_landmarker_ link): each one recorded (url, start, end);
+// it answers after ms with n bytes
+function slowModelNet(g, ms = 400, n = 1000) {
+  const net = { fetches: [] }, real = g.w.fetch;
+  g.w.fetch = function (u, init) {
+    const url = String((u && u.url) || u);
+    if (!url.includes("pose_landmarker_")) return real.apply(this, arguments);
+    const f = { url, start: g.w.performance.now(), end: null, init: init ? JSON.stringify(init) : "" };
+    net.fetches.push(f);
+    return new Promise(r => setTimeout(r, ms)).then(() => { f.end = g.w.performance.now(); return new g.w.Response(new Uint8Array(n)); });
+  };
+  return net;
+}
+const FULL = { ...BASE, settings: { ...BASE.settings, model: "full" } };
 // ---- sound: the base save has sound off; this one has it on (voice stays off)
 const SOUND_ON = { ...BASE, settings: { ...BASE.settings, sound: true } };
 // does the audio engine's clock still move (it stops while the engine sleeps)?
@@ -1666,6 +1695,189 @@ const tests = [
       && fights.every(f => f.ready && !f.error && f.loads === 2 && f.framesThisFight > 0 && f.closes === 0) && ml.models.length === 1, JSON.stringify(res));
     noPenalty(A);
     return JSON.stringify(res);
+  }],
+  // ---------------- Item 7 (audit finding #1): fight startup with body tracking
+  ["Item 7a A fight waits for Lite, a newer Full request fails, Lite answers last: the error shows at once, Lite is closed, nothing is left on", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const ml = A.heldModels(), cam = {};
+    A.camera(cam);
+    const wl = A.fakeWakeLock(false), loop = A.countLoop();
+    await A.tapFight("field-mouse");
+    await until(() => ml.loads.length === 1, 3000, "the fight's Lite load");
+    pickModel(A, "full"); // a newer request
+    check(ml.loads.map(l => l.name).join() === "lite,full", `test setup: loads asked: ${ml.loads.map(l => l.name).join()}`);
+    const t0 = performance.now();
+    ml.loads[1].fail(); // the newer Full load fails
+    await until(() => /could not load body tracking/i.test(A.modal()), 1500, "the body-tracking error").catch(() => {});
+    const errorMs = /could not load body tracking/i.test(A.modal()) ? Math.round(performance.now() - t0) : null;
+    const lite = ml.loads[0].give(); // the fight's own Lite load answers last
+    await wait(300);
+    const r0 = loop.runs, f0 = lite.frames;
+    await wait(400);
+    const st = saved();
+    const res = { errorMs, errorBeforeLiteAnswered: errorMs !== null, liteCloses: lite.closes, liteFrames: lite.frames, liveTracks: liveTracks(cam.streams), locks: heldLocks(wl),
+      loopRuns400ms: loop.runs - r0, framesAfter: lite.frames - f0, trackerRunning: A.api.trackerRunning, screen: A.screen(),
+      losses: Object.keys(st.losses || {}).length, history: (st.history || []).length };
+    check(res.errorBeforeLiteAnswered && res.errorMs < 500 && res.liteCloses === 1 && res.liteFrames === 0 && !res.liveTracks && !res.locks && !res.loopRuns400ms
+      && !res.trackerRunning && !res.losses && !res.history, `${JSON.stringify(res)} / "${A.modal().slice(0, 80)}"`);
+    noPenalty(A);
+    return JSON.stringify(res);
+  }],
+  ["Item 7b The model download starts with the library and its WASM start-up, and runs once (shared, and for the CPU fallback); chosen model; reuse", async () => {
+    await libMode("fake");
+    try {
+      await reset(FULL);
+      const A = await openRealLoader("A", { wasmMs: 300 });
+      A.api.strictCamera = true;
+      const fv = A.w.__fakeVision, net = slowModelNet(A, 400), cam = {};
+      A.camera(cam); A.fakeWakeLock(false);
+      const ev = (n, from = 0) => fv.log.slice(from).find(e => e.ev === n);
+      // 1. Full: a fight, and Settings asking for Full again while it loads (one shared load)
+      await A.tapFight("field-mouse");
+      pickModel(A, "full");
+      await until(() => A.fight || A.modal(), 5000, "the fight").catch(() => {});
+      const f = net.fetches[0], cr = ev("create"), wr = ev("wasmReady"), rd = ev("modelRead");
+      const full = { ready: !!A.fight, error: A.modal().slice(0, 60), modelDownloads: net.fetches.length, model: f ? f.url.split("/").pop() : null,
+        downloadStartedBeforeWasmReady: !!f && !!wr && f.start < wr.t, downloadRunningAtCreate: !!f && !!cr && f.end > cr.t,
+        createToModelReadMs: cr && rd ? Math.round(rd.t - cr.t) : null, creates: fv.log.filter(e => e.ev === "create").length, delegate: A.api.delegate };
+      await tapFlee(A);
+      // 2. the next fight reuses the ready model
+      const n0 = net.fetches.length, c0 = fv.log.filter(e => e.ev === "create").length;
+      await A.fightMonster("field-mouse");
+      const reuse = { ready: !!A.fight, newDownloads: net.fetches.length - n0, newCreates: fv.log.filter(e => e.ev === "create").length - c0 };
+      await tapFlee(A);
+      // 3. Lite with the GPU failing: the CPU fallback uses the same download
+      fv.failGpu = true;
+      const k = fv.log.length, n1 = net.fetches.length;
+      pickModel(A, "lite");
+      await A.fightMonster("field-mouse");
+      const tries = fv.log.slice(k).filter(e => e.ev === "create").map(e => e.delegate).join("+");
+      const lite = { ready: !!A.fight, error: A.modal().slice(0, 60), downloads: net.fetches.length - n1, model: net.fetches[n1] ? net.fetches[n1].url.split("/").pop() : null,
+        tries, delegate: A.api.delegate };
+      await tapFlee(A);
+      const res = { full, reuse, lite };
+      check(full.ready && !full.error && full.modelDownloads === 1 && full.model === "pose_landmarker_full.task" && full.downloadStartedBeforeWasmReady && full.downloadRunningAtCreate
+        && full.delegate === "GPU" && reuse.ready && reuse.newDownloads === 0 && reuse.newCreates === 0
+        && lite.ready && !lite.error && lite.downloads === 1 && lite.model === "pose_landmarker_lite.task" && lite.tries === "GPU+CPU" && lite.delegate === "CPU", JSON.stringify(res));
+      check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+      return JSON.stringify(res);
+    } finally { await libMode("block"); }
+  }],
+  ["Item 7c Offline copies still answer: the loader asks only for links the offline helper saves, the model as a plain download, and its bytes are used", async () => {
+    await libMode("fake");
+    try {
+      await reset(FULL);
+      const A = await openRealLoader("A", { wasmMs: 50 });
+      A.api.strictCamera = true;
+      const net = slowModelNet(A, 50, 4321), cam = {};
+      A.camera(cam); A.fakeWakeLock(false);
+      const core = await A.w.eval(`import(${JSON.stringify(new URL("core.js", A.w.location.href).href)})`); // the game's own module (same one)
+      const saves = await core.trackingFiles("full");     // what the offline helper downloads and keeps
+      await A.fightMonster("field-mouse");
+      const made = A.w.__fakeVision.made || [];
+      const res = { ready: !!A.fight, error: A.modal().slice(0, 70), savedList: saves.map(u => u.split("/").pop()), libInList: saves.includes(LIB_URL),
+        modelDownloads: net.fetches.length, modelInList: net.fetches.length > 0 && net.fetches.every(f => saves.includes(f.url)), plainDownload: net.fetches.every(f => !f.init),
+        bytesUsed: made[0] ? made[0].bytes === 4321 : false };
+      await tapFlee(A);
+      check(res.ready && !res.error && res.libInList && res.modelDownloads === 1 && res.modelInList && res.plainDownload && res.bytesUsed, JSON.stringify(res));
+      check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+      return JSON.stringify(res);
+    } finally { await libMode("block"); }
+  }],
+  ["Item 7d The startup screen gets a frame before the first inference; that one frame makes the fight ready, before its clock (map and mine)", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const cam = {}, calls = [], fr = { n: 0 };
+    A.camera(cam);
+    const raf = A.w.requestAnimationFrame.bind(A.w), tick = () => { fr.n++; raf(tick); };
+    raf(tick);
+    const wl = A.fakeWakeLock(false), ask = A.w.navigator.wakeLock.request;
+    const lock = { frame: null };
+    A.w.navigator.wakeLock.request = function (...a) { lock.frame = fr.n; return ask.apply(this, a); };
+    // a ready model whose first inference holds the page for 300 ms
+    A.api.hooks.setModelLoader(async () => ({ lm: { n: 0, detectForVideo() {
+      const c = { frame: fr.n, start: A.w.performance.now(), ready: !!A.fight };
+      if (this.n++ === 0) { const end = A.w.performance.now() + 300; while (A.w.performance.now() < end) {} }
+      c.end = A.w.performance.now(); calls.push(c); return { landmarks: [] };
+    }, close() {} }, used: "GPU" }));
+    pickModel(A, A.state.settings.model);
+    await wait(100);
+    const runs = [];
+    for (const where of ["map", "mine"]) {
+      const k = calls.length;
+      if (where === "map") await A.fightMonster("field-mouse"); else await A.enterFloor();
+      const first = calls[k], f = A.fight;
+      runs.push({ where, ready: !!f, framesAfterLockAnswer: first && lock.frame !== null ? first.frame - lock.frame : null, firstInferMs: first ? Math.round(first.end - first.start) : null,
+        firstBeforeReady: !!first && !first.ready, clockAfterFirst: !!f && !!first && f.waitSince >= first.end,
+        inferencesBeforeClock: f ? calls.slice(k).filter(c => c.start <= f.waitSince).length : null });
+      await tapFlee(A);
+    }
+    check(runs.every(r => r.ready && r.framesAfterLockAnswer >= 1 && r.firstBeforeReady && r.clockAfterFirst && r.inferencesBeforeClock === 1), JSON.stringify(runs));
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return JSON.stringify(runs);
+  }],
+  ["Item 7e Stuck after the camera permission: a retryable error when time is up, nothing left on, no penalty; a same-model retry works first; the old model closes once", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const LIMIT = 1500;
+    const hasLimit = typeof A.api.hooks.setStartBudget === "function";
+    if (hasLimit) A.api.hooks.setStartBudget(LIMIT);
+    const cam = {}, bad = [], notes = [];
+    A.camera(cam);
+    const ml = A.heldModels(), wl = A.fakeWakeLock(false), loop = A.countLoop();
+    // 1. the camera permission question stays open longer than the time limit: no time-out, Back works
+    cam.hold = true;
+    await A.tapFight("field-mouse");
+    await wait(LIMIT + 700);
+    const permission = { timedOut: /too long/i.test(A.modal()), stillStarting: A.screen() === "fight" && !A.fight };
+    await tapFlee(A);
+    permission.backToMap = A.screen() === "map";
+    cam.give();
+    if (permission.timedOut || !permission.stillStarting || !permission.backToMap) bad.push(`while the permission question was open: ${JSON.stringify(permission)}`);
+    notes.push(`permission open ${LIMIT + 700} ms: ${JSON.stringify(permission)}`);
+    try { noPenalty(A); } catch (e) { bad.push("after Back: " + e.message); }
+    // 2. camera allowed at once, body tracking stuck: after the limit, a retryable error and nothing on
+    await A.tapFight("field-mouse");
+    const t0 = performance.now();
+    await until(() => /too long/i.test(A.modal()), LIMIT + 1500, "the time-out").catch(() => {});
+    const r0 = loop.runs; await wait(300);
+    const st = saved();
+    const stuck = { timedOutAfterMs: /too long/i.test(A.modal()) ? Math.round(performance.now() - 300 - t0) : null, retryButton: !!A.d.querySelector('#modal [data-action="retryStart"]'),
+      liveTracks: liveTracks(cam.streams), locks: heldLocks(wl), loopRuns300ms: loop.runs - r0, trackerRunning: A.api.trackerRunning, screen: A.screen(),
+      losses: Object.keys(st.losses || {}).length, history: (st.history || []).length, loads: ml.loads.length };
+    if (!(stuck.timedOutAfterMs !== null && stuck.retryButton && !stuck.liveTracks && !stuck.locks && !stuck.loopRuns300ms && !stuck.trackerRunning && !stuck.losses && !stuck.history))
+      bad.push(`body tracking stuck: ${JSON.stringify(stuck)}${hasLimit ? "" : " (no time limit in this version)"} / "${A.modal().slice(0, 80)}"`);
+    notes.push(`stuck: ${JSON.stringify(stuck)}`);
+    try { noPenalty(A); } catch (e) { bad.push("after the time-out: " + e.message); }
+    // 3. Try again with the same model, before the stuck load ends: a new load, and the fight starts
+    if (stuck.retryButton) {
+      A.d.querySelector('#modal [data-action="retryStart"]').click();
+      await until(() => ml.loads.length === 2, 3000, "the retry's load").catch(() => {});
+      const m2 = ml.loads[1] && ml.loads[1].give();
+      await until(() => A.fight || /can't start/i.test(A.modal()), 3000, "the retry's fight").catch(() => {});
+      const retry = { ready: !!A.fight, error: A.modal().slice(0, 60), loads: ml.loads.length, sameModel: ml.loads.length === 2 && ml.loads[0].name === ml.loads[1].name,
+        retryTracks: !!m2 && m2.frames > 0 };
+      // 4. now the old, stuck load answers: it is closed once and the retry's model keeps going
+      const m1 = ml.loads[0].give();
+      await wait(300);
+      const f2 = m2 ? m2.frames : 0; await wait(400);
+      const old = { oldCloses: m1.closes, oldFrames: m1.frames, retryCloses: m2 ? m2.closes : null, retryStillTracking: !!m2 && m2.frames > f2, fightGoesOn: !!A.fight && !A.fight.over,
+        liveTracks: liveTracks(cam.streams), locks: heldLocks(wl) };
+      if (!(retry.ready && !retry.error && retry.loads === 2 && retry.sameModel && retry.retryTracks)) bad.push(`retry: ${JSON.stringify(retry)}`);
+      if (!(old.oldCloses === 1 && old.oldFrames === 0 && old.retryCloses === 0 && old.retryStillTracking && old.fightGoesOn && old.liveTracks === 1 && old.locks === 1)) bad.push(`old load answering late: ${JSON.stringify(old)}`);
+      notes.push(`retry: ${JSON.stringify(retry)}; old load answers: ${JSON.stringify(old)}`);
+      await tapFlee(A);
+    }
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return notes.join("; ");
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

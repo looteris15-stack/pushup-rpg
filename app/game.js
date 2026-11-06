@@ -887,7 +887,8 @@ const plankState = () => (fakeReps() ? "up" : tracker.counter.state);
 // time; going back counts for nothing, because no fight has begun yet. Returns true when the fight can begin.
 let startup = null; // { token, backTo, cancel } while the camera and body tracking start
 let strictCamera = false; // tests (?debug): a camera problem shows the real error instead of fake-rep mode
-async function openFightScreen(backTo) {
+let retryStart = null; // the "Try again" button of a start that ran out of time: does the same start again
+async function openFightScreen(backTo, again = null) {
   applySettings();
   initAudio(); // after applySettings: with sound off, the audio engine isn't made or woken
   closeModal();
@@ -921,8 +922,9 @@ async function openFightScreen(backTo) {
     quietAudio(); // no fight, no sound to finish
     stopBeat();
     show(backTo);
+    retryStart = e.retry && again ? again : null; // ran out of time: nothing was lost, so offer the same start again
     openModal(`<p class="eyebrow">Camera</p><h2>The fight can't start</h2><p>${esc(e.friendly || "Could not start the camera.")}</p>
-      <div class="row"><button type="button" class="primary" data-action="closeModal">OK</button></div>`);
+      <div class="row">${retryStart ? `<button type="button" class="primary" data-action="retryStart">Try again</button>` : ""}<button type="button"${retryStart ? "" : ' class="primary"'} data-action="closeModal">OK</button></div>`);
     return false;
   } finally {
     clearTimeout(slowNote);
@@ -1611,7 +1613,7 @@ async function startFight(id) {
   const r = resolveMonster(id);
   if (!r || fight || state.run) return;
   if (r.where !== "test" && (state.restUntil > now() || bossLock(r.m, r.zone))) return;
-  if (!(await openFightScreen("map"))) return;
+  if (!(await openFightScreen("map", () => startFight(id)))) return;
   beginFight(r.m, r.where, false, r.label);
 }
 async function enterFloor() {
@@ -1620,13 +1622,13 @@ async function enterFloor() {
   if (fight || state.run || state.restUntil > t || state.dungeonLockedUntil > t || state.dungeonFloor > DUNGEON.floors.length) return;
   state.run = { floor: state.dungeonFloor, room: 0 };
   save();
-  if (!(await openFightScreen("dungeon"))) { state.run = null; save(); renderCurrent(); return; }
+  if (!(await openFightScreen("dungeon", enterFloor))) { state.run = null; save(); renderCurrent(); return; }
   beginFight(DUNGEON.floors[state.run.floor - 1][0], "dungeon", false, DUNGEON.name);
 }
 async function continueRun() {
   if (!mayStartHere()) return;
   if (!state.run) return;
-  if (!(await openFightScreen("dungeon"))) return;
+  if (!(await openFightScreen("dungeon", continueRun))) return;
   // back after the game was closed: only what was left of the break (a full minute if no break was on)
   const left = state.run.breakEndsAt ? Math.ceil((state.run.breakEndsAt - now()) / 1000) : 60;
   mineBreak(Math.max(5, left), "Back in the mine", []);
@@ -1641,7 +1643,8 @@ document.addEventListener("click", e => {
   if (action === "goto") { closeModal(); show(to); }
   else if (action === "prefight") openPrefight(id);
   else if (action === "fight") startFight(id);
-  else if (action === "closeModal") { closeModal(); renderCurrent(); }
+  else if (action === "closeModal") { retryStart = null; closeModal(); renderCurrent(); }
+  else if (action === "retryStart") { const again = retryStart; retryStart = null; closeModal(); if (again) again(); }
   else if (action === "enterFloor") enterFloor();
   else if (action === "deeper") { closeModal(); enterFloor(); }
   else if (action === "continueRun") continueRun();

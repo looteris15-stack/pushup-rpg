@@ -262,15 +262,41 @@ export async function trackingFiles(name) {
   return [LIB, files.wasmLoaderPath, files.wasmBinaryPath, MODELS[name] || MODELS.full];
 }
 
-// automated tests (game.js ?debug) can swap in a slow fake model loader; players always get the real one
+// Time limit for the app's own part of a fight start: from the camera permission (the player's part, no
+// limit: Back works the whole time) until the fight is ready. Measured cold starts (Full model, nothing
+// saved yet, _tests\bench.ps1) took 11-19 s on a PC and 22-26 s with a phone-like 4x slower CPU and
+// 9 Mbit/s; 60 s covers that more than twice, or the ~11 MB first download (WASM + Full model) on about
+// 2 Mbit/s. The first inference can't be cut short by this (it blocks the page), but a fight whose first
+// inference succeeds is ready before the time-out can run.
+const START_BUDGET_MS = 60000;
+let startBudget = START_BUDGET_MS;
+
+// automated tests (game.js ?debug) can swap in a slow fake model loader or a short time limit;
+// players always get the real ones
 let modelLoader = name => loadPoseLandmarker(name);
-export const testHooks = { setModelLoader(fn) { modelLoader = fn || (name => loadPoseLandmarker(name)); } };
+export const testHooks = {
+  setModelLoader(fn) { modelLoader = fn || (name => loadPoseLandmarker(name)); },
+  setStartBudget(ms) { startBudget = ms > 0 ? ms : START_BUDGET_MS; },
+};
 
 async function loadPoseLandmarker(name) {
+  const url = MODELS[name] || MODELS.full;
+  // the model download starts at once, alongside the library and its WASM start-up, and is read once:
+  // the GPU try and the CPU fallback both get these same bytes
+  let failed = null;
+  const bytes = fetch(url)
+    .then(r => { if (!r.ok) throw new Error(`Failed to fetch model: ${url} (${r.status})`); return r.arrayBuffer(); })
+    .then(b => new Uint8Array(b));
+  bytes.catch(e => { failed = e; });
   const { PoseLandmarker, FilesetResolver } = await import(LIB);
   const files = await FilesetResolver.forVisionTasks(WASM);
+  // the library asks for the model only once its WASM is up; this hands it the downloaded bytes then
+  const model = () => {
+    let given = false;
+    return { async read() { if (given) return { done: true, value: undefined }; given = true; return { done: false, value: await bytes }; }, releaseLock() {}, cancel() {} };
+  };
   const opts = d => ({
-    baseOptions: { modelAssetPath: MODELS[name] || MODELS.full, delegate: d },
+    baseOptions: { modelAssetBuffer: model(), delegate: d },
     runningMode: "VIDEO",
     numPoses: 1,
     minPoseDetectionConfidence: 0.5,
@@ -280,6 +306,7 @@ async function loadPoseLandmarker(name) {
   try {
     return { lm: await PoseLandmarker.createFromOptions(files, opts("GPU")), used: "GPU" };
   } catch (e) {
+    if (failed) throw failed; // the download failed: the CPU can't help
     console.warn("GPU tracking failed, using CPU", e);
     return { lm: await PoseLandmarker.createFromOptions(files, opts("CPU")), used: "CPU" };
   }
@@ -297,28 +324,43 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   const sm = {};
 
   // Body tracking: a load of the asked type that is still going is shared, and a ready model is kept for
-  // later fights. modelGen: the newest request. Only it may install its model (and its delegate) or clear
-  // the pending load. A model that arrives for an older request is closed; so is the installed model
-  // when another type is asked for.
+  // later fights. modelGen: the newest request. Only it may install its model (and its delegate) or end
+  // the pending load. Whoever still waits for an older request gets the newest one's answer instead (its
+  // model, or its error at once). A model that arrives for an older request is closed; so is the
+  // installed model when another type is asked for.
   let modelGen = 0;
   const closeModel = lm => { try { lm?.close(); } catch {} };
   function ensureModel(name) {
-    if (name === modelName && (loading || landmarker)) return loading || Promise.resolve(landmarker);
+    if (name === modelName && landmarker) return Promise.resolve(landmarker);
+    if (name === modelName && loading) return loading.promise;
     const g = ++modelGen;
     modelName = name;
     closeModel(landmarker);
     landmarker = null;
-    const p = modelLoader(name).then(({ lm, used }) => {
-      if (g !== modelGen) { closeModel(lm); return loading || landmarker; } // too late: the newer request counts
+    const older = loading;
+    const mine = {};
+    mine.promise = new Promise((res, rej) => { mine.res = res; mine.rej = rej; });
+    loading = mine;
+    older?.res(mine.promise); // those waiting for the older request now wait for this one
+    modelLoader(name).then(({ lm, used }) => {
+      if (g !== modelGen) { closeModel(lm); return; } // too late: a newer request counts
       landmarker = lm; delegate = used; loading = null;
-      return lm;
+      mine.res(lm);
     }, err => {
-      if (g === modelGen) loading = null;
       console.error(err);
-      throw err;
+      if (g !== modelGen) return;
+      loading = null;
+      mine.rej(err);
     });
-    loading = p;
-    return p;
+    return mine.promise;
+  }
+  // a start that ran out of time lets go of a load still going: the retry starts a fresh one, and the
+  // late model is closed when it comes
+  function dropPendingModel(err) {
+    const l = loading;
+    if (!l) return;
+    loading = null; modelGen++; modelName = "";
+    l.rej(err);
   }
 
   function setDims() {
@@ -421,8 +463,12 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   // token: { cancelled } set by the game when the player taps Back during startup. Whatever arrives
   // after that (a late camera, a finished model, a screen lock) is switched off and ignored instead of
   // starting a fight. Resolves only when the fight can really begin: visible, a live camera, and one
-  // frame already through body tracking.
+  // frame already through body tracking. After the camera permission the start has startBudget ms; when
+  // they run out it fails with a "try again" error (retry: true) and leaves nothing on.
   const cancelled = () => Object.assign(new Error("Startup was cancelled."), { cancelled: true });
+  const tooSlow = () => Object.assign(friendly("Body tracking took too long to start. Check the internet connection, then try again."), { retry: true });
+  // after the next frame is painted (a timer set in a frame callback runs once that frame is on screen)
+  const afterPaint = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
   async function startCamera(facing, model, token = null) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw friendly(window.isSecureContext
@@ -436,13 +482,22 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     paused = document.visibilityState === "hidden";
     facingNow = facing;
     frame.classList.toggle("mirror", facing === "user");
+    let timer = 0;
     try {
       // 1. the camera first, so its permission question comes before body tracking downloads
       try { await attachCamera(my); } catch (e) { if (stale()) throw cancelled(); throw cameraError(e); }
       if (stale()) throw cancelled();
+      // from here on it's the app's own work: it gets startBudget ms in all
+      const late = new Promise((_, rej) => { timer = setTimeout(() => rej(tooSlow()), startBudget); });
+      late.catch(() => {});
+      const inTime = p => Promise.race([p, late]);
       // 2. body tracking
-      try { await ensureModel(model); }
-      catch { if (stale()) throw cancelled(); throw friendly("Could not load body tracking. Check the internet connection and try again."); }
+      try { await inTime(ensureModel(model)); }
+      catch (e) {
+        if (stale()) throw cancelled();
+        if (e.retry) { dropPendingModel(e); throw e; }
+        throw friendly("Could not load body tracking. Check the internet connection and try again.");
+      }
       if (stale()) throw cancelled();
       counter.reset();
       side = null;
@@ -451,17 +506,22 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
       //    Hidden on the way: wait for the app to come back, then open a fresh camera.
       for (;;) {
         if (stale()) throw cancelled();
-        if (paused) { await changed(); continue; }
+        if (paused) { await inTime(changed()); continue; }
         if (!liveStream()) {
-          try { await attachCamera(my); } catch (e) { if (stale()) throw cancelled(); throw cameraError(e); }
+          try { await inTime(attachCamera(my)); } catch (e) { if (stale()) throw cancelled(); if (e.retry) throw e; throw cameraError(e); }
           continue;
         }
-        await Promise.race([keepAwake(), changed()]);
+        await inTime(Promise.race([keepAwake(), changed()]));
+        if (stale()) throw cancelled();
+        if (paused || !liveStream()) continue;
+        // let the startup screen and the camera picture show first: the first inference can hold the page
+        // for seconds (the GPU getting ready), and nothing can interrupt it once it runs
+        await inTime(Promise.race([afterPaint(), changed()]));
         if (stale()) throw cancelled();
         if (paused || !liveStream()) continue;
         const first = new Promise(r => { onFirstFrame = r; }); // before startLoop(): its first frame can be tracked at once
         startLoop();
-        const tracked = await Promise.race([first, changed()]);
+        const tracked = await inTime(Promise.race([first, changed()]));
         onFirstFrame = null;
         if (tracked) break;
       }
@@ -469,6 +529,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
       if (my === session) stop(); // a failed start leaves nothing on (a cancelled one was stopped already)
       throw e;
     } finally {
+      clearTimeout(timer);
       if (my === session) starting = false;
     }
   }
