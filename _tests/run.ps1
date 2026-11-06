@@ -20,7 +20,7 @@ try {
     $block = "MAP cdn.jsdelivr.net 127.0.0.1, MAP storage.googleapis.com 127.0.0.1, MAP fonts.googleapis.com 127.0.0.1, MAP fonts.gstatic.com 127.0.0.1"
     $edge = Start-Process "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" -PassThru -ArgumentList `
         "--headless=new", "--remote-debugging-port=$DevPort", "--user-data-dir=`"$root\edge`"", "--no-first-run", `
-        "--deny-permission-prompts", `
+        "--deny-permission-prompts", "--autoplay-policy=no-user-gesture-required", `
         "--host-resolver-rules=`"$block`"", "http://localhost:$Port/_tests/$(if ($Only) { '?only=' + [Uri]::EscapeDataString($Only) })"
     $target = $null
     for ($i = 0; $i -lt 40 -and -not $target; $i++) {

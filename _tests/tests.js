@@ -154,6 +154,22 @@ async function open(id) {
       }
       return n;
     },
+    // records the game's audio engines (AudioContext) from now on: each one made, resume() and suspend()
+    // calls, and every sound played (the engine's state then, and when the sound ends)
+    trackAudio() {
+      const Real = w.AudioContext, rec = { list: [], resumes: 0, suspends: [], tones: [] };
+      w.AudioContext = class extends Real {
+        constructor(...a) { super(...a); rec.list.push(this); }
+        resume() { rec.resumes++; return super.resume(); }
+        suspend() { rec.suspends.push({ clock: this.currentTime, wall: performance.now() }); return super.suspend(); }
+        createOscillator() {
+          const o = super.createOscillator(), ctx = this, stop = o.stop.bind(o);
+          o.stop = when => { rec.tones.push({ state: ctx.state, end: when, wall: performance.now() }); return stop(when); };
+          return o;
+        }
+      };
+      return rec;
+    },
     // picks a file in Settings → Backup → Open backup file; returns the message
     async openFile(parts, name = "backup.txt") {
       const input = d.querySelector("#restoreFile"), dt = new w.DataTransfer();
@@ -212,6 +228,12 @@ function campTrip(d, to) {
   return went && !d.getElementById("camp").hidden;
 }
 const frame = w => new Promise(r => w.requestAnimationFrame(() => w.requestAnimationFrame(r)));
+// ---- sound: the base save has sound off; this one has it on (voice stays off)
+const SOUND_ON = { ...BASE, settings: { ...BASE.settings, sound: true } };
+// does the audio engine's clock still move (it stops while the engine sleeps)?
+async function clockMoves(ctx, ms = 300) { const a = ctx.currentTime; await wait(ms); return ctx.currentTime > a; }
+const tapFlee = async (g, ms = 300) => { g.d.querySelector("#btnFlee").click(); await wait(ms); };
+const tapSound = async (g, ms = 100) => { g.d.querySelector("#btnSound").click(); await wait(ms); };
 // n characters of base64 made from random bytes (looks like a backup code, but holds no save)
 function randomB64(n) {
   const bytes = new Uint8Array(Math.ceil(n * 3 / 4));
@@ -894,6 +916,128 @@ const tests = [
       `after the win: counter "${A.api.counter.state}", ${keptFrames(A)} frames kept`);
     check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
     return `won with the slow rep: +${gain} XP, ${h.reps} reps in the history, counter cleared afterwards`;
+  }],
+  // ------------------------ Item 4 (audit finding #10): the audio engine only runs while sound can play
+  ["Item 4a Sound off: fights start and end without starting (or waking) the audio engine", async () => {
+    await reset();
+    const A = await open("A");
+    const au = A.trackAudio();
+    for (let i = 0; i < 3; i++) {
+      await A.fightMonster("field-mouse");
+      await A.reps(3);
+      check(/defeated/i.test(A.modal()), `fight ${i + 1}: no win`);
+      await A.fightMonster("field-mouse");
+      await tapFlee(A);
+      check(A.screen() === "map", `fight ${i + 1}: Back didn't go to the map`);
+    }
+    const made = au.list.length, woken = au.resumes;
+    check(made === 0 && woken === 0, `with sound off, ${made} audio engine(s) were made and woken ${woken} time(s)`);
+    // an engine made earlier (Sound on in one fight, then off again): later muted fights don't wake it
+    await A.fightMonster("field-mouse");
+    await tapSound(A);
+    const ctx = au.list[0];
+    check(ctx && ctx.state === "running", `test setup: Sound on didn't start the engine (${ctx ? ctx.state : "none made"})`);
+    await tapSound(A);
+    await tapFlee(A);
+    const r0 = au.resumes;
+    for (let i = 0; i < 3; i++) { await A.fightMonster("field-mouse"); await A.reps(3); }
+    await A.goto("camp");
+    const moving = await clockMoves(ctx);
+    check(au.resumes === r0, `muted fights woke the engine ${au.resumes - r0} time(s)`);
+    check(ctx.state !== "running" && !moving, `on Camp the engine is "${ctx.state}" (clock ${moving ? "moving" : "still"})`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `6 muted fights: ${made} engines made, woken ${woken} times; after Sound on/off, 3 more muted fights: woken ${au.resumes - r0} times, engine "${ctx.state}", clock still`;
+  }],
+  ["Item 4b Sound on: the win or loss sound plays out on a running engine, then the engine sleeps", async () => {
+    await reset(SOUND_ON);
+    const A = await open("A");
+    const au = A.trackAudio();
+    const notes = [];
+    for (const kind of ["win", "loss"]) {
+      await A.fightMonster(kind === "win" ? "field-mouse" : "cave-rat");
+      const ctx = au.list[0];
+      check(ctx && ctx.state === "running", `${kind}: the fight's audio engine isn't running (${ctx ? ctx.state : "none made"})`);
+      const n0 = au.tones.length, s0 = au.suspends.length;
+      if (kind === "win") await A.reps(3);
+      else { A.rep(); await wait(100); await tapFlee(A, 50); await tapFlee(A, 300); } // give up: tap twice
+      check(kind === "win" ? /defeated/i.test(A.modal()) : /won this time/i.test(A.modal()), `${kind}: the fight didn't end that way: "${A.modal().slice(0, 60)}"`);
+      const cue = au.tones.slice(n0).slice(-4); // the last sound: 4 notes
+      const endWall = cue[0].wall, cueEnd = Math.max(...cue.map(t => t.end));
+      check(cue.length === 4 && cue.every(t => t.state === "running"), `${kind}: the end sound was played on a "${cue.map(t => t.state)}" engine`);
+      check(ctx.state === "running", `${kind}: the engine slept ${(performance.now() - endWall).toFixed(0)} ms after the end, before its sound had finished`);
+      await until(() => ctx.state === "suspended", 2500, "the engine to sleep").catch(() => {});
+      const s = au.suspends[s0];
+      check(ctx.state === "suspended" && s, `${kind}: 2.5 s after the end the engine is still "${ctx.state}"`);
+      check(s.clock >= cueEnd, `${kind}: the engine slept at ${s.clock.toFixed(2)} s, before its sound ended (${cueEnd.toFixed(2)} s)`);
+      check(!(await clockMoves(ctx)), `${kind}: the sleeping engine's clock still moves`);
+      const clockAtEnd = s.clock - (s.wall - endWall) / 1000; // the engine's clock when the end sound started
+      notes.push(`${kind}: sound ${((cueEnd - clockAtEnd) * 1000).toFixed(0)} ms long, engine asleep ${(s.wall - endWall).toFixed(0)} ms after the end`);
+      A.closeModal();
+    }
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return notes.join("; ");
+  }],
+  ["Item 4c Sound on: Back during startup, or Sound off, puts the audio engine to sleep at once", async () => {
+    await reset(SOUND_ON);
+    const A = await open("A");
+    const au = A.trackAudio();
+    // 1. Back while the camera question is still open
+    const answer = A.slowCamera();
+    await A.tapFight("field-mouse");
+    const ctx = au.list[0];
+    check(ctx && ctx.state === "running", `test setup: the engine didn't start with the fight (${ctx ? ctx.state : "none made"})`);
+    const t0 = performance.now();
+    A.d.querySelector("#btnFlee").click();
+    await until(() => ctx.state === "suspended", 400, "sleep").catch(() => {});
+    const msBack = performance.now() - t0;
+    check(ctx.state === "suspended", `400 ms after Back during startup the engine is "${ctx.state}"`);
+    check(A.screen() === "map" && !(await clockMoves(ctx)), `after Back: screen ${A.screen()}, clock still moving`);
+    answer();
+    await wait(200);
+    // 2. Sound off in a fight
+    A.fastCamera();
+    await A.fightMonster("field-mouse");
+    check(ctx.state === "running", `the next fight didn't wake the engine (${ctx.state})`);
+    const t1 = performance.now();
+    A.d.querySelector("#btnSound").click();
+    await until(() => ctx.state === "suspended", 400, "sleep").catch(() => {});
+    const msOff = performance.now() - t1;
+    check(ctx.state === "suspended" && !(await clockMoves(ctx)), `400 ms after Sound off the engine is "${ctx.state}"`);
+    // and Sound on wakes it again
+    await tapSound(A);
+    check(ctx.state === "running", `Sound on didn't wake the engine (${ctx.state})`);
+    await tapFlee(A);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `asleep ${msBack.toFixed(0)} ms after Back during startup, ${msOff.toFixed(0)} ms after Sound off`;
+  }],
+  ["Item 4d Sound on: a fight started right after one ends keeps its sound, and its own end still sleeps", async () => {
+    await reset(SOUND_ON);
+    const A = await open("A");
+    const au = A.trackAudio();
+    await A.fightMonster("field-mouse");
+    const ctx = au.list[0];
+    check(ctx && ctx.state === "running", `test setup: the engine isn't running (${ctx ? ctx.state : "none made"})`);
+    // the winning rep, and right away (same moment) Fight on the Cave Rat from the map
+    A.rep(); A.rep(); A.rep();
+    const tEnd = performance.now();
+    check(/defeated/i.test(A.modal()), "test setup: the first fight didn't end");
+    A.d.querySelector('.mrow[data-id="cave-rat"]').click();
+    [...A.d.querySelectorAll("#modal button")].find(b => /fight/i.test(b.textContent) && !b.disabled).click();
+    const startedIn = performance.now() - tEnd;
+    check(startedIn < 100, `test setup: the new fight was started ${startedIn.toFixed(0)} ms after the first ended`);
+    await until(() => A.fight && !A.fight.over && A.fight.m.id === "cave-rat", 3000, "the new fight");
+    await wait(Math.max(0, 1000 - (performance.now() - tEnd)));
+    const at = performance.now() - tEnd, moving = await clockMoves(ctx);
+    check(ctx.state === "running" && moving && au.suspends.length === 0,
+      `${at.toFixed(0)} ms after the first fight ended, the new fight's engine is "${ctx.state}" (slept ${au.suspends.length} time(s))`);
+    A.rep(); await wait(50);
+    check(au.tones.at(-1).state === "running", "a hit in the new fight played on a sleeping engine");
+    // the new fight ends: now the engine does go to sleep
+    await A.reps(A.fight.total - A.fight.reps);
+    await until(() => ctx.state === "suspended", 2500, "sleep").catch(() => {});
+    check(ctx.state === "suspended", `after the second fight ended, the engine is still "${ctx.state}"`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `new fight ${startedIn.toFixed(0)} ms after the end: engine running at ${at.toFixed(0)} ms, 0 sleeps; asleep after the second fight`;
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

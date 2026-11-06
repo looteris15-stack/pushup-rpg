@@ -1,4 +1,4 @@
-import { createTracker, initAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake, testHooks } from "./core.js";
+import { createTracker, initAudio, quietAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake, testHooks } from "./core.js";
 import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
@@ -887,8 +887,8 @@ const plankState = () => (fakeReps() ? "up" : tracker.counter.state);
 // time; going back counts for nothing, because no fight has begun yet. Returns true when the fight can begin.
 let startup = null; // { token, backTo, cancel } while the camera and body tracking start
 async function openFightScreen(backTo) {
-  initAudio();
   applySettings();
+  initAudio(); // after applySettings: with sound off, the audio engine isn't made or woken
   closeModal();
   show("fight");
   $("restPanel").hidden = true;
@@ -917,6 +917,7 @@ async function openFightScreen(backTo) {
     if (token.cancelled) return false;
     if (DEBUG) { $("debug").textContent = "debug: no camera, use the fake buttons"; return true; }
     tracker.stop();
+    quietAudio(); // no fight, no sound to finish
     stopBeat();
     show(backTo);
     openModal(`<p class="eyebrow">Camera</p><h2>The fight can't start</h2><p>${esc(e.friendly || "Could not start the camera.")}</p>
@@ -934,6 +935,7 @@ function cancelStartup() {
   startup = null;
   s.cancel();
   tracker.stop(); // stops a camera that is already on (body tracking was still loading)
+  quietAudio(); // no fight, no sound to finish
   stopBeat();
   show(s.backTo);
 }
@@ -1482,6 +1484,7 @@ function endFight(screen) {
   stopBeat(); // a clean end frees the other windows right away
   tracker.stop(); // also clears the rep counter
   resetDepthMeter(); // and the meter's copy of the last rep
+  quietAudio(600); // the audio engine sleeps once the win or loss sound has played out
   $("restPanel").hidden = true;
   show(screen);
 }
@@ -1667,7 +1670,7 @@ $("btnSound").addEventListener("click", () => {
   state.settings.sound = !audio.on;
   applySettings();
   saveSoon();
-  if (audio.on) initAudio(); else hush();
+  if (audio.on) initAudio(); else { hush(); quietAudio(); }
 });
 $("dbgRep").addEventListener("click", () => { if (fight && !fight.over && !rest) hit(); });
 $("dbgNoRep").addEventListener("click", () => onRepEvent({ type: "norep", reasons: ["Go lower"] }));

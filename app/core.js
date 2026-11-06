@@ -172,18 +172,37 @@ export function createRepCounter(getCfg) {
 // ---------- sound ----------
 
 export const audio = { on: true, voice: true };
+// The browser's audio engine keeps working (and using battery) while it is awake, even in silence.
+// So it is only made or woken when sound is on, and put to sleep when the game goes quiet.
 let actx = null;
+let sleepTimer = 0, sleepMin = 0; // a sleep waiting for the last sound to finish
+let soundsEnd = 0;                // engine time when the last sound played so far ends
 
 export function initAudio() {
+  if (!audio.on) { quietAudio(); return; }
+  clearTimeout(sleepTimer); sleepTimer = 0; // a new fight right after the last one: keep the engine awake
   try {
     actx = actx || new (window.AudioContext || window.webkitAudioContext)();
-    actx.resume();
+    if (actx.state !== "running") actx.resume().catch(() => {});
   } catch {}
+}
+
+// Puts the audio engine to sleep: at once (ms = 0: Back before the fight, Sound off), or after at least
+// ms and only once the last sound has played out (the end of a fight: the win or loss sound).
+export function quietAudio(ms = 0) {
+  clearTimeout(sleepTimer); sleepTimer = 0;
+  if (!actx) return;
+  const sleep = () => { sleepTimer = 0; if (actx.state === "running") actx.suspend().catch(() => {}); };
+  if (ms <= 0) { sleep(); return; }
+  sleepMin = ms;
+  sleepTimer = setTimeout(sleep, Math.max(ms, (soundsEnd - actx.currentTime) * 1000 + 100));
 }
 
 function tone(freq, dur, type = "sine", gain = 0.25, when = 0, slideTo = 0) {
   if (!actx || !audio.on) return;
   const t = actx.currentTime + when;
+  soundsEnd = Math.max(soundsEnd, t + dur + 0.02);
+  if (sleepTimer) quietAudio(sleepMin); // a sound while a sleep waits: sleep only after it has played
   const o = actx.createOscillator(), g = actx.createGain();
   o.type = type;
   o.frequency.setValueAtTime(freq, t);
