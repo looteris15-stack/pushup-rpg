@@ -189,7 +189,7 @@ async function open(id) {
       rec.gum = 0; rec.streams = []; rec.hold = false; rec.deny = "";
       w.navigator.mediaDevices.getUserMedia = () => {
         rec.gum++;
-        const make = () => { const s = g.fakeStream(); rec.streams.push(s); return s; };
+        const make = () => { const s = g.fakeStream(); rec.streams.push(s); rec.grantedAt = w.performance.now(); return s; };
         if (rec.deny) { const n = rec.deny; rec.deny = ""; return Promise.reject(new w.DOMException(n, n)); }
         if (!rec.hold) return Promise.resolve(make());
         rec.hold = false;
@@ -1878,6 +1878,102 @@ const tests = [
     if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
     check(!bad.length, bad.join(" || "));
     return notes.join("; ");
+  }],
+  ["Item 7f The camera picture never starts (video.play() held): the time limit counts from the camera grant, not the question; Try again; late playback revives nothing", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const LIMIT = 1200;
+    if (typeof A.api.hooks.setStartBudget === "function") A.api.hooks.setStartBudget(LIMIT);
+    const cam = {}, inf = {}, pl = {}, bad = [];
+    A.camera(cam); A.fastModel(inf);
+    const wl = A.fakeWakeLock(false), loop = A.countLoop();
+    cam.hold = true;
+    A.holdPlay(pl);
+    await A.tapFight("field-mouse");
+    await wait(LIMIT + 500); // the permission question stays open longer than the limit
+    const question = { timedOut: /too long/i.test(A.modal()), stillStarting: A.screen() === "fight" && !A.fight };
+    cam.give(); // granted now; the picture's play() stays held
+    const tGrant = performance.now();
+    await until(() => pl.playGo, 2000, "video.play()").catch(() => {});
+    await until(() => /too long/i.test(A.modal()), LIMIT + 1500, "the time-out").catch(() => {});
+    const timedOut = /too long/i.test(A.modal());
+    const atTimeout = { afterGrantMs: timedOut ? Math.round(performance.now() - tGrant) : null, retryButton: !!A.d.querySelector('#modal [data-action="retryStart"]'),
+      shown: !!A_video(A.d), liveTracks: liveTracks(cam.streams), locks: heldLocks(wl), trackerRunning: A.api.trackerRunning };
+    // the held play() ends now: nothing may come back to life
+    if (pl.playGo) pl.playGo();
+    await wait(300);
+    const r0 = loop.runs; await wait(400);
+    const st = saved();
+    const late = { shown: !!A_video(A.d), liveTracks: liveTracks(cam.streams), locks: heldLocks(wl), loopRuns400ms: loop.runs - r0, frames: inf.frames || 0,
+      fight: !!A.fight, stillTryAgain: /too long/i.test(A.modal()), trackerRunning: A.api.trackerRunning, losses: Object.keys(st.losses || {}).length, history: (st.history || []).length };
+    if (question.timedOut || !question.stillStarting) bad.push(`while the question was open: ${JSON.stringify(question)}`);
+    if (!(atTimeout.afterGrantMs !== null && atTimeout.afterGrantMs >= LIMIT - 100 && atTimeout.retryButton && !atTimeout.shown && !atTimeout.liveTracks && !atTimeout.locks && !atTimeout.trackerRunning))
+      bad.push(`time-out: ${JSON.stringify(atTimeout)}`);
+    if (!(!late.shown && !late.liveTracks && !late.locks && !late.loopRuns400ms && !late.frames && !late.fight && late.stillTryAgain && !late.trackerRunning && !late.losses && !late.history))
+      bad.push(`after the late playback: ${JSON.stringify(late)}`);
+    try { noPenalty(A); } catch (e) { bad.push("penalty: " + e.message); }
+    // Try again (same model): this time the picture plays and the fight starts
+    let retry = null;
+    if (atTimeout.retryButton) {
+      A.d.querySelector('#modal [data-action="retryStart"]').click();
+      await until(() => A.fight || /can't start/i.test(A.modal()), 3000, "the retry").catch(() => {});
+      retry = { ready: !!A.fight, error: A.modal().slice(0, 60), cameraAsks: cam.gum, liveTracks: liveTracks(cam.streams), locks: heldLocks(wl) };
+      if (!(retry.ready && !retry.error && retry.liveTracks === 1 && retry.locks === 1)) bad.push(`retry: ${JSON.stringify(retry)}`);
+      await tapFlee(A);
+    }
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return `question open ${LIMIT + 500} ms: ${JSON.stringify(question)}; time-out: ${JSON.stringify(atTimeout)}; late playback: ${JSON.stringify(late)}; retry: ${JSON.stringify(retry)}`;
+  }],
+  ["Item 7g The first inference starts in time but ends after the limit: when it returns the start is out of time; Try again, nothing on, no fight and no fight clock", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    A.api.strictCamera = true;
+    const LIMIT = 1000;
+    if (typeof A.api.hooks.setStartBudget === "function") A.api.hooks.setStartBudget(LIMIT);
+    const cam = {}, calls = [], bad = [];
+    A.camera(cam);
+    const wl = A.fakeWakeLock(false), loop = A.countLoop();
+    // a ready model whose first inference holds the page for LIMIT + 400 ms; later ones are quick
+    A.api.hooks.setModelLoader(async () => ({ lm: { n: 0, detectForVideo() {
+      const c = { start: A.w.performance.now(), ready: !!A.fight };
+      if (this.n++ === 0) { const end = c.start + LIMIT + 400; while (A.w.performance.now() < end) {} }
+      c.end = A.w.performance.now(); calls.push(c); return { landmarks: [] };
+    }, close() {} }, used: "GPU" }));
+    pickModel(A, A.state.settings.model);
+    await wait(100);
+    await A.tapFight("field-mouse");
+    await until(() => A.fight || A.modal(), 4000, "the fight or a message").catch(() => {});
+    const c = calls[0], fightStarted = !!A.fight;
+    const res = { firstStartAfterGrantMs: c ? Math.round(c.start - cam.grantedAt) : null, firstEndAfterGrantMs: c ? Math.round(c.end - cam.grantedAt) : null,
+      timedOut: /too long/i.test(A.modal()), retryButton: !!A.d.querySelector('#modal [data-action="retryStart"]'), fightStarted, fightClock: fightStarted ? "started" : "none" };
+    if (A.fight) await tapFlee(A);
+    await wait(200);
+    const r0 = loop.runs; await wait(400);
+    const st = saved();
+    Object.assign(res, { liveTracks: liveTracks(cam.streams), locks: heldLocks(wl), loopRuns400ms: loop.runs - r0, trackerRunning: A.api.trackerRunning,
+      losses: Object.keys(st.losses || {}).length, history: (st.history || []).length });
+    if (!(res.firstStartAfterGrantMs !== null && res.firstStartAfterGrantMs < LIMIT && res.firstEndAfterGrantMs > LIMIT && res.timedOut && res.retryButton && !res.fightStarted
+      && !res.liveTracks && !res.locks && !res.loopRuns400ms && !res.trackerRunning && !res.losses && !res.history)) bad.push(JSON.stringify(res));
+    try { noPenalty(A); } catch (e) { bad.push("penalty: " + e.message); }
+    // Try again (same, now warmed-up model): one quick frame makes the fight ready, before its clock
+    let retry = null;
+    if (res.retryButton) {
+      const k = calls.length;
+      A.d.querySelector('#modal [data-action="retryStart"]').click();
+      await until(() => A.fight || /can't start/i.test(A.modal()), 3000, "the retry").catch(() => {});
+      const f = A.fight;
+      retry = { ready: !!f, error: A.modal().slice(0, 60), firstBeforeReady: !!calls[k] && !calls[k].ready,
+        inferencesBeforeClock: f ? calls.slice(k).filter(x => x.start <= f.waitSince).length : null };
+      if (!(retry.ready && !retry.error && retry.firstBeforeReady && retry.inferencesBeforeClock === 1)) bad.push(`retry: ${JSON.stringify(retry)}`);
+      await tapFlee(A);
+    }
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return `${JSON.stringify(res)}; retry: ${JSON.stringify(retry)}`;
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

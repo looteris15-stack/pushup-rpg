@@ -262,12 +262,12 @@ export async function trackingFiles(name) {
   return [LIB, files.wasmLoaderPath, files.wasmBinaryPath, MODELS[name] || MODELS.full];
 }
 
-// Time limit for the app's own part of a fight start: from the camera permission (the player's part, no
-// limit: Back works the whole time) until the fight is ready. Measured cold starts (Full model, nothing
-// saved yet, _tests\bench.ps1) took 11-19 s on a PC and 22-26 s with a phone-like 4x slower CPU and
-// 9 Mbit/s; 60 s covers that more than twice, or the ~11 MB first download (WASM + Full model) on about
-// 2 Mbit/s. The first inference can't be cut short by this (it blocks the page), but a fight whose first
-// inference succeeds is ready before the time-out can run.
+// Time limit for the app's own part of a fight start: from the moment the camera is allowed (the
+// permission question is the player's part, no limit: Back works the whole time) until the fight is
+// ready. Measured cold starts (Full model, nothing saved yet, _tests\bench.ps1) took 11-19 s on a PC
+// and 22-26 s with a phone-like 4x slower CPU and 9 Mbit/s; 60 s covers that more than twice, or the
+// ~11 MB first download (WASM + Full model) on about 2 Mbit/s. The first inference can't be cut short
+// (it blocks the page), so the clock is checked when it returns: past the limit, the start fails too.
 const START_BUDGET_MS = 60000;
 let startBudget = START_BUDGET_MS;
 
@@ -442,11 +442,12 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   // arrives after a hide, a newer request or stop(); the same if that happens while the picture starts.
   // A request made old that fails (e.g. AbortError after a hide) isn't this start's error: null too.
   // A picture that can't play is switched off and let go before the error goes on.
-  async function attachCamera(my) {
+  async function attachCamera(my, granted = null) {
     const g = ++camGen;
     const mine = () => g === camGen && my === session && !paused;
     let s;
     try { s = await openCamera(facingNow); } catch (e) { if (mine()) throw e; return null; }
+    if (my === session) granted?.(); // the camera was allowed: from here on it's the app's own time
     if (!mine()) { s.getTracks().forEach(t => t.stop()); return null; }
     showStream(s);
     try { await video.play(); } catch (e) { stopOwn(s); if (mine()) throw e; return null; }
@@ -463,8 +464,9 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   // token: { cancelled } set by the game when the player taps Back during startup. Whatever arrives
   // after that (a late camera, a finished model, a screen lock) is switched off and ignored instead of
   // starting a fight. Resolves only when the fight can really begin: visible, a live camera, and one
-  // frame already through body tracking. After the camera permission the start has startBudget ms; when
-  // they run out it fails with a "try again" error (retry: true) and leaves nothing on.
+  // frame already through body tracking. Once the camera is allowed the start has startBudget ms (the
+  // picture starting, body tracking, the first inference); when they run out it fails with a "try again"
+  // error (retry: true) and leaves nothing on.
   const cancelled = () => Object.assign(new Error("Startup was cancelled."), { cancelled: true });
   const tooSlow = () => Object.assign(friendly("Body tracking took too long to start. Check the internet connection, then try again."), { retry: true });
   // after the next frame is painted (a timer set in a frame callback runs once that frame is on screen)
@@ -482,15 +484,17 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     paused = document.visibilityState === "hidden";
     facingNow = facing;
     frame.classList.toggle("mirror", facing === "user");
-    let timer = 0;
+    // the time limit starts when the camera is allowed (the permission question is the player's time)
+    let timer = 0, clockAt = -1, timeUp = null;
+    const late = new Promise((_, rej) => { timeUp = () => rej(tooSlow()); });
+    late.catch(() => {});
+    const startClock = () => { if (clockAt < 0) { clockAt = performance.now(); timer = setTimeout(timeUp, startBudget); } };
+    const inTime = p => Promise.race([p, late]);
     try {
       // 1. the camera first, so its permission question comes before body tracking downloads
-      try { await attachCamera(my); } catch (e) { if (stale()) throw cancelled(); throw cameraError(e); }
+      try { await inTime(attachCamera(my, startClock)); }
+      catch (e) { if (stale()) throw cancelled(); if (e.retry) throw e; throw cameraError(e); }
       if (stale()) throw cancelled();
-      // from here on it's the app's own work: it gets startBudget ms in all
-      const late = new Promise((_, rej) => { timer = setTimeout(() => rej(tooSlow()), startBudget); });
-      late.catch(() => {});
-      const inTime = p => Promise.race([p, late]);
       // 2. body tracking
       try { await inTime(ensureModel(model)); }
       catch (e) {
@@ -508,7 +512,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
         if (stale()) throw cancelled();
         if (paused) { await inTime(changed()); continue; }
         if (!liveStream()) {
-          try { await inTime(attachCamera(my)); } catch (e) { if (stale()) throw cancelled(); if (e.retry) throw e; throw cameraError(e); }
+          try { await inTime(attachCamera(my, startClock)); } catch (e) { if (stale()) throw cancelled(); if (e.retry) throw e; throw cameraError(e); }
           continue;
         }
         await inTime(Promise.race([keepAwake(), changed()]));
@@ -523,6 +527,9 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
         startLoop();
         const tracked = await inTime(Promise.race([first, changed()]));
         onFirstFrame = null;
+        // the first inference blocks the page, so the time-out can't run while it does: check the clock
+        // when it returns, before the fight (and its timer) can start
+        if (tracked && clockAt >= 0 && performance.now() - clockAt >= startBudget) throw tooSlow();
         if (tracked) break;
       }
     } catch (e) {
