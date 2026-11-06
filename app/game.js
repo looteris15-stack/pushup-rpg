@@ -1678,10 +1678,21 @@ $("dbgNoRep").addEventListener("click", () => onRepEvent({ type: "norep", reason
 // Leaving the app doesn't pause anything: the clock keeps running while you're away.
 // A quick look at a notification is fine, but leaving a fight that has started counts as giving up,
 // otherwise you could rest in another app (or close the game) to dodge a loss.
+// The camera is off while the game is hidden. Coming back, the game first decides whether the fight
+// (or break) goes on; only then does the tracker switch the camera and screen lock back on. After a
+// loss the tracker is already stopped, so nothing is switched on for a fight that is over.
 document.addEventListener("visibilitychange", () => {
   const t = performance.now();
-  if (document.hidden) { if (fight || rest) hiddenAt = t; return; }
+  if (document.hidden) {
+    tracker.pause();
+    if (fight || rest) hiddenAt = t;
+    return;
+  }
   adoptIfNewer(); // another window may have saved while this one was in the background
+  settleAway(t);
+  tracker.resume();
+});
+function settleAway(t) {
   if (!hiddenAt) return;
   const away = t - hiddenAt;
   hiddenAt = 0;
@@ -1697,7 +1708,7 @@ document.addEventListener("visibilitychange", () => {
     if (fight.overkill) stopSet("You left the app. Your record counts."); // the Champion is already down
     else lose("You left the app during the fight.");
   }
-});
+}
 // a closed or reloaded page can't be stopped on a phone, but on a computer the browser can ask first
 window.addEventListener("beforeunload", e => {
   if ((fight && committed(fight)) || rest) { e.preventDefault(); e.returnValue = ""; }

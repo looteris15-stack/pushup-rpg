@@ -154,6 +154,40 @@ async function open(id) {
       }
       return n;
     },
+    // body tracking loads at once (a fake model that never finds anyone)
+    fastModel() { w.PushupRPG.hooks.setModelLoader(async () => ({ lm: fakeModel(), used: "CPU" })); },
+    // a fake "keep the screen on" (wake lock). hold = true: answers wait until grantAll(). Records every
+    // request (and whether the fight screen was showing then) and every lock handed out
+    fakeWakeLock(hold) {
+      const wl = { hold, calls: [], sentinels: [], waiting: [] };
+      const give = () => { const s = { type: "screen", released: false, release() { this.released = true; return Promise.resolve(); }, addEventListener() {}, removeEventListener() {} }; wl.sentinels.push(s); return s; };
+      wl.grantAll = () => { for (const r of wl.waiting.splice(0)) r(give()); };
+      Object.defineProperty(w.navigator, "wakeLock", { configurable: true, value: {
+        request() {
+          wl.calls.push({ inFight: !d.getElementById("fight").hidden });
+          return wl.hold ? new Promise(r => wl.waiting.push(r)) : Promise.resolve(give());
+        },
+      } });
+      return wl;
+    },
+    // counts runs of the tracker's frame loop (core.js "loop") from now on
+    countLoop() {
+      const n = { runs: 0 }, raf = w.requestAnimationFrame.bind(w);
+      w.requestAnimationFrame = cb => raf(cb.name === "loop" ? ts => { n.runs++; cb(ts); } : cb);
+      return n;
+    },
+    // makes the game hidden (another app, phone locked) or visible again
+    setVisible(v) {
+      Object.defineProperty(d, "visibilityState", { configurable: true, value: v ? "visible" : "hidden" });
+      Object.defineProperty(d, "hidden", { configurable: true, value: !v });
+      d.dispatchEvent(new w.Event("visibilitychange"));
+    },
+    // lets the game's clock (performance.now) jump ahead, like time spent away
+    shiftClock() {
+      const real = w.performance.now.bind(w.performance), c = { off: 0, skip(ms) { c.off += ms; } };
+      w.performance.now = () => real() + c.off;
+      return c;
+    },
     // records the game's audio engines (AudioContext) from now on: each one made, resume() and suspend()
     // calls, and every sound played (the engine's state then, and when the sound ends)
     trackAudio() {
@@ -228,6 +262,8 @@ function campTrip(d, to) {
   return went && !d.getElementById("camp").hidden;
 }
 const frame = w => new Promise(r => w.requestAnimationFrame(() => w.requestAnimationFrame(r)));
+const fakeModel = () => ({ detectForVideo: () => ({ landmarks: [] }), close() {} });
+const liveTracks = streams => streams.filter(Boolean).flatMap(s => s.getTracks()).filter(t => t.readyState === "live").length;
 // ---- sound: the base save has sound off; this one has it on (voice stays off)
 const SOUND_ON = { ...BASE, settings: { ...BASE.settings, sound: true } };
 // does the audio engine's clock still move (it stops while the engine sleeps)?
@@ -1038,6 +1074,128 @@ const tests = [
     check(ctx.state === "suspended", `after the second fight ended, the engine is still "${ctx.state}"`);
     check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
     return `new fight ${startedIn.toFixed(0)} ms after the end: engine running at ${at.toFixed(0)} ms, 0 sleeps; asleep after the second fight`;
+  }],
+  // --------------- Item 5 (audit finding #4): a start or a screen lock that comes back late is let go
+  ["Item 5a 12× Fight → Back while the screen-lock answer is pending: all 12 late locks released, camera and loop off", async () => {
+    await reset();
+    const A = await open("A");
+    A.fastCamera(); A.fastModel();
+    const wl = A.fakeWakeLock(true), loop = A.countLoop(), streams = [];
+    for (let i = 0; i < 12; i++) {
+      const asked = wl.calls.filter(c => c.inFight).length;
+      await A.tapFight("field-mouse");
+      await until(() => wl.calls.filter(c => c.inFight).length > asked, 3000, `fight ${i + 1}'s screen-lock request`);
+      streams.push(A.d.querySelector("#video").srcObject);
+      await tapFlee(A, 150);
+      check(A.screen() === "map", `cycle ${i + 1}: Back didn't go to the map (${A.screen()})`);
+    }
+    wl.grantAll(); // the phone answers all of them now, after the player left
+    await wait(150);
+    const r0 = loop.runs;
+    await wait(600);
+    const held = wl.sentinels.filter(s => !s.released).length, live = liveTracks(streams), runs = loop.runs - r0;
+    check(held === 0, `${held} of ${wl.sentinels.length} screen locks are still held`);
+    check(live === 0, `${live} camera track(s) still on`);
+    check(runs === 0 && !A.api.trackerRunning, `the tracking loop ran ${runs} times in 600 ms after leaving`);
+    noPenalty(A);
+    return `12 cycles, ${wl.sentinels.length} late locks: ${held} held, ${live} live camera tracks, ${runs} loop runs in 600 ms`;
+  }],
+  ["Item 5b Back while body tracking loads, then a new fight at once: the old start can't stop the new camera", async () => {
+    const notes = [];
+    for (const outcome of ["loads", "fails"]) {
+      await reset();
+      const A = await open("A");
+      A.fastCamera();
+      const loop = A.countLoop();
+      let finish, fail;
+      A.api.hooks.setModelLoader(() => new Promise((res, rej) => { finish = res; fail = rej; }));
+      await A.tapFight("field-mouse");
+      const s1 = await until(() => A.d.querySelector("#video").srcObject, 3000, "fight 1's camera");
+      await tapFlee(A, 100);
+      // fight 2 right away, with the other model setting so it loads its own (at once) instead of waiting
+      A.state.settings.model = A.state.settings.model === "lite" ? "full" : "lite";
+      A.fastModel();
+      await A.fightMonster("field-mouse");
+      const s2 = A.d.querySelector("#video").srcObject;
+      check(A.fight && A.api.trackerRunning && s2 && s2 !== s1 && liveTracks([s2]) > 0, `${outcome}: test setup: fight 2 isn't tracking with its own camera`);
+      // now fight 1's model load ends
+      if (outcome === "loads") finish({ lm: fakeModel(), used: "CPU" }); else fail(new Error("network down"));
+      await wait(300);
+      const r0 = loop.runs;
+      await wait(500);
+      const runs = loop.runs - r0, still = A.d.querySelector("#video").srcObject === s2 && liveTracks([s2]) > 0;
+      check(still, `${outcome}: fight 1's late model ${outcome === "loads" ? "arriving" : "failing"} switched off fight 2's camera`);
+      check(A.api.trackerRunning && runs > 0 && A.fight && !A.fight.over, `${outcome}: fight 2's tracking stopped (loop ran ${runs} times in 500 ms)`);
+      check(liveTracks([s1]) === 0, `${outcome}: fight 1's camera is still on`);
+      notes.push(`${outcome}: fight 2's camera live, loop ran ${runs} times in 500 ms`);
+      await tapFlee(A);
+      check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    }
+    return notes.join("; ");
+  }],
+  ["Item 5c Hidden mid-fight: camera off at once; back after 2 s it goes on; back after 11 s: lost once, nothing left on", async () => {
+    await reset();
+    const A = await open("A");
+    A.fastCamera(); A.fastModel();
+    const wl = A.fakeWakeLock(false), loop = A.countLoop(), clock = A.shiftClock();
+    await A.fightMonster("cave-rat");
+    const s1 = A.d.querySelector("#video").srcObject;
+    check(A.api.trackerRunning && s1 && wl.sentinels.length >= 1, "test setup: tracking or the screen lock didn't start");
+    A.rep(); await wait(100); // the fight is on: first rep counted
+    // 1. a quick look elsewhere (2 s): the camera is off while hidden, and back on afterwards
+    A.setVisible(false); await wait(200);
+    const r0 = loop.runs; await wait(300);
+    const hiddenRuns = loop.runs - r0, hiddenLive = liveTracks([s1]);
+    check(hiddenLive === 0, "the camera stayed on while the game was hidden");
+    check(hiddenRuns === 0, `the tracking loop ran ${hiddenRuns} times while hidden`);
+    clock.skip(2000); A.setVisible(true);
+    const s2 = await until(() => { const s = A.d.querySelector("#video").srcObject; return s && s !== s1 && liveTracks([s]) && s; }, 3000, "the camera to come back").catch(() => null);
+    check(s2 && A.fight && !A.fight.over && A.api.trackerRunning, "after a 2 s look away the fight didn't go on with the camera");
+    check(wl.sentinels.filter(x => !x.released).length === 1, `screen locks held after coming back: ${wl.sentinels.filter(x => !x.released).length} (1 expected)`);
+    // 2. away 11 s, and the phone's screen-lock answer comes late (after coming back)
+    wl.hold = true;
+    A.setVisible(false); await wait(200);
+    check(liveTracks([s2]) === 0, "the camera stayed on while hidden (second time)");
+    clock.skip(11000); A.setVisible(true); await wait(300);
+    wl.grantAll(); await wait(300);
+    check(/won this time/i.test(A.modal()), `no loss for leaving: "${A.modal().slice(0, 80)}"`);
+    // and once more: hidden and back, still only one loss
+    A.setVisible(false); await wait(100); clock.skip(11000); A.setVisible(true); await wait(300);
+    const st = saved(), losses = st.losses["cave-rat"] || 0, lostFights = st.history.filter(h => !h.won).length;
+    check(losses === 1 && lostFights === 1, `the loss was recorded ${losses} time(s) (${lostFights} in the history)`);
+    const held = wl.sentinels.filter(x => !x.released).length, r1 = loop.runs;
+    await wait(400);
+    check(held === 0, `${held} screen lock(s) still held after the loss`);
+    check(loop.runs === r1 && !A.api.trackerRunning && liveTracks([s1, s2]) === 0, `after the loss: loop ran ${loop.runs - r1} times, camera tracks on: ${liveTracks([s1, s2])}`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `hidden: 0 live tracks, ${hiddenRuns} loop runs; back after 2 s: camera on again; back after 11 s: 1 loss, ${held} locks held, 0 loop runs`;
+  }],
+  ["Item 5d Back while the camera or body tracking starts: no loss, and camera, screen lock, loop and sound all off", async () => {
+    await reset(SOUND_ON);
+    const A = await open("A");
+    const au = A.trackAudio(), wl = A.fakeWakeLock(false), loop = A.countLoop(), streams = [];
+    // 1. Back while the camera question is open; the camera comes late
+    const answer = A.slowCamera();
+    await A.tapFight("field-mouse");
+    await tapFlee(A);
+    streams.push(answer());
+    await wait(300);
+    // 2. Back while body tracking loads; it finishes late
+    A.fastCamera();
+    const finish = A.slowModel();
+    await A.tapFight("field-mouse");
+    streams.push(await until(() => A.d.querySelector("#video").srcObject, 3000, "the camera"));
+    await tapFlee(A);
+    finish();
+    await wait(300);
+    const r0 = loop.runs;
+    await wait(400);
+    const runs = loop.runs - r0, held = wl.sentinels.filter(x => !x.released).length, live = liveTracks(streams), ctx = au.list[0];
+    noPenalty(A);
+    check(saved().history.length === 0, `${saved().history.length} fight(s) in the history`);
+    check(live === 0 && held === 0 && runs === 0 && !A.api.trackerRunning, `left on: ${live} camera tracks, ${held} screen locks, loop ran ${runs} times`);
+    check(ctx && ctx.state === "suspended", `the audio engine is "${ctx ? ctx.state : "none made"}"`);
+    return `0 losses, 0 history; ${live} live tracks, ${held} locks held, ${runs} loop runs, audio "${ctx.state}"`;
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

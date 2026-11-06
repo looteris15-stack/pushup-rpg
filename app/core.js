@@ -318,25 +318,63 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   video.addEventListener("loadedmetadata", setDims);
   video.addEventListener("resize", setDims);
 
+  // Each start (startCamera, or resume after the app was hidden) is one attempt with its own number;
+  // stop() starts a new number too. Whatever an attempt gets after waiting (a camera, body tracking, a
+  // screen lock) is checked against the current number: if it's old, that thing is switched off or let go,
+  // and nothing a newer attempt set up is touched. paused: the app is hidden (camera, loop, lock all off).
+  let attempt = 0, paused = false, facingNow = "user";
+  const tracking = () => running && !paused;
+
   // awake: did the phone agree to keep the screen on? (battery saver can refuse; null = not asked yet)
   let awake = null;
-  async function keepAwake() {
-    try { wakeLock = await navigator.wakeLock.request("screen"); awake = true; }
-    catch { wakeLock = null; awake = "wakeLock" in navigator ? false : null; }
+  function letGoAwake() { const l = wakeLock; wakeLock = null; try { l?.release().catch(() => {}); } catch {} }
+  async function keepAwake(my) {
+    const mine = () => my === attempt && tracking() && document.visibilityState === "visible";
+    if (!mine()) return awake; // no fight being tracked on a visible screen: don't ask
+    let lock;
+    try { lock = await navigator.wakeLock.request("screen"); }
+    catch { if (my === attempt) awake = "wakeLock" in navigator ? false : null; return awake; }
+    // the fight ended (or the app was hidden) while the phone was answering: let this lock go at once
+    if (!mine()) { try { lock.release().catch(() => {}); } catch {} return awake; }
+    letGoAwake();
+    wakeLock = lock;
+    awake = true;
     return awake;
   }
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && running) keepAwake();
-  });
 
   function stopStream() {
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     video.pause();
     video.srcObject = null;
   }
+  // switches off one attempt's own camera; the video lets go of it only if it is still showing that one
+  function stopOwn(s) {
+    if (!s) return;
+    s.getTracks().forEach(t => t.stop());
+    if (stream === s) stopStream();
+  }
+  function openCamera(facing) {
+    return navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    });
+  }
+  function showStream(s) {
+    stopStream();
+    stream = s;
+    video.srcObject = s;
+    video.muted = true;
+  }
+  function startLoop() {
+    cancelAnimationFrame(rafId);
+    fpsT = performance.now();
+    frames = 0;
+    loop();
+  }
 
   // token: { cancelled } set by the game when the player taps Back during startup. Whatever arrives
-  // after that (a late camera, a finished model) is switched off and ignored instead of starting a fight.
+  // after that (a late camera, a finished model, a screen lock) is switched off and ignored instead of
+  // starting a fight. The same happens when a newer start or stop() came in the meantime.
   const cancelled = () => Object.assign(new Error("Startup was cancelled."), { cancelled: true });
   async function startCamera(facing, model, token = null) {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -344,55 +382,87 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
         ? "This browser cannot use the camera. Try Chrome."
         : "The camera only works on an https:// link. Open the https address.");
     }
+    const my = ++attempt;
+    const stale = () => my !== attempt || !!token?.cancelled;
+    running = false;
+    paused = document.visibilityState === "hidden";
+    cancelAnimationFrame(rafId);
+    letGoAwake();
     let s;
     try {
-      s = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
-      });
+      s = await openCamera(facing);
     } catch (e) {
+      if (stale()) throw cancelled();
       if (e.name === "NotAllowedError") throw friendly("Camera permission was blocked. Allow the camera for this site in the browser settings, then try again.");
       if (e.name === "NotFoundError" || e.name === "OverconstrainedError") throw friendly("No camera found.");
       throw friendly("Could not start the camera: " + (e.message || e.name));
     }
     // the player went back while the camera question was open: switch this late camera off
-    if (token?.cancelled) { s.getTracks().forEach(t => t.stop()); throw cancelled(); }
-    stopStream();
-    stream = s;
-    video.srcObject = s;
-    video.muted = true;
+    if (stale()) { stopOwn(s); throw cancelled(); }
+    showStream(s);
+    facingNow = facing;
     frame.classList.toggle("mirror", facing === "user");
-    await video.play();
-    if (token?.cancelled) { stopStream(); throw cancelled(); }
+    await video.play().catch(e => { if (!stale()) throw e; });
+    if (stale()) { stopOwn(s); throw cancelled(); }
     try {
       await ensureModel(model);
     } catch {
-      stopStream();
-      if (token?.cancelled) throw cancelled();
+      stopOwn(s);
+      if (stale()) throw cancelled();
       throw friendly("Could not load body tracking. Check the internet connection and try again.");
     }
-    // the player went back while body tracking was loading: ignore it (the camera was already stopped)
-    if (token?.cancelled) { stopStream(); throw cancelled(); }
+    // the player went back while body tracking was loading: ignore it (this camera is switched off)
+    if (stale()) { stopOwn(s); throw cancelled(); }
     counter.reset();
     side = null;
     resetSmooth();
     lastVideoTime = -1;
     running = true;
-    await keepAwake();
+    await keepAwake(my);
+    // Back while the phone was asked to keep the screen on: no loop for a fight that isn't there
+    if (stale()) { stopOwn(s); throw cancelled(); }
+    // the app went into the background while starting: camera off until it comes back (resume)
+    if (paused) { stopOwn(s); return; }
+    startLoop();
+  }
+
+  // The app was hidden (another app, screen locked): camera, tracking and screen lock go off right away.
+  // The game calls resume() when it comes back and the fight (or break) goes on.
+  function pause() {
+    paused = true;
     cancelAnimationFrame(rafId);
-    fpsT = performance.now();
-    frames = 0;
-    loop();
+    stopStream();
+    letGoAwake();
+  }
+  async function resume() {
+    if (!paused) return;
+    paused = false;
+    if (!running) return; // nothing tracked (or a start still going, which carries on by itself)
+    const my = ++attempt;
+    const stale = () => my !== attempt || !tracking();
+    let s;
+    try { s = await openCamera(facingNow); } catch { return; } // no camera now: the fight's timers decide
+    if (stale()) { stopOwn(s); return; }
+    showStream(s);
+    await video.play().catch(() => {});
+    if (stale()) { stopOwn(s); return; }
+    lastVideoTime = -1;
+    resetSmooth();
+    await keepAwake(my);
+    if (stale()) { stopOwn(s); return; }
+    startLoop();
   }
 
   function stop() {
+    attempt++; // anything a start or resume is still waiting for is now stale
     running = false;
+    paused = false;
     cancelAnimationFrame(rafId);
+    rafId = 0;
     counter.reset(); // a rep in progress (and its frames) isn't kept until the next fight
     stopStream();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    try { wakeLock?.release(); } catch {}
-    wakeLock = null;
+    letGoAwake();
   }
 
   function smooth(m) {
@@ -404,6 +474,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   function resetSmooth() { sm.elbow = sm.bodyBend = sm.knee = null; }
 
   function loop() {
+    if (!tracking()) return; // stopped or hidden: no frame work, and no next frame
     rafId = requestAnimationFrame(loop);
     if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
     lastVideoTime = video.currentTime;
@@ -423,6 +494,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     frames++;
     if (now - fpsT > 1000) { fps = Math.round(frames * 1000 / (now - fpsT)); frames = 0; fpsT = now; }
     counter.update(m, now).forEach(onEvent);
+    if (!tracking()) return; // that rep ended the fight (stop() ran): nothing more to show
     onFrame(m, now);
     draw(lm, m);
   }
@@ -460,6 +532,8 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     ensureModel,
     startCamera,
     stop,
+    pause,
+    resume,
     counter,
     get running() { return running; },
     get fps() { return fps; },
