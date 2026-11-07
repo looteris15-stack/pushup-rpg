@@ -1,5 +1,5 @@
 import { createTracker, initAudio, quietAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake, testHooks } from "./core.js";
-import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, artUrl } from "./data.js";
+import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, pauseSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
 const SAVE_KEY = "pushupRPG.save.v1";
@@ -425,7 +425,7 @@ function openPrefight(id) {
     special.push(["leave", `<b>Stay in the game:</b> after your first rep, leaving the app for more than ${RULES.leaveAppSec} s (closing it, switching apps, locking the phone) counts as giving up.${where === "champion" ? " Once the Champion is down, leaving just ends your set." : ""}`]);
     const rules = [];
     if (rounds.length === 1) rules.push(`<b>${m.hp} strict pushups in one set</b> win. Each rep is 1 hit.`);
-    rules.push(`The timer starts with your first strict rep. Then ${RULES.maxPauseSec} s without one, or standing up, and the monster wins.`);
+    rules.push(`The timer starts with your first strict rep. Then ${pauseSecs(m)} s without one, or standing up, and the monster wins.`);
     rules.push(`If it wins, you rest ${RULES.restHoursAfterLoss} hours.`);
     const xp = rewardFor(m, where) + (where === "champion" ? " or more" : "");
     body = `<p class="hpbig">${m.hp}<span>HP</span></p>
@@ -461,7 +461,9 @@ function renderDungeon() {
   const t = now(), F = state.dungeonFloor, run = state.run, total = DUNGEON.floors.length;
   let status, button = "";
   if (run) {
-    status = `<span class="chip warn">Run not finished</span> You are on floor ${run.floor}, room ${run.room + 1}. You get a short break first.`;
+    status = run.replay
+      ? `<span class="chip warn">Replay not finished</span> You are replaying floor ${run.floor}, room ${run.room + 1}. You get a short break first.`
+      : `<span class="chip warn">Run not finished</span> You are on floor ${run.floor}, room ${run.room + 1}. You get a short break first.`;
     button = `<button type="button" class="primary" data-action="continueRun">Continue the run</button>`;
   } else if (state.dungeonLockedUntil > t) {
     status = `<span class="chip bad">Closed</span> The mine is closed after your last run. It opens again in ${until(state.dungeonLockedUntil)} (${fmtAt(state.dungeonLockedUntil)}).`;
@@ -491,10 +493,14 @@ function renderDungeon() {
     <li>You get ${RULES.restBetweenRoomsSec} seconds of rest between rooms. Then do your first rep within ${RULES.dungeonStartSec} seconds.</li>
     <li>Reach the safe room to save the floor and get +${RULES.floorBonusXp} XP times the floor number.</li>
     <li>Lose or leave before the safe room: the mine closes for ${RULES.dungeonLockDays} days and you recover ${RULES.restHoursAfterLoss} hours.</li>
+    <li>Floors you cleared can be played again (tap one below): 1 XP per rep, no floor bonus. Losing a replay means only the ${RULES.restHoursAfterLoss}-hour rest; the mine stays open.</li>
     <li><b>Stay in the game during the run.</b> Leaving the app for more than ${RULES.leaveAppSec} seconds in a room, or longer than a break, counts as leaving the mine.</li>`;
   const here = run ? run.floor : F;
+  // a cleared floor can be replayed when a fresh run could start: the mine open, the rest over, no run going
+  const canReplay = !run && state.dungeonLockedUntil <= t && state.restUntil <= t;
   $("dgLadder").innerHTML = DUNGEON.floors.map((_, i) => {
     const f = i + 1;
+    if (f < F && canReplay) return `<button type="button" class="done" data-action="replayFloor" data-floor="${f}" title="Play floor ${f} again">${f}</button>`;
     return `<span class="${f < F ? "done" : f === here ? "here" : ""}" title="Floor ${f}">${f}</span>`;
   }).join("");
 }
@@ -691,11 +697,12 @@ function checkSave(s) {
   if (deepest > DUNGEON.floors.length || floor < 1 || floor > deepest + 1) return `mine floor ${floor} doesn't fit ${deepest} floors cleared`;
   const tooDeep = Object.keys({ ...kills, ...losses }).map(id => findMonster(id)).find(f => f && f.floor && f.floor > floor);
   if (tooDeep) return `it beat or met a monster on mine floor ${tooDeep.floor} without reaching it`;
-  // a mine run in progress is always on the current floor, in one of its rooms
+  // a mine run in progress is on the current floor (a replay: on a floor already cleared), in one of its rooms
   const run = s.run;
   if (run != null) {
-    const rooms = DUNGEON.floors[floor - 1];
-    if (typeof run !== "object" || run.floor !== floor || !rooms || !whole(run.room) || run.room >= rooms.length) return "it has a mine run that can't exist";
+    const onFloor = typeof run === "object" && (run.replay === true ? whole(run.floor) && run.floor >= 1 && run.floor < floor : run.floor === floor);
+    const rooms = onFloor ? DUNGEON.floors[run.floor - 1] : null;
+    if (!rooms || !whole(run.room) || run.room >= rooms.length) return "it has a mine run that can't exist";
   }
   if (!Array.isArray(s.history ?? [])) return "its fight list is broken";
   return null;
@@ -742,7 +749,8 @@ function cleanSave(s, keepMark = false) {
   out.wandererDone = str(s.wandererDone, 20);
   const w = s.wanderToday;
   out.wanderToday = w && typeof w === "object" && typeof w.key === "string" && Number.isFinite(w.hp) ? { key: w.key.slice(0, 20), hp: w.hp } : null;
-  if (out.run) out.run = { floor: out.run.floor, room: out.run.room, ...(Number.isFinite(out.run.breakEndsAt) ? { breakEndsAt: out.run.breakEndsAt } : {}) };
+  if (out.run) out.run = { floor: out.run.floor, room: out.run.room, ...(Number.isFinite(out.run.breakEndsAt) ? { breakEndsAt: out.run.breakEndsAt } : {}),
+    ...(out.run.replay === true ? { replay: true } : {}) };
   if (!keepMark) out.fightMark = null;
   return out;
 }
@@ -1082,7 +1090,7 @@ function renderFightHud() {
     : `${f.hpLeft} / ${f.total} HP`;
   $("fHpFill").style.width = f.openEnded ? "100%" : (f.hpLeft / f.total) * 100 + "%";
   const bits = [f.where === "dungeon" && state.run
-    ? `${DUNGEON.name} · floor ${state.run.floor} · room ${state.run.room + 1} of ${DUNGEON.floors[state.run.floor - 1].length}`
+    ? `${DUNGEON.name} · floor ${state.run.floor}${state.run.replay ? " (replay)" : ""} · room ${state.run.room + 1} of ${DUNGEON.floors[state.run.floor - 1].length}`
     : f.label];
   if (f.rounds.length > 1) bits.push(`round ${f.round + 1} of ${f.rounds.length}`);
   $("fWhere").innerHTML = esc(bits.join(" · ")) + (f.m.slow ? ` <span class="chip slow">Slow reps · ${slowSecs(f.m)} s down</span>` : "");
@@ -1211,9 +1219,10 @@ function fightTick() {
     return;
   }
   if (fight.leftSince && t - fight.leftSince > RULES.leavePlankSec * 1000) { stopSet("You left the plank position."); return; }
-  const left = RULES.maxPauseSec * 1000 - (t - fight.lastRepAt);
-  if (left <= 0) { stopSet(`No strict rep for ${RULES.maxPauseSec} seconds.`); return; }
-  updateThreat(left, RULES.maxPauseSec * 1000, fight.openEnded || fight.overkill ? "Set ends in" : "Attack in");
+  const pause = pauseSecs(fight.m); // longer with slow reps
+  const left = pause * 1000 - (t - fight.lastRepAt);
+  if (left <= 0) { stopSet(`No strict rep for ${pause} seconds.`); return; }
+  updateThreat(left, pause * 1000, fight.openEnded || fight.overkill ? "Set ends in" : "Attack in");
   renderBanner();
 }
 setInterval(fightTick, 200);
@@ -1317,7 +1326,7 @@ function recordFight(f, won) {
   }
   state.history.unshift({
     t: now(), id: f.m.id, name: f.m.name, hp: f.m.hp, reps: f.reps, won,
-    where: f.where === "dungeon" ? `Mine floor ${state.run ? state.run.floor : "?"}` : f.label,
+    where: f.where === "dungeon" ? `Mine floor ${state.run ? state.run.floor : "?"}${state.run && state.run.replay ? " (replay)" : ""}` : f.label,
   });
   state.history.length = Math.min(state.history.length, 40);
 }
@@ -1339,7 +1348,10 @@ function win() {
   updateThreat(null);
   const levelBefore = levelFromXp(state.xp);
   const prevBest = state.stats.bestSet;
-  const gain = f.where === "champion" ? f.reps * RULES.championXpPerRep : rewardFor(f.m, f.where);
+  // a replayed mine floor: 1 XP per counted rep
+  const gain = f.where === "champion" ? f.reps * RULES.championXpPerRep
+    : f.where === "dungeon" && state.run && state.run.replay ? f.reps
+    : rewardFor(f.m, f.where);
   state.xp += gain;
   recordFight(f, true);
   const lines = [`+${gain} XP for ${f.m.name.startsWith("The ") ? "" : "the "}${esc(f.m.name)}.`];
@@ -1374,6 +1386,20 @@ function win() {
     save();
     say(`${f.m.name} defeated! Rest.`);
     mineBreak(RULES.restBetweenRoomsSec, `Room ${run.room} cleared`, lines);
+    return;
+  }
+
+  // last room of a replay: no floor bonus, and the mine progress stays (both are for first clears)
+  if (run.replay) {
+    state.run = null;
+    levelUpLine(levelBefore, lines);
+    lines.push(`Floor ${run.floor} replayed. The floor bonus and mine progress are only for first clears.`);
+    const ok = save();
+    if (!ok) lines.push(NOT_SAVED);
+    say(`Floor ${run.floor} replayed!`);
+    endFight("dungeon");
+    resultModal({ tone: "won", eyebrow: "Replay", title: `Floor ${run.floor} replayed`, lines,
+      buttons: (ok ? "" : BACKUP_NOW_BTN) + `<button type="button"${ok ? ' class="primary"' : ""} data-action="closeModal">Leave the mine</button>` });
     return;
   }
 
@@ -1429,8 +1455,12 @@ function lose(reason) {
     if (where === "champion") lines.push(`Your record stays at ${state.stats.bestSet}.`);
   }
   if (where === "dungeon") {
-    state.dungeonLockedUntil = t + RULES.dungeonLockDays * 86400e3;
-    lines.push(`${DUNGEON.name} is closed for ${RULES.dungeonLockDays} days, until ${fmtAt(state.dungeonLockedUntil)}. Then you start floor ${state.dungeonFloor} again.`);
+    // a lost replay: only the normal rest (the mine stays open, the progress is kept)
+    if (state.run && state.run.replay) lines.push(`It was a replay of floor ${state.run.floor}, so the mine stays open and your progress is kept.`);
+    else {
+      state.dungeonLockedUntil = t + RULES.dungeonLockDays * 86400e3;
+      lines.push(`${DUNGEON.name} is closed for ${RULES.dungeonLockDays} days, until ${fmtAt(state.dungeonLockedUntil)}. Then you start floor ${state.dungeonFloor} again.`);
+    }
     state.run = null;
   }
   lines.push(`Your muscles need rest. Fights open again in ${RULES.restHoursAfterLoss} hours (${fmtAt(state.restUntil)}).`);
@@ -1586,8 +1616,10 @@ function mineBreak(sec, title, lines) {
     title,
     next: `${lines.length ? lines.join("<br>") + "<br>" : ""}Next: <b>${esc(next.name)}</b>, ${next.hp} HP (room ${run.room + 1} of ${rooms.length})${next.slow ? `<br><span class="chip slow">Slow reps · ${slowSecs(next)} s down</span>` : ""}`,
     quitLabel: "Leave the mine",
-    quitReason: "You left the mine before the safe room.",
-    warn: `Leaving now closes the mine for ${RULES.dungeonLockDays} days. Leaving the app longer than the break does too.`,
+    quitReason: run.replay ? "You left the replay before the safe room." : "You left the mine before the safe room.",
+    warn: run.replay
+      ? `Leaving now counts as a loss: ${RULES.restHoursAfterLoss} hours of rest (the mine stays open). Leaving the app longer than the break does too.`
+      : `Leaving now closes the mine for ${RULES.dungeonLockDays} days. Leaving the app longer than the break does too.`,
     onDone: () => beginFight(next, "dungeon", true, DUNGEON.name),
   });
   // show the next monster in the HUD during the break
@@ -1630,6 +1662,17 @@ async function enterFloor() {
   if (!(await openFightScreen("dungeon", enterFloor))) { state.run = null; save(); renderCurrent(); return; }
   beginFight(DUNGEON.floors[state.run.floor - 1][0], "dungeon", false, DUNGEON.name);
 }
+// a floor already cleared, played again: 1 XP per rep, no floor bonus, no progress; losing it means only the
+// normal rest. It can start when a fresh run could: the mine open, the rest over, no run going.
+async function replayFloor(floor) {
+  if (!mayStartHere()) return;
+  const t = now();
+  if (fight || state.run || state.restUntil > t || state.dungeonLockedUntil > t || !(floor >= 1 && floor < state.dungeonFloor)) return;
+  state.run = { floor, room: 0, replay: true };
+  save();
+  if (!(await openFightScreen("dungeon", () => replayFloor(floor)))) { state.run = null; save(); renderCurrent(); return; }
+  beginFight(DUNGEON.floors[floor - 1][0], "dungeon", false, DUNGEON.name);
+}
 async function continueRun() {
   if (!mayStartHere()) return;
   if (!state.run) return;
@@ -1652,6 +1695,7 @@ document.addEventListener("click", e => {
   else if (action === "retryStart") { const again = retryStart; retryStart = null; closeModal(); if (again) again(); }
   else if (action === "enterFloor") enterFloor();
   else if (action === "deeper") { closeModal(); enterFloor(); }
+  else if (action === "replayFloor") replayFloor(Number(b.dataset.floor));
   else if (action === "continueRun") continueRun();
   else if (action === "backupNow") shareBackup();
 });

@@ -8,6 +8,8 @@ export const RULES = {
   roundRestSec: 90,         // break between rounds of a big monster
   dungeonStartSec: 30,      // after a break, do the first rep within this time
   maxPauseSec: 15,          // after the first rep: no strict rep for this long = the monster gets you
+  slowPauseSec: 20,         // ...in a fight with 2 s slow reps (each try takes longer)
+  slowHardPauseSec: 23,     // ...in a fight with 3 s slow reps
   leavePlankSec: 3,         // stand up or sit back this long = you lose
   leaveAppSec: 10,          // a fight that has started: away from the app longer than this = you gave up
   slowDownSec: 2,           // "slow reps": going down must take this long (2 early, 3 in later areas)
@@ -193,6 +195,8 @@ export function titleFor(L) {
 
 // seconds a rep must take going down, or 0 for normal reps
 export const slowSecs = m => (m.slow === true ? RULES.slowDownSec : m.slow || 0);
+// the longest pause between counted reps before the monster wins (longer with slow reps)
+export const pauseSecs = m => (slowSecs(m) >= RULES.slowHardSec ? RULES.slowHardPauseSec : slowSecs(m) ? RULES.slowPauseSec : RULES.maxPauseSec);
 
 export function xpReward(m, where) {
   return Math.round(m.hp

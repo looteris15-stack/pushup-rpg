@@ -2887,6 +2887,187 @@ const tests = [
     check(!bad.length, bad.join(" || "));
     return JSON.stringify(res);
   }],
+  ["Journal 2 The pause timer: 15 s in normal fights, 20 s with 2 s slow reps, 23 s with 3 s slow reps; it starts with the first counted rep, a counted rep fills it again, a too-fast rep doesn't", async () => {
+    const data = await import(`../app/data.js?t=${Date.now()}`);
+    const bad = [], res = {};
+    // 1. the rule for every monster (world, mine, wanderers)
+    const want = m => (m.slow === 3 ? 23 : m.slow ? 20 : 15);
+    const all = [...data.ZONES.flatMap(z => z.monsters), ...data.DUNGEON.floors.flat(), ...data.WANDERERS];
+    const wrong = all.filter(m => typeof data.pauseSecs !== "function" || data.pauseSecs(m) !== want(m)).map(m => m.id);
+    res.slowOnes = all.filter(m => m.slow).map(m => `${m.id}:${typeof data.pauseSecs === "function" ? data.pauseSecs(m) : "?"}`);
+    if (wrong.length) bad.push(`wrong pause time for: ${wrong.join(", ")}`);
+    // 2. real fights: no timer before the first counted rep, then the pause time; a too-fast rep doesn't fill it
+    for (const [id, secs] of [["field-mouse", 15], ["moss-slime", 20], ["ice-wraith", 23]]) {
+      await reset({ ...BASE, unlockedZones: 5 });
+      const A = await open("A"), clock = A.shiftClock();
+      await A.goto("map");
+      A.d.querySelector(`.mrow[data-id="${id}"]`).click(); await wait(200);
+      const rulesText = A.modal();
+      A.closeModal();
+      await A.fightMonster(id);
+      const beforeFirst = A.d.querySelector("#threat").hidden;
+      A.rep(); await wait(300);
+      const shown = A.text("#threatText");
+      clock.skip((secs - 3) * 1000); await wait(400);
+      const onAfter = !!A.fight && !A.fight.over;
+      if (secs > 15) { A.api.repEvent({ type: "rep", count: 1, depth: true, downSecs: 0.8 }); await wait(300); }
+      clock.skip(4000); await wait(500);
+      const r = res[id] = { rulesSay: (rulesText.match(/Then (\d+) s without one/) || [])[1] || null, timerBeforeFirstRep: !beforeFirst, shown,
+        stillOnAt: onAfter ? secs - 3 : null, lostAt: /won this time/i.test(A.modal()) ? secs + 1 : null, reason: (A.modal().match(/No strict rep for \d+ seconds/) || [])[0] || null };
+      if (!(r.rulesSay === String(secs) && !r.timerBeforeFirstRep && r.shown === `Attack in ${secs} s` && r.stillOnAt !== null && r.lostAt !== null && r.reason === `No strict rep for ${secs} seconds`)) bad.push(`${id}: ${JSON.stringify(r)}`);
+      if (A.errors.length) bad.push(`${id} errors: ` + A.errors.join(" | "));
+    }
+    // 3. a counted rep fills it again: two 15 s gaps on Moss Slime are fine
+    await reset();
+    const A = await open("A"), clock = A.shiftClock();
+    await A.fightMonster("moss-slime");
+    A.rep(); await wait(300);
+    clock.skip(15000); await wait(400); A.rep(); await wait(300);
+    clock.skip(15000); await wait(400);
+    res.refilled = { stillOn: !!A.fight && !A.fight.over, hits: A.fight ? A.fight.reps : null };
+    if (!(res.refilled.stillOn && res.refilled.hits === 2)) bad.push(`refilled: ${JSON.stringify(res.refilled)}`);
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Journal 3 Cleared mine floors can be replayed from the Floors row, only when the mine is open, the rest is over and no run is going", async () => {
+    const bad = [], res = {};
+    const CLEARED2 = { ...BASE, dungeonFloor: 3, stats: { ...BASE.stats, deepestFloor: 2 } };
+    let sizes = null;
+    const tiles = async save => {
+      await reset(save);
+      const A = await open("A");
+      await A.goto("dungeon");
+      const els = [...A.d.querySelectorAll("#dgLadder > *")];
+      // a replay button looks like the other floor tiles (same size)
+      const size = el => el && `${Math.round(el.getBoundingClientRect().width)}x${Math.round(el.getBoundingClientRect().height)}`;
+      sizes ||= { button: size(els.find(el => el.tagName === "BUTTON")), tile: size(els.find(el => el.tagName === "SPAN")) };
+      return els.map(el => el.matches('button[data-action="replayFloor"]') ? `${el.textContent}:replay` : el.textContent).join(" ");
+    };
+    res.open = await tiles(CLEARED2);
+    res.sizes = sizes;
+    if (!(sizes.button && sizes.button === sizes.tile)) bad.push(`a replay button is ${sizes.button}, a floor tile ${sizes.tile}`);
+    res.closed = await tiles({ ...CLEARED2, dungeonLockedUntil: Date.now() + 86400e3 });
+    res.resting = await tiles({ ...CLEARED2, restUntil: Date.now() + 3600e3 });
+    res.runGoing = await tiles({ ...CLEARED2, run: { floor: 3, room: 1 } });
+    res.nothingCleared = await tiles(BASE);
+    res.allConquered = await tiles({ ...BASE, dungeonFloor: 11, stats: { ...BASE.stats, deepestFloor: 10 } });
+    const replays = t => t.split(" ").filter(x => x.endsWith(":replay")).map(x => x.split(":")[0]).join(",");
+    if (replays(res.open) !== "1,2") bad.push(`open: ${res.open}`);
+    for (const k of ["closed", "resting", "runGoing", "nothingCleared"]) if (replays(res[k]) !== "") bad.push(`${k}: ${res[k]}`);
+    if (replays(res.allConquered) !== "1,2,3,4,5,6,7,8,9,10") bad.push(`all conquered: ${res.allConquered}`);
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Journal 4 A replayed floor: each room won is a win and a monster slain and gives 1 XP per counted rep; the floor, Deepest floor and the safe-room bonus stay as they were", async () => {
+    const { DUNGEON } = await import(`../app/data.js?t=${Date.now()}`);
+    await reset({ ...BASE, dungeonFloor: 3, stats: { ...BASE.stats, deepestFloor: 2 } });
+    const A = await open("A");
+    const before = JSON.parse(JSON.stringify(A.state)), rooms = DUNGEON.floors[0];
+    await A.goto("dungeon");
+    const b = A.d.querySelector('#dgLadder button[data-action="replayFloor"][data-floor="1"]');
+    check(b, "no replay button for floor 1");
+    b.click(); await A.settled();
+    const roomXp = [];
+    for (let room = 0; room < 3; room++) {
+      await until(() => A.fight && !A.fight.over, 5000, `room ${room + 1}`);
+      const xp0 = A.state.xp;
+      await A.reps(A.fight.total);
+      roomXp.push(A.state.xp - xp0);
+      if (room < 2) { A.d.querySelector("#btnFightNow").click(); await wait(300); }
+    }
+    await wait(300);
+    const s = saved();
+    const res = {
+      roomXp, roomHp: rooms.map(m => m.hp), modal: A.modal().slice(0, 140),
+      wins: s.stats.wins - before.stats.wins, fights: s.stats.fights - before.stats.fights,
+      kills: rooms.map(m => (s.kills[m.id] || 0) - (before.kills[m.id] || 0)), pushups: s.stats.pushups - before.stats.pushups,
+      dungeonFloor: s.dungeonFloor, deepestFloor: s.stats.deepestFloor, run: s.run, rest: s.restUntil > Date.now(), locked: s.dungeonLockedUntil > Date.now(),
+      history: s.history.slice(0, 3).map(h => h.where),
+    };
+    const sum = rooms.reduce((a, m) => a + m.hp, 0), bad = [];
+    if (!(res.roomXp.join() === res.roomHp.join() && s.xp - before.xp === sum)) bad.push(`XP ${res.roomXp.join("+")} for rooms of ${res.roomHp.join("+")} HP (total ${s.xp - before.xp}, expected ${sum})`);
+    if (!(res.wins === 3 && res.fights === 3 && res.kills.join() === "1,1,1" && res.pushups === sum)) bad.push(`stats: ${JSON.stringify({ wins: res.wins, fights: res.fights, kills: res.kills, pushups: res.pushups })}`);
+    if (!(res.dungeonFloor === 3 && res.deepestFloor === 2 && !res.run && !res.rest && !res.locked)) bad.push(`progress: ${JSON.stringify(res)}`);
+    if (!/floor 1 replayed/i.test(res.modal) || /safe room reached|go deeper/i.test(res.modal)) bad.push(`result: "${res.modal}"`);
+    if (!res.history.every(w => /floor 1 \(replay\)/i.test(w))) bad.push(`history: ${res.history.join(", ")}`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Journal 5 Losing a replay (giving up, leaving in a break, or closing the game) means the 10-hour rest only: the mine stays open and the progress is kept", async () => {
+    const bad = [], res = {};
+    const CLEARED2 = { ...BASE, dungeonFloor: 3, stats: { ...BASE.stats, deepestFloor: 2 } };
+    const startReplay = async (A, floor) => {
+      await A.goto("dungeon");
+      const b = A.d.querySelector(`#dgLadder button[data-action="replayFloor"][data-floor="${floor}"]`);
+      if (!b) return false;
+      b.click(); await A.settled();
+      await until(() => A.fight && !A.fight.over, 5000, "the replay fight").catch(() => {});
+      return !!A.fight;
+    };
+    // losses: a monster lost to (none when leaving in a break: no fight is going then)
+    const after = (A, how, losses = 1) => {
+      const s = saved();
+      const r = res[how] = { modal: A.modal().slice(0, 160), rest: s.restUntil > Date.now() + 9.9 * 3600e3, locked: s.dungeonLockedUntil > Date.now(),
+        run: s.run, dungeonFloor: s.dungeonFloor, deepestFloor: s.stats.deepestFloor, losses: Object.values(s.losses || {}).reduce((a, b) => a + b, 0) };
+      if (!(r.rest && !r.locked && !r.run && r.dungeonFloor === 3 && r.deepestFloor === 2 && r.losses === losses && !/closed for/i.test(r.modal))) bad.push(`${how}: ${JSON.stringify(r)}`);
+    };
+    // 1. give up in room 1 after the first rep
+    await reset(CLEARED2);
+    let A = await open("A");
+    if (await startReplay(A, 2)) {
+      await A.reps(1);
+      const f = A.d.querySelector("#btnFlee"); f.click(); await wait(80); f.click(); await wait(400);
+      after(A, "gave up");
+    } else bad.push("gave up: no replay started");
+    // 2. leave in the break after room 1
+    await reset(CLEARED2);
+    A = await open("A");
+    if (await startReplay(A, 1)) {
+      await A.reps(A.fight.total);
+      await until(() => A.api.rest, 3000, "the break").catch(() => {});
+      res.breakWarn = A.text("#restWarn");
+      const q = A.d.querySelector("#btnQuitRun"); q.click(); await wait(80); q.click(); await wait(400);
+      after(A, "left in a break", 0);
+      if (/7 days|closes the mine/i.test(res.breakWarn)) bad.push(`the break warns about the mine lock: "${res.breakWarn}"`);
+    } else bad.push("left in a break: no replay started");
+    // 3. the game closed during a replay fight (after the first rep), then opened again
+    await reset(CLEARED2);
+    A = await open("A");
+    if (await startReplay(A, 1)) {
+      await A.reps(1);
+      await close("A");
+      A = await open("A");
+      // settled once the closed window's "still running" signal is old
+      await until(() => /won this time|left the mine/i.test(A.modal()), 20000, "").catch(() => {});
+      after(A, "closed the game");
+    } else bad.push("closed the game: no replay started");
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Journal 6 A backup made during a replay restores and the replay goes on; a run on a floor that doesn't fit is still refused", async () => {
+    await reset();
+    const A = await open("A");
+    const CLEARED2 = { ...GOOD, dungeonFloor: 3, stats: { ...GOOD.stats, deepestFloor: 2 }, xp: 15 + 10 + 20 };
+    const res = {
+      replayRun: flat(await A.restoreCode(oldCode({ ...CLEARED2, run: { floor: 1, room: 1, replay: true } }))).slice(0, 80),
+      notCurrentNoReplay: flat(await A.restoreCode(oldCode({ ...CLEARED2, run: { floor: 1, room: 1 } }))).slice(0, 80),
+      replayNotCleared: flat(await A.restoreCode(oldCode({ ...CLEARED2, run: { floor: 3, room: 0, replay: true } }))).slice(0, 80),
+    };
+    // the replay restored last (the two after it were refused): it is still a replay, and it goes on from room 2
+    res.savedRun = saved().run;
+    await A.goto("dungeon");
+    res.status = A.text("#dgStatus").slice(0, 100);
+    const bad = [];
+    if (!/restored/i.test(res.replayRun)) bad.push(`replay run refused: "${res.replayRun}"`);
+    if (/restored/i.test(res.notCurrentNoReplay)) bad.push(`a normal run on a cleared floor was accepted: "${res.notCurrentNoReplay}"`);
+    if (/restored/i.test(res.replayNotCleared)) bad.push(`a replay of a floor not cleared yet was accepted: "${res.replayNotCleared}"`);
+    if (!(res.savedRun && res.savedRun.replay === true && res.savedRun.floor === 1 && res.savedRun.room === 1)) bad.push(`saved run: ${JSON.stringify(res.savedRun)}`);
+    if (!/replay/i.test(res.status)) bad.push(`mine screen: "${res.status}"`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();
