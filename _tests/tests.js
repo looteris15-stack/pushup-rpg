@@ -2856,6 +2856,37 @@ const tests = [
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);
   }],
+  // ---------------- Journal changes (play-test wishes after the audit)
+  ["Journal 1 Moss Slime has 5 HP (8 XP for a win); a backup from when it had 7 HP still restores, and one that claims more than that is still refused", async () => {
+    await reset();
+    const A = await open("A");
+    const { ZONES, xpReward } = await import(`../app/data.js?t=${Date.now()}`);
+    const m = ZONES.flatMap(z => z.monsters).find(x => x.id === "moss-slime");
+    const res = { hp: m.hp, xp: xpReward(m, "world") };
+    // a win against it: 5 hits, +8 XP
+    const xp0 = A.state.xp;
+    await A.fightMonster("moss-slime");
+    const total = A.fight ? A.fight.total : null;
+    await A.reps(total || 0);
+    await wait(300);
+    res.fight = { total, won: /defeated/i.test(A.modal()), gained: A.state.xp - xp0 };
+    A.closeModal();
+    // a backup made before the change: one Moss Slime win at 7 HP (7 pushups, 11 XP), so its numbers are at the
+    // old limit; and the same backup with one pushup more than the old limit allows
+    const before = { ...GOOD, xp: 15 + 11, kills: { "moss-slime": 1 }, losses: {},
+      stats: { ...GOOD.stats, pushups: 15 + 7, fights: 1, wins: 1, biggestKill: 7 },
+      history: [{ t: Date.now() - 86400e3, id: "moss-slime", name: "Moss Slime", hp: 7, reps: 7, won: true, where: "Birch Forest" }] };
+    res.oldBackup = flat(await A.restoreCode(oldCode(before))).slice(0, 90);
+    res.tooMuch = flat(await A.restoreCode(oldCode({ ...before, stats: { ...before.stats, pushups: 15 + 8 } }))).slice(0, 110);
+    const bad = [];
+    if (!(m.hp === 5 && res.xp === 8)) bad.push(`Moss Slime: ${m.hp} HP, ${res.xp} XP`);
+    if (!(res.fight.total === 5 && res.fight.won && res.fight.gained === 8)) bad.push(`the fight: ${JSON.stringify(res.fight)}`);
+    if (!/restored/i.test(res.oldBackup)) bad.push(`the backup from before was refused: "${res.oldBackup}"`);
+    if (/restored/i.test(res.tooMuch)) bad.push(`a backup with more than the old limit was accepted: "${res.tooMuch}"`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();

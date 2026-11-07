@@ -658,8 +658,10 @@ function checkSave(s) {
   if (fights !== wins + sum(losses)) return `${num(fights)} fights, but ${num(wins)} wins and ${num(sum(losses))} losses`;
 
   const test = s.tested ? s.testResult || 0 : 0;
+  // a monster as it was at its biggest (hpBefore: its HP before it was lowered; older wins were for that many)
+  const biggest = m => m.hpBefore > m.hp ? { ...m, hp: m.hpBefore } : m;
   // most reps one fight can give: the monster's HP (a lost fight gives fewer); the Champion: one set, so your best set
-  const repsCap = id => id === "champion" ? best : wander(id) ? WANDER_HP_MAX : findMonster(id).m.hp;
+  const repsCap = id => id === "champion" ? best : wander(id) ? WANDER_HP_MAX : biggest(findMonster(id).m).hp;
   const fought = { ...losses };
   for (const [id, k] of Object.entries(kills)) fought[id] = (fought[id] || 0) + k;
   const maxPushups = test + Object.entries(fought).reduce((a, [id, k]) => a + k * repsCap(id), 0);
@@ -672,7 +674,7 @@ function checkSave(s) {
     const w = wander(id);
     if (w) return Math.round(WANDER_HP_MAX * RULES.wandererXpMult * (w.slow ? RULES.specialXpMult : 1));
     const f = findMonster(id);
-    return xpReward(f.m, f.zone ? "world" : "dungeon");
+    return xpReward(biggest(f.m), f.zone ? "world" : "dungeon");
   };
   const deepest = st.deepestFloor || 0;
   const maxXp = test + Object.entries(kills).reduce((a, [id, k]) => a + k * xpCap(id), 0) + RULES.floorBonusXp * deepest * (deepest + 1) / 2;

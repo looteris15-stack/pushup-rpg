@@ -23,6 +23,8 @@ export const RULES = {
 
 // slow: seconds each rep must take going down. rounds: several sets with a break between (hp = all rounds together).
 // A new rule shows up on a normal monster first (practice), and only later on a boss (the test).
+// hpBefore: a monster's HP before it was lowered. Wins from then gave more pushups and XP, so a backup is checked
+// against the larger number (keep it when lowering HP again; use the highest it ever had).
 export const ZONES = [
   {
     id: "meadow", name: "Meadow Edge", blurb: "Small beasts at the forest edge. Good for your first fights.",
@@ -37,7 +39,7 @@ export const ZONES = [
     id: "birch", name: "Birch Forest", blurb: "Goblins and wolves live between the white trees.",
     monsters: [
       { id: "forest-goblin", name: "Forest Goblin", hp: 9 },
-      { id: "moss-slime", name: "Moss Slime", hp: 7, slow: 2 },
+      { id: "moss-slime", name: "Moss Slime", hp: 5, slow: 2, hpBefore: 7 }, // 7 HP until Nov 2026
       { id: "grey-wolf", name: "Grey Wolf", hp: 12 },
       { id: "goblin-chief", name: "Goblin Chief", hp: 14, boss: true },
     ],
