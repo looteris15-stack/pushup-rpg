@@ -1378,10 +1378,14 @@ const tests = [
     const hiddenRuns = loop.runs - r0, hiddenLive = liveTracks([s1]);
     check(hiddenLive === 0, "the camera stayed on while the game was hidden");
     check(hiddenRuns === 0, `the tracking loop ran ${hiddenRuns} times while hidden`);
+    check(heldLocks(wl) === 0, "the screen lock stayed on while the game was hidden");
     clock.skip(2000); A.setVisible(true);
     const s2 = await until(() => { const s = A.d.querySelector("#video").srcObject; return s && s !== s1 && liveTracks([s]) && s; }, 3000, "the camera to come back").catch(() => null);
     check(s2 && A.fight && !A.fight.over && A.api.trackerRunning, "after a 2 s look away the fight didn't go on with the camera");
-    check(wl.sentinels.filter(x => !x.released).length === 1, `screen locks held after coming back: ${wl.sentinels.filter(x => !x.released).length} (1 expected)`);
+    // The stream is attached before play() finishes and resume() asks for the screen lock.
+    await until(() => heldLocks(wl) > 0, 3000, "the screen lock to come back");
+    const resumedLocks = heldLocks(wl);
+    check(resumedLocks === 1, `screen locks held after coming back: ${resumedLocks} (1 expected)`);
     // 2. away 11 s, and the phone's screen-lock answer comes late (after coming back)
     wl.hold = true;
     A.setVisible(false); await wait(200);
