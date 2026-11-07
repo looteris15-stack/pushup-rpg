@@ -4,8 +4,9 @@
 //   installed and the old one stays), then waits until every game window is closed, so an open fight
 //   keeps the release it started with. The next launch uses the new one.
 //   Game files only ever come from this helper's own release, never one by one from elsewhere. If a saved
-//   file goes missing (storage trouble), a launch gets a repair page instead of a broken game: a waiting
-//   update takes over now, or the release is downloaded again as a whole. The save is never touched.
+//   file goes missing (storage trouble), a launch gets a repair page instead of a broken game: the release
+//   is downloaded again as a whole, or, when a newer release is ready, the page asks the player to close
+//   all game windows (it takes over then, like any update). The save is never touched.
 //   RELEASE RULE: raise SHELL_V whenever a release changes any of these files (or the list), otherwise
 //   phones keep the old release.
 // - Monster pictures: show the saved copy, refresh it in the background.
@@ -51,8 +52,6 @@ self.addEventListener("message", e => {
   const d = e.data || {};
   // the page asks to save all monster pictures ahead of time, so the map has them offline
   if (d.type === "warm" && Array.isArray(d.urls)) e.waitUntil(warm(d.urls));
-  // asked by an older release's repair (below) while this one waits: take over now
-  else if (d.type === "takeOver") e.waitUntil(self.skipWaiting());
   // the repair page asks to repair this release; the answer goes back on its port
   else if (d.type === "repair" && e.ports[0]) e.waitUntil(repair().catch(() => ({ ok: false })).then(r => e.ports[0].postMessage(r)));
 });
@@ -89,15 +88,16 @@ async function complete() {
 const unavailable = () => new Response("Pushup RPG: this game file is missing on this phone. Close the game and open it again.",
   { status: 504, headers: { "Content-Type": "text/plain; charset=utf-8" } });
 
-// The repair, always to one whole release:
-// 1. a newer release waiting for the game windows to close takes over now (it needs no network);
+// The repair, always to one whole release, and never by switching a release under an open window:
+// 1. a newer release is ready (installed, waiting for the game windows to close): "update", and the repair
+//    page asks the player to close all game windows; the newer release takes over then, the normal way;
 // 2. else, if the server still has this release (its sw.js has this SHELL_V before and after), all of this
-//    release's files are downloaded again and saved together;
-// 3. else (the server has another release) that one is installed as a whole, the normal update way, and
-//    takes over. No signal: the repair page says so and offers to try again.
+//    release's files are downloaded again and saved together: "repaired";
+// 3. else (the server has another release) that one is installed as a whole, the normal update way: "update"
+//    as in 1. No signal: the repair page says so and offers to try again.
 async function repair() {
   if (await complete()) return { ok: true, how: "repaired" };
-  if (takeOver(await settled(self.registration.installing) || self.registration.waiting)) return { ok: true, how: "update" };
+  if (await ready()) return { ok: true, how: "update" };
   const before = await serverRelease();
   if (before === null) return { ok: false };
   if (before === SHELL_V) {
@@ -109,7 +109,13 @@ async function repair() {
     }
   }
   await Promise.race([self.registration.update(), new Promise((_, no) => setTimeout(() => no(new Error("update took too long")), UPDATE_MS))]);
-  return takeOver(await settled(self.registration.installing) || self.registration.waiting) ? { ok: true, how: "update" } : { ok: false };
+  return (await ready()) ? { ok: true, how: "update" } : { ok: false };
+}
+
+// is a newer release installed and waiting (one still installing is waited for)?
+async function ready() {
+  const w = await settled(self.registration.installing) || self.registration.waiting;
+  return !!w && w.state === "installed";
 }
 
 // a release that is still installing: wait until it is installed (or failed)
@@ -119,12 +125,6 @@ function settled(w) {
     const t = setTimeout(() => done(null), UPDATE_MS);
     w.addEventListener("statechange", () => { if (w.state !== "installing") { clearTimeout(t); done(w.state === "redundant" ? null : w); } });
   });
-}
-
-function takeOver(w) {
-  if (!w || w.state !== "installed") return false;
-  w.postMessage({ type: "takeOver" });
-  return true;
 }
 
 async function timed(work) {
@@ -150,7 +150,7 @@ function download() {
 }
 
 // shown instead of the game while this phone's saved release is missing a file; it asks this helper to
-// repair it, then loads the game again
+// repair it, then loads the game again (or, when a newer release is ready, asks to close all game windows)
 function repairPage() {
   return new Response(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -171,7 +171,6 @@ const SAFE = " Your progress is safe.";
 async function repair() {
   again.hidden = true;
   msg.textContent = "Some game files are missing on this phone. Getting them again..." + SAFE;
-  const changed = new Promise(r => sw.addEventListener("controllerchange", r, { once: true }));
   const reply = await new Promise(r => {
     if (!sw.controller) return r({ ok: false });
     const ch = new MessageChannel();
@@ -180,7 +179,10 @@ async function repair() {
     setTimeout(() => r({ ok: false }), 45000);
   });
   if (reply.ok && reply.how === "repaired") return location.reload();
-  if (reply.ok && reply.how === "update" && await Promise.race([changed.then(() => true), new Promise(r => setTimeout(() => r(false), 10000))])) return location.reload();
+  if (reply.ok && reply.how === "update") {
+    msg.textContent = "A new version of the game is ready. Finish any fight you have open, close all game windows, then open the game again." + SAFE;
+    return;
+  }
   msg.textContent = "The game files could not be downloaded. Check the internet connection, then try again." + SAFE;
   again.hidden = false;
 }

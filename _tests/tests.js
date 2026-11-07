@@ -450,6 +450,35 @@ async function setupWaiting(bParams = "") {
   await dropData(aName);
   return { A, reg };
 }
+// a launch in window id that should get the repair page; its last word: "ready" (a new release is ready: close
+// all game windows), "error" (no signal: Try again), or "game" (it went on to the game). The window stays open.
+async function repairLaunch(id = "B", limit = 15000) {
+  const el = document.getElementById(id), t0 = performance.now();
+  el.src = `${SW_GAME}&win=${id}${Date.now()}`;
+  let outcome = null, sawRepair = false;
+  while (performance.now() - t0 < limit && !outcome) {
+    try {
+      const d = el.contentDocument, w = el.contentWindow;
+      if (d.getElementById("recovery")) {
+        sawRepair = true;
+        if (/close all/i.test(d.getElementById("msg").textContent)) outcome = "ready";
+        else if (!d.getElementById("again").hidden) outcome = "error";
+      } else if (w.PushupRPG && !d.getElementById("camp").hidden && d.getElementById("campTitle").textContent) outcome = "game";
+    } catch {}
+    if (!outcome) await wait(10);
+  }
+  const d = el.contentDocument;
+  return { outcome, ms: Math.round(performance.now() - t0), sawRepair, message: flat(d?.getElementById("msg")?.textContent).slice(0, 140),
+    release: outcome === "game" ? releaseOf(el.contentWindow, d) : null, saveKept: saveKept() };
+}
+// the player closes every game window: the waiting release takes over (the normal way), then a new launch
+async function closeAllAndRelaunch(reg, before) {
+  await close("A"); await close("B");
+  const t = performance.now();
+  await until(() => reg.active && reg.active !== before && !reg.waiting, 10000, "").catch(() => {});
+  const switchedAfterMs = reg.active && reg.active !== before ? Math.round(performance.now() - t) : null;
+  return { switchedAfterMs, ...(await launchB()) };
+}
 // a launch in window B (closed again afterwards): how it went
 async function launchB(limit = 15000) {
   const g = await openShell("B", limit);
@@ -2590,41 +2619,89 @@ const tests = [
       await installShell("A");
       await dropData(await shellCacheName());
       await shellNet("release=b&bump=0&mode=pass&clear=1");
-      res["server on b with the same sw.js"] = await launchB();
-      // 2-3. b waiting while window A (release a) is open: the repair lets b take over now (no network needed)
+      const r1 = res["server on b with the same sw.js"] = await launchB();
+      if (!(r1.readyMs !== null && r1.sawRepair && allFrom(r1.release, "b") && r1.saveKept)) bad.push(`server on b with the same sw.js: ${JSON.stringify(r1)}`);
+      // 2-3. b waiting while window A (release a) is open: the repair page says b is ready and to close all game
+      //      windows; a stays in charge until then (no network needed); after that the next launch is b
       for (const mode of ["pass", "fail"]) {
         const { A, reg } = await setupWaiting();
+        const before = reg.active, ctlA = A.w.navigator.serviceWorker.controller;
         await shellNet(`mode=${mode}&clear=1`);
-        res[`b waiting, network ${mode}`] = { ...(await launchB()), bInCharge: !!reg.active && !reg.waiting, openWindowCode: releaseOf(A.w, A.d).html };
+        const r = await repairLaunch("B");
+        const open = { stillWaiting: !!reg.waiting, sameHelper: reg.active === before, sameInA: A.w.navigator.serviceWorker.controller === ctlA, openWindowCode: releaseOf(A.w, A.d).html };
+        const next = await closeAllAndRelaunch(reg, before);
+        res[`b waiting, network ${mode}`] = { repair: r, whileOpen: open, afterClosing: next };
+        if (!(r.outcome === "ready" && r.saveKept && open.stillWaiting && open.sameHelper && open.sameInA && open.openWindowCode === "a")) bad.push(`b waiting, network ${mode}: repair ${JSON.stringify(r)}, while open ${JSON.stringify(open)}`);
+        if (!(next.switchedAfterMs !== null && next.readyMs !== null && allFrom(next.release, "b") && next.saveKept)) bad.push(`b waiting, network ${mode}, after closing: ${JSON.stringify(next)}`);
       }
-      for (const [name, r] of Object.entries(res)) if (!(r.readyMs !== null && r.sawRepair && allFrom(r.release, "b") && r.saveKept)) bad.push(`${name}: ${JSON.stringify(r)}`);
     } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);
   }],
-  ["Item 9f Review probe 1: release b adds a new module and waits, release a's saved copy loses a file, the server answers 503: the launch starts on release b with its new module from b's own saved copy", async () => {
+  ["Item 9f Review probe 1: release b adds a new module and waits, release a's saved copy loses a file, the server answers 503: the repair page says to close all game windows; after that the launch is release b, its new module from b's own saved copy", async () => {
     const bad = [], res = {};
     try {
       const { A, reg } = await setupWaiting("&extra=1");
+      const before = reg.active;
       await shellNet("mode=503&clear=1");
-      const r = res.launch = await launchB();
-      res.bInCharge = !!reg.active && !reg.waiting;
-      res.openWindowCode = releaseOf(A.w, A.d).html;
-      if (!(r.readyMs !== null && allFrom(r.release, "b") && r.extra === "b" && r.saveKept)) bad.push(`launch: ${JSON.stringify(r)}`);
+      const r = res.repair = await repairLaunch("B");
+      const open = res.whileOpen = { stillWaiting: !!reg.waiting, sameHelper: reg.active === before, openWindowCode: releaseOf(A.w, A.d).html };
+      const n = res.afterClosing = await closeAllAndRelaunch(reg, before);
+      if (!(r.outcome === "ready" && r.saveKept && open.stillWaiting && open.sameHelper && open.openWindowCode === "a")) bad.push(`repair: ${JSON.stringify(r)}, while open ${JSON.stringify(open)}`);
+      if (!(n.switchedAfterMs !== null && n.readyMs !== null && allFrom(n.release, "b") && n.extra === "b" && n.saveKept)) bad.push(`after closing: ${JSON.stringify(n)}`);
     } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);
   }],
-  ["Item 9g Review probe 2: release a's saved copy loses a file, nothing waiting, and the server switches to release b right after answering a page request: the game still starts on one whole release", async () => {
+  ["Item 9g Review probe 2: release a's saved copy loses a file, nothing waiting, and the server switches to release b right after answering a page request: the repair installs b as a whole and says to close all game windows; after that the launch is b", async () => {
     const bad = [], res = {};
     try {
       await shellNet("mode=pass&release=a&switch=&clear=1"); await reset(); await clearHelper();
       await installShell("A"); await close("A");
+      const reg = await swReg(), before = reg.active;
       await dropData(await shellCacheName());
       await shellNet("switch=b&clear=1");
-      const r = res.launch = await launchB();
-      res.serverNow = (await shellStatus()).release;
-      if (!(r.readyMs !== null && allFrom(r.release, "b") && r.saveKept)) bad.push(`launch: ${JSON.stringify(r)}`);
+      const r = res.repair = await repairLaunch("B", 30000);
+      const open = res.whileOpen = { waiting: !!reg.waiting, sameHelper: reg.active === before, serverNow: (await shellStatus()).release };
+      const n = res.afterClosing = await closeAllAndRelaunch(reg, before);
+      if (!(r.outcome === "ready" && r.saveKept && open.waiting && open.sameHelper)) bad.push(`repair: ${JSON.stringify(r)}, while open ${JSON.stringify(open)}`);
+      if (!(n.switchedAfterMs !== null && n.readyMs !== null && allFrom(n.release, "b") && n.saveKept)) bad.push(`after closing: ${JSON.stringify(n)}`);
+    } finally { await shellNet("mode=pass&release=a&switch="); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Item 9h Review probe 3: window 1 has release a's page but not yet its game script; release a then loses its icon and window 2's launch repairs while release b waits: window 1 still starts on release a throughout, window 2 says to close all game windows, and after that the launch is b", async () => {
+    const bad = [], res = {};
+    try {
+      await shellNet("mode=pass&release=a&hold=1&switch=&clear=1"); await reset(); await clearHelper();
+      await installShell("A");
+      const reg = await swReg(), before = reg.active, aName = await shellCacheName();
+      await shellNet("release=b&mode=pass&clear=1");
+      await reg.update().catch(() => {});
+      await until(() => reg.waiting, 10000, "").catch(() => {});
+      check(reg.waiting, "test setup: release b isn't waiting");
+      // window 1 (B): a launch that got release a's page and waits before asking for game.js
+      const w1 = document.getElementById("B");
+      w1.src = `${SW_GAME}&hold&win=B${Date.now()}`;
+      await until(() => w1.contentDocument?.querySelector('meta[name="release"]') && w1.contentDocument.readyState !== "loading", 5000, "").catch(() => {});
+      await wait(200);
+      res.window1Page = { html: w1.contentDocument?.querySelector('meta[name="release"]')?.content || null, game: !!w1.contentWindow.PushupRPG };
+      await close("A"); // window 1 is release a's only window now
+      // release a loses its icon; window 2 (A) launches and gets the repair page
+      const c = await caches.open(aName);
+      for (const r of await c.keys()) if (new URL(r.url).pathname.endsWith("/icon-192.png")) await c.delete(r);
+      const r2 = res.window2 = await repairLaunch("A");
+      const open = res.whileOpen = { stillWaiting: !!reg.waiting, sameHelper: reg.active === before };
+      // window 1 goes on, and must start on release a throughout
+      w1.contentWindow.__resume = true;
+      await until(() => { const d = w1.contentDocument; return w1.contentWindow.PushupRPG && !d.getElementById("camp").hidden && d.getElementById("campTitle").textContent; }, 8000, "").catch(() => {});
+      res.window1 = { game: !!w1.contentWindow.PushupRPG, release: releaseOf(w1.contentWindow, w1.contentDocument) };
+      // both windows closed: b takes over, and the next launch is b throughout
+      const n = res.afterClosing = await closeAllAndRelaunch(reg, before);
+      if (!(res.window1Page.html === "a" && !res.window1Page.game)) bad.push(`test setup: window 1 ${JSON.stringify(res.window1Page)}`);
+      if (!(r2.outcome === "ready" && r2.saveKept && open.stillWaiting && open.sameHelper)) bad.push(`window 2: ${JSON.stringify(r2)}, while open ${JSON.stringify(open)}`);
+      if (!(res.window1.game && allFrom(res.window1.release, "a"))) bad.push(`window 1 after going on: ${JSON.stringify(res.window1)}`);
+      if (!(n.switchedAfterMs !== null && n.readyMs !== null && allFrom(n.release, "b") && n.saveKept)) bad.push(`after closing: ${JSON.stringify(n)}`);
     } finally { await shellNet("mode=pass&release=a&switch="); await reset(); await clearHelper(); }
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);

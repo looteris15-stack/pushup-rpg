@@ -15,16 +15,22 @@ Copy-Item "$repo\_tests\*" "$root\_tests" -Recurse   # test page, tests and reco
 # The offline helper's (service worker's) own copy for its tests: the whole game with its icons in swapp\, so
 # the helper can install there (app\ has no icons, so it never installs for the other tests). Release "a" or
 # "b": every shell file carries its release mark, and a newer release's sw.js has its shell version raised.
-# extra: the release adds a new module, extra.js (game.js imports it, sw.js lists it).
+# extra: the release adds a new module, extra.js (game.js imports it, sw.js lists it). hold: a launch with
+# &hold in its link gets the page (and its styles and preloads) but asks for game.js only once the test sets
+# window.__resume (like a launch paused after its page arrived).
 $script:release = ''; $script:releaseKey = ''
-function WriteRelease([string]$rel, [bool]$bump = $true, [bool]$extra = $false) {
+function WriteRelease([string]$rel, [bool]$bump = $true, [bool]$extra = $false, [bool]$hold = $false) {
     New-Item -ItemType Directory -Force "$root\swapp\icons" | Out-Null
     Get-ChildItem "$repo\app" -File | Copy-Item -Destination "$root\swapp" -Force
     Copy-Item "$repo\app\icons\*" "$root\swapp\icons" -Force
     Remove-Item "$root\swapp\extra.js" -ErrorAction SilentlyContinue
     $utf8 = New-Object Text.UTF8Encoding $false
     $f = "$root\swapp\index.html"
-    [IO.File]::WriteAllText($f, ([IO.File]::ReadAllText($f) -replace '<head>', "<head>`n<meta name=`"release`" content=`"$rel`">"), $utf8)
+    $t = [IO.File]::ReadAllText($f) -replace '<head>', "<head>`n<meta name=`"release`" content=`"$rel`">"
+    if ($hold) {
+        $t = $t.Replace('<script type="module" src="game.js"></script>', '<script type="module">if (/[?&]hold(&|$)/.test(location.search)) await new Promise(r => { const t = setInterval(() => { if (window.__resume) { clearInterval(t); r(); } }, 20); }); await import("./game.js");</script>')
+    }
+    [IO.File]::WriteAllText($f, $t, $utf8)
     foreach ($n in 'game.js', 'core.js', 'data.js') { [IO.File]::AppendAllText("$root\swapp\$n", "`n;(globalThis.__release ||= {})[`"$n`"] = `"$rel`";`n", $utf8) }
     [IO.File]::AppendAllText("$root\swapp\style.css", "`n:root { --release: `"$rel`"; }`n", $utf8)
     if ($extra) {
@@ -38,7 +44,7 @@ function WriteRelease([string]$rel, [bool]$bump = $true, [bool]$extra = $false) 
         $t = [regex]::Replace([IO.File]::ReadAllText($f), 'const (SHELL_V|V) = (\d+);', { param($m) "const $($m.Groups[1].Value) = $([int]$m.Groups[2].Value + 1);" })
         [IO.File]::WriteAllText($f, $t, $utf8)
     }
-    $script:release = $rel; $script:releaseKey = "$rel|$bump|$extra"
+    $script:release = $rel; $script:releaseKey = "$rel|$bump|$extra|$hold"
 }
 WriteRelease 'a'
 
@@ -95,7 +101,8 @@ try {
     # (service worker) and answers them as the test page sets with /__shell/set?mode=..&only=..&release=..&clear=1:
     # mode pass (the server), hold (no answer until the mode changes), 503, or fail (as if offline); only = one
     # file (e.g. core.js) or all; release = a or b (rewrites swapp\; with bump=0 b keeps a's sw.js; extra=1
-    # adds a new module); switch=b: the server answers the next page request, then has release b.
+    # adds a new module; hold=1 see WriteRelease); switch=b: the server answers the next page request, then
+    # has release b.
     # /__shell/status lists the files asked for.
     $script:shell = @{ mode = 'pass'; only = '' }
     $script:shellSeen = New-Object System.Collections.ArrayList
@@ -122,7 +129,7 @@ try {
         $u = $p.request.url
         if ($u -like '*/__shell/set*') {
             $q = Query $u
-            if ($q.release -and "$($q.release)|$($q.bump -ne '0')|$($q.extra -eq '1')" -ne $script:releaseKey) { WriteRelease $q.release ($q.bump -ne '0') ($q.extra -eq '1') }
+            if ($q.release -and "$($q.release)|$($q.bump -ne '0')|$($q.extra -eq '1')|$($q.hold -eq '1')" -ne $script:releaseKey) { WriteRelease $q.release ($q.bump -ne '0') ($q.extra -eq '1') ($q.hold -eq '1') }
             if ($q.ContainsKey('switch')) { $script:switchTo = "$($q.switch)" }
             if ($q.mode) { $script:shell = @{ mode = "$($q.mode)"; only = "$($q.only)" } }
             if ($q.clear -eq '1') { $script:shellSeen.Clear() }
