@@ -401,12 +401,14 @@ function plankPose(elbow) {
   return lm;
 }
 // a fake model showing what the test plays: pose.queue = elbow angles, one per inference; when it is empty,
-// pose.e is shown (null = nobody seen). Each call is recorded in pose.calls ({ at, ts }).
+// pose.e is shown (null = nobody seen). Each call is recorded in pose.calls ({ at, ts, tag }): tag is what
+// pose.tag() gives then (if set). pose.after (if set) runs once, inside the next call.
 function poseModel(pose, w) {
   pose.calls ||= []; pose.queue ||= [];
   return { detectForVideo(video, ts) {
     if (pose.queue.length) pose.e = pose.queue.shift();
-    pose.calls.push({ at: w.performance.now(), ts, ready: !!w.PushupRPG?.fight });
+    pose.calls.push({ at: w.performance.now(), ts, ready: !!w.PushupRPG?.fight, tag: pose.tag ? pose.tag() : null });
+    if (pose.after) { const f = pose.after; pose.after = null; f(); }
     return { landmarks: pose.e == null ? [] : [plankPose(pose.e)] };
   }, close() {} };
 }
@@ -2309,6 +2311,72 @@ const tests = [
     }
     check(!bad.length, bad.join(" || "));
     return JSON.stringify(res);
+  }],
+  ["Item 8e Fight now while the camera is still coming back from a hide (its picture or screen lock not answered yet): one loop start, one inference per camera frame, never closer than the pace", async () => {
+    const bad = [], notes = [];
+    for (const waitFor of ["picture", "lock", "nothing"]) {
+      await reset();
+      const A = await open("A");
+      await skipWarmUp(A);
+      A.api.strictCamera = true;
+      const cam = {}, pose = { e: 170 }, play = {};
+      A.camera(cam);
+      A.api.hooks.setModelLoader(async () => ({ lm: poseModel(pose, A.w), used: "GPU" }));
+      const wl = A.fakeWakeLock(false), loop = A.countLoop();
+      await A.enterFloor();
+      check(A.fight && !A.fight.over, `${waitFor}: test setup: the fight didn't start`);
+      await A.reps(A.fight.total);
+      await until(() => A.api.rest, 3000, "the break").catch(() => {});
+      if (!A.api.rest) { bad.push(`${waitFor}: test setup: no break`); continue; }
+      // which camera frame each inference got (counted the way the tracker sees new frames)
+      const v = A.d.querySelector("#video");
+      let vf = 0; const tick = () => { vf++; v.requestVideoFrameCallback(tick); }; v.requestVideoFrameCallback(tick);
+      pose.tag = () => vf;
+      // hidden and back during the break; this return's camera picture (play) or screen lock waits
+      if (waitFor === "picture") A.holdPlay(play);
+      if (waitFor === "lock") wl.hold = true;
+      A.setVisible(false); await wait(200); A.setVisible(true); await wait(400);
+      const pending = waitFor === "picture" ? !!play.playGo : waitFor === "lock" ? wl.waiting.length === 1 : true;
+      if (!pending || !A.api.rest) { bad.push(`${waitFor}: test setup: not waiting (${JSON.stringify({ play: !!play.playGo, locksWaiting: wl.waiting.length, rest: !!A.api.rest })})`); continue; }
+      // the moment the game really ends the break (it hides the break panel as it sets up the next room)
+      const panel = A.d.querySelector("#restPanel"), hid = Object.getOwnPropertyDescriptor(A.w.HTMLElement.prototype, "hidden");
+      let endAt = null;
+      Object.defineProperty(panel, "hidden", { configurable: true, get() { return hid.get.call(this); },
+        set(x) { if (x && endAt === null) endAt = A.w.performance.now(); hid.set.call(this, x); } });
+      const st0 = loop.starts, c0 = pose.calls.length;
+      A.d.querySelector("#btnFightNow").click();
+      await until(() => !A.api.rest && A.fight && !A.fight.over, 2000, "the next room").catch(() => {});
+      // the answer comes in the next room: in a task just after an inference if one runs, otherwise now
+      let goAt = null;
+      const go = () => { goAt = A.w.performance.now(); if (waitFor === "picture") play.playGo(); else { wl.hold = false; wl.grantOldest(); } };
+      if (waitFor !== "nothing") {
+        await until(() => pose.calls.length > c0, 400, "").catch(() => {});
+        if (pose.calls.length > c0) { pose.after = () => A.w.setTimeout(go, 0); await until(() => goAt !== null, 1000, "the answer").catch(() => {}); }
+        else go();
+      }
+      await wait(900);
+      const after = endAt === null ? [] : pose.calls.slice(c0).filter(c => c.at >= endAt);
+      const iv = after.slice(1).map((c, i) => c.ts - after[i].ts);
+      const firstAfter = from => { const c = after.find(x => x.at >= from); return c ? Math.round(c.at - from) : null; };
+      const r = { loopStarts: loop.starts - st0, calls: after.length, repeatedFrames: after.slice(1).filter((c, i) => c.tag === after[i].tag).length,
+        minIntervalMs: iv.length ? +Math.min(...iv).toFixed(1) : null,
+        callsBeforeAnswer: goAt === null ? null : after.filter(c => c.at < goAt).length,
+        firstAfterMs: goAt !== null ? firstAfter(goAt) : endAt !== null ? firstAfter(endAt) : null,
+        locks: heldLocks(wl), liveTracks: liveTracks([A_video(A.d)]) };
+      // the first rep after the break counts once
+      const reps0 = A.fight ? A.fight.reps : 0;
+      pose.queue.push(...ONE_REP);
+      await until(() => A.fight && A.fight.reps > reps0, 4000, "the first rep").catch(() => {});
+      await wait(600);
+      r.firstRep = A.fight ? A.fight.reps - reps0 : null;
+      const ok = r.loopStarts === 1 && !r.repeatedFrames && r.minIntervalMs !== null && r.minIntervalMs >= 31 && r.calls >= 10
+        && r.firstAfterMs !== null && r.firstAfterMs <= (goAt !== null ? 100 : 50) && r.locks === 1 && r.liveTracks === 1 && r.firstRep === 1;
+      if (!ok) bad.push(`${waitFor}: ${JSON.stringify(r)}`);
+      notes.push(`${waitFor}: ${JSON.stringify(r)}`);
+      if (A.errors.length) bad.push(`${waitFor} errors: ` + A.errors.join(" | "));
+    }
+    check(!bad.length, bad.join(" || "));
+    return notes.join("; ");
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

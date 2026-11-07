@@ -577,14 +577,21 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     notify();
     if (!running || starting) return; // nothing tracked, or a start still going (it opens its own camera)
     const my = session;
-    let s = null;
-    try { s = await attachCamera(my); } catch { return; } // no camera now: the fight's timers decide
-    if (!s || my !== session || !tracking()) return;
-    await keepAwake();
-    // still this return's camera? (hidden and back again meanwhile: the newer return starts the loop)
-    if (my !== session || !tracking() || stream !== s || !liveStream()) return;
-    startLoop();
+    const asked = attachCamera(my), g = camGen; // a hide, stop() or a newer camera request makes this return old
+    backGen = g;
+    try {
+      let s = null;
+      try { s = await asked; } catch { return; } // no camera now: the fight's timers decide
+      if (!s || my !== session || !tracking()) return;
+      await keepAwake();
+      // still this return's camera? (hidden and back again meanwhile: the newer return starts the loop)
+      if (my !== session || !tracking() || stream !== s || !liveStream()) return;
+      if (!held) startLoop(); // in a break, hold(false) starts it
+    } finally { if (backGen === g) backGen = 0; }
   }
+  // a return from a hide is still bringing the camera back (resume() waits for it, its picture or the lock)
+  let backGen = 0;
+  const comingBack = () => backGen !== 0 && backGen === camGen;
 
   // A break (between mine rooms or boss rounds): the camera, its picture and the screen lock stay on, but
   // no body tracking runs (no inference, rep counting or drawing) until hold(false) starts the next set.
@@ -594,7 +601,12 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   function hold(on) {
     held = !!on;
     if (held) { cancelAnimationFrame(rafId); rafId = 0; ctx.clearRect(0, 0, canvas.width, canvas.height); }
-    else if (tracking() && liveStream()) { side = null; resetSmooth(); startLoop(); }
+    else {
+      side = null; resetSmooth();
+      // the camera still coming back from a hide: that resume() starts the loop once it's ready (a second
+      // start here would track the same frame again and break the pace)
+      if (tracking() && liveStream() && !comingBack()) startLoop();
+    }
   }
 
   function stop() {
