@@ -418,20 +418,45 @@ function releaseOf(w, d) {
 }
 const allFrom = (r, rel) => !!r && typeof r === "object" && Object.values(r).every(v => v === rel);
 // opens the helper's copy in window id with its own ?query (like a launch from a link or the home screen);
-// ready = ms until Camp works (null if not within limit)
+// ready = ms until Camp works (null if not within limit); sawRepair = the helper's repair page showed first
 async function openShell(id, limit = 8000) {
   const el = document.getElementById(id), t0 = performance.now();
   el.src = `${SW_GAME}&win=${id}${Date.now()}`;
-  let ready = null;
+  let ready = null, sawRepair = false;
   while (performance.now() - t0 < limit) {
     try {
       const d = el.contentDocument;
+      if (d.getElementById("recovery")) sawRepair = true;
       if (el.contentWindow.PushupRPG && !d.getElementById("camp").hidden && d.getElementById("campTitle").textContent) { ready = Math.round(performance.now() - t0); break; }
     } catch {}
     await wait(5);
   }
   const w = el.contentWindow, d = el.contentDocument;
-  return { w, d, ready, release: releaseOf(w, d), search: w.location.search, debug: !!w.PushupRPG };
+  return { w, d, ready, sawRepair, release: releaseOf(w, d), search: w.location.search, debug: !!w.PushupRPG };
+}
+const dropData = async name => { const c = await caches.open(name); for (const r of await c.keys()) if (new URL(r.url).pathname.endsWith("/data.js")) await c.delete(r); };
+const shellCacheName = async () => (await caches.keys()).find(k => k.startsWith("rpg-shell-"));
+// the save is the one the test started with (the repair never touches it)
+const saveKept = () => { const s = saved(); return !!s && s.xp === BASE.xp && s.stats.pushups === BASE.stats.pushups && s.history.length === BASE.history.length; };
+// release a in use (window A open), release b (bParams: e.g. "&extra=1") installed and waiting; then data.js
+// goes missing from release a's saved copy
+async function setupWaiting(bParams = "") {
+  await shellNet("mode=pass&release=a&switch=&clear=1"); await reset(); await clearHelper();
+  const A = await installShell("A"), reg = await swReg(), aName = await shellCacheName();
+  await shellNet(`release=b${bParams}&mode=pass&clear=1`);
+  await reg.update().catch(() => {});
+  await until(() => reg.waiting, 10000, "").catch(() => {});
+  check(reg.waiting, "test setup: release b isn't waiting");
+  await dropData(aName);
+  return { A, reg };
+}
+// a launch in window B (closed again afterwards): how it went
+async function launchB(limit = 15000) {
+  const g = await openShell("B", limit);
+  const asked = (await shellStatus()).seen.filter(f => !f.startsWith("img/"));
+  const r = { readyMs: g.ready, sawRepair: g.sawRepair, release: g.release, extra: g.w.__release?.["extra.js"] || null, asked, saveKept: saveKept() };
+  await close("B");
+  return r;
 }
 // the first visit: the helper installs release a and takes charge of the window
 async function installShell(id) {
@@ -2456,33 +2481,36 @@ const tests = [
     check(!bad.length, bad.join(" || "));
     return JSON.stringify(res);
   }],
-  ["Item 9b A file missing from the saved release comes from the network with a time limit (5 s), and is not added to that release", async () => {
-    await reset(); await clearHelper(); await shellNet("mode=pass&release=a&clear=1");
+  ["Item 9b A file missing from the saved release: an open window gets an error for it at once (never the network); a launch gets the repair page, which with no signal says so within its time limit, then on Try again downloads the release as a whole and starts the game; the save is kept", async () => {
+    await reset(); await clearHelper(); await shellNet("mode=pass&release=a&switch=&clear=1");
     const bad = [], res = {};
     try {
       const A = await installShell("A");
-      const shellName = (await caches.keys()).find(k => k.startsWith("rpg-shell-"));
-      const shell = await caches.open(shellName), isData = r => new URL(r.url).pathname.endsWith("/data.js");
-      for (const r of (await shell.keys()).filter(isData)) await shell.delete(r);
-      // 1. the network hangs: the request ends within the time limit instead of waiting for ever
-      await shellNet("mode=hold&only=data.js&clear=1");
-      const t0 = performance.now();
-      let ended = null;
-      A.w.fetch("data.js").then(r => { ended = { status: r.status, ms: Math.round(performance.now() - t0) }; },
-        e => { ended = { error: e.name, ms: Math.round(performance.now() - t0) }; });
-      await until(() => ended, 7500, "").catch(() => {});
-      res.stalled = ended || { endedWithinMs: null };
-      res.stalledAsked = (await shellStatus()).seen.filter(f => f === "data.js").length;
-      await shellNet("mode=pass");
-      await until(() => ended, 3000, "").catch(() => {});
-      // 2. the network works: the file comes from it, and the saved release isn't changed
-      const t1 = performance.now(), r2 = await A.w.fetch("data.js").catch(() => null);
-      res.online = { status: r2 ? r2.status : null, ms: Math.round(performance.now() - t1), release: r2 ? ((await r2.text()).match(/\["data\.js"\] = "(\w)"/) || [])[1] || null : null };
-      await wait(300);
-      res.addedToRelease = (await shell.keys()).filter(isData).length;
-      const s = res.stalled;
-      if (!(s.ms >= 4500 && s.ms <= 6000 && res.stalledAsked >= 1)) bad.push(`stalled network: ${JSON.stringify(s)} (asked ${res.stalledAsked}x)`);
-      if (!(res.online.status === 200 && res.online.ms <= 1500 && res.online.release === "a" && res.addedToRelease === 0)) bad.push(`network back: ${JSON.stringify(res.online)}, added to the saved release: ${res.addedToRelease}`);
+      const name = await shellCacheName();
+      await dropData(name);
+      // 1. the open window asks for the missing file: an error at once, nothing asked from the network
+      await shellNet("mode=pass&clear=1");
+      const t0 = performance.now(), r1 = await A.w.fetch("data.js").catch(() => null);
+      res.openWindow = { status: r1 ? r1.status : null, ms: Math.round(performance.now() - t0), asked: (await shellStatus()).seen.filter(f => f === "data.js").length };
+      await close("A");
+      // 2. a launch with the network hung: the repair page gives up within its time limit and offers to try again
+      await shellNet("mode=hold&clear=1");
+      const el = document.getElementById("A"), t1 = performance.now();
+      el.src = `${SW_GAME}&win=A${Date.now()}`;
+      const again = await until(() => { const b = el.contentDocument?.getElementById("again"); return b && !b.hidden && b; }, 15000, "").catch(() => null);
+      res.hung = { tryAgainAfterMs: again ? Math.round(performance.now() - t1) : null, message: flat(el.contentDocument?.getElementById("msg")?.textContent).slice(0, 100), game: !!el.contentWindow.PushupRPG };
+      // 3. the signal is back: Try again downloads release a as a whole and the game starts
+      await shellNet("mode=pass&clear=1");
+      const t2 = performance.now();
+      if (again) again.click();
+      await until(() => { const d = el.contentDocument; return el.contentWindow.PushupRPG && !d.getElementById("camp").hidden && d.getElementById("campTitle").textContent; }, 15000, "").catch(() => {});
+      const w = el.contentWindow, d = el.contentDocument;
+      res.repaired = { readyMs: w.PushupRPG ? Math.round(performance.now() - t2) : null, release: releaseOf(w, d), asked: (await shellStatus()).seen,
+        savedFiles: (await (await caches.open(name)).keys()).length, saveKept: saveKept() };
+      const o = res.openWindow, h = res.hung, r = res.repaired;
+      if (!(o.status === 504 && o.ms <= 500 && o.asked === 0)) bad.push(`open window: ${JSON.stringify(o)}`);
+      if (!(h.tryAgainAfterMs !== null && h.tryAgainAfterMs <= 8000 && !h.game)) bad.push(`no signal: ${JSON.stringify(h)}`);
+      if (!(r.readyMs !== null && allFrom(r.release, "a") && r.savedFiles === 8 && r.saveKept)) bad.push(`repaired: ${JSON.stringify(r)}`);
     } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
     check(!bad.length, bad.join(" || "));
     return JSON.stringify(res);
@@ -2552,47 +2580,52 @@ const tests = [
     check(!missing.length && !notThere.length, `loaded at start but not in the release list: ${missing.join(", ") || "-"}; listed but not on the server: ${notThere.join(", ") || "-"}`);
     return `release list: ${list.join(", ")}`;
   }],
-  ["Item 9e A file missing from the saved release while an update waits (network on or off), or while the server already has the next release: each launch uses one whole release", async () => {
+  ["Item 9e A file missing from the saved release: the launch gets the repair page, then starts on one whole release: the waiting update (network on or off), or the files the server has (same sw.js); the save is kept", async () => {
     const bad = [], res = {};
-    const oneRelease = r => !!r && typeof r === "object" && !!r.html && allFrom(r, r.html);
-    const dropData = async name => { const c = await caches.open(name); for (const r of await c.keys()) if (new URL(r.url).pathname.endsWith("/data.js")) await c.delete(r); };
-    const launch = async (name, extra = {}) => {
-      const g = await openShell("B");
-      const asked = (await shellStatus()).seen.filter(f => !f.startsWith("img/"));
-      const r = res[name] = { readyMs: g.ready, release: g.release, asked, ...extra };
-      await close("B");
-      if (!(r.readyMs !== null && oneRelease(r.release))) bad.push(`${name}: ${JSON.stringify(r)}`);
-      return r;
-    };
     try {
-      // 1. nothing to install: the server already has release b's files but the same sw.js (the release rule
-      //    broken), so the saved release a is incomplete and no other release is saved. (First: after a helper
-      //    with an update waiting was unregistered, Edge replaced the next new helper during a launch.)
-      await reset(); await clearHelper(); await shellNet("mode=pass&release=a&clear=1");
-      const A1 = await installShell("A");
-      const reg1 = await swReg(), active1 = reg1.active;
-      await dropData((await caches.keys()).find(k => k.startsWith("rpg-shell-")));
+      // 1. nothing waiting; the server already has release b's files with the same sw.js (the release rule
+      //    broken): the repair downloads what the server has, as a whole. (First: after a helper with an update
+      //    waiting was unregistered, Edge replaced the next new helper during a launch.)
+      await shellNet("mode=pass&release=a&switch=&clear=1"); await reset(); await clearHelper();
+      await installShell("A");
+      await dropData(await shellCacheName());
       await shellNet("release=b&bump=0&mode=pass&clear=1");
-      await launch("server on b with the same sw.js");
-      res.after1 = { sameHelper: reg1.active === active1, waiting: !!reg1.waiting, openWindow: releaseOf(A1.w, A1.d) };
-      if (!(res.after1.sameHelper && !res.after1.waiting && allFrom(res.after1.openWindow, "a"))) bad.push(`case 1 setup or open window: ${JSON.stringify(res.after1)}`);
-      // 2-3. release a in use (window A open), release b installed and waiting; then data.js goes missing from a
-      await shellNet("mode=pass&release=a&clear=1"); await reset(); await clearHelper();
-      const A = await installShell("A");
-      const reg = await swReg();
-      const aName = (await caches.keys()).find(k => k.startsWith("rpg-shell-"));
-      await shellNet("release=b&mode=pass&clear=1");
-      await reg.update().catch(() => {});
-      await until(() => reg.waiting, 10000, "").catch(() => {});
-      check(reg.waiting, "test setup: release b isn't waiting");
-      await dropData(aName);
+      res["server on b with the same sw.js"] = await launchB();
+      // 2-3. b waiting while window A (release a) is open: the repair lets b take over now (no network needed)
       for (const mode of ["pass", "fail"]) {
+        const { A, reg } = await setupWaiting();
         await shellNet(`mode=${mode}&clear=1`);
-        await launch(`b waiting, network ${mode}`, { stillWaiting: !!reg.waiting });
+        res[`b waiting, network ${mode}`] = { ...(await launchB()), bInCharge: !!reg.active && !reg.waiting, openWindowCode: releaseOf(A.w, A.d).html };
       }
-      res.openWindow = releaseOf(A.w, A.d);
-      if (!allFrom(res.openWindow, "a")) bad.push(`open window: ${JSON.stringify(res.openWindow)}`);
+      for (const [name, r] of Object.entries(res)) if (!(r.readyMs !== null && r.sawRepair && allFrom(r.release, "b") && r.saveKept)) bad.push(`${name}: ${JSON.stringify(r)}`);
     } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Item 9f Review probe 1: release b adds a new module and waits, release a's saved copy loses a file, the server answers 503: the launch starts on release b with its new module from b's own saved copy", async () => {
+    const bad = [], res = {};
+    try {
+      const { A, reg } = await setupWaiting("&extra=1");
+      await shellNet("mode=503&clear=1");
+      const r = res.launch = await launchB();
+      res.bInCharge = !!reg.active && !reg.waiting;
+      res.openWindowCode = releaseOf(A.w, A.d).html;
+      if (!(r.readyMs !== null && allFrom(r.release, "b") && r.extra === "b" && r.saveKept)) bad.push(`launch: ${JSON.stringify(r)}`);
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Item 9g Review probe 2: release a's saved copy loses a file, nothing waiting, and the server switches to release b right after answering a page request: the game still starts on one whole release", async () => {
+    const bad = [], res = {};
+    try {
+      await shellNet("mode=pass&release=a&switch=&clear=1"); await reset(); await clearHelper();
+      await installShell("A"); await close("A");
+      await dropData(await shellCacheName());
+      await shellNet("switch=b&clear=1");
+      const r = res.launch = await launchB();
+      res.serverNow = (await shellStatus()).release;
+      if (!(r.readyMs !== null && allFrom(r.release, "b") && r.saveKept)) bad.push(`launch: ${JSON.stringify(r)}`);
+    } finally { await shellNet("mode=pass&release=a&switch="); await reset(); await clearHelper(); }
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);
   }],

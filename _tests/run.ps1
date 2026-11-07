@@ -15,22 +15,30 @@ Copy-Item "$repo\_tests\*" "$root\_tests" -Recurse   # test page, tests and reco
 # The offline helper's (service worker's) own copy for its tests: the whole game with its icons in swapp\, so
 # the helper can install there (app\ has no icons, so it never installs for the other tests). Release "a" or
 # "b": every shell file carries its release mark, and a newer release's sw.js has its shell version raised.
-$script:release = ''
-function WriteRelease([string]$rel, [bool]$bump = $true) {
+# extra: the release adds a new module, extra.js (game.js imports it, sw.js lists it).
+$script:release = ''; $script:releaseKey = ''
+function WriteRelease([string]$rel, [bool]$bump = $true, [bool]$extra = $false) {
     New-Item -ItemType Directory -Force "$root\swapp\icons" | Out-Null
     Get-ChildItem "$repo\app" -File | Copy-Item -Destination "$root\swapp" -Force
     Copy-Item "$repo\app\icons\*" "$root\swapp\icons" -Force
+    Remove-Item "$root\swapp\extra.js" -ErrorAction SilentlyContinue
     $utf8 = New-Object Text.UTF8Encoding $false
     $f = "$root\swapp\index.html"
     [IO.File]::WriteAllText($f, ([IO.File]::ReadAllText($f) -replace '<head>', "<head>`n<meta name=`"release`" content=`"$rel`">"), $utf8)
     foreach ($n in 'game.js', 'core.js', 'data.js') { [IO.File]::AppendAllText("$root\swapp\$n", "`n;(globalThis.__release ||= {})[`"$n`"] = `"$rel`";`n", $utf8) }
     [IO.File]::AppendAllText("$root\swapp\style.css", "`n:root { --release: `"$rel`"; }`n", $utf8)
+    if ($extra) {
+        [IO.File]::WriteAllText("$root\swapp\extra.js", ";(globalThis.__release ||= {})[`"extra.js`"] = `"$rel`";`n", $utf8)
+        [IO.File]::AppendAllText("$root\swapp\game.js", "import `"./extra.js`";`n", $utf8)
+        $f = "$root\swapp\sw.js"
+        [IO.File]::WriteAllText($f, ([IO.File]::ReadAllText($f) -replace '"icons/icon-192\.png"\]', '"icons/icon-192.png", "extra.js"]'), $utf8)
+    }
     if ($rel -ne 'a' -and $bump) { # bump=0: the files change but sw.js doesn't (the release rule broken)
         $f = "$root\swapp\sw.js"
         $t = [regex]::Replace([IO.File]::ReadAllText($f), 'const (SHELL_V|V) = (\d+);', { param($m) "const $($m.Groups[1].Value) = $([int]$m.Groups[2].Value + 1);" })
         [IO.File]::WriteAllText($f, $t, $utf8)
     }
-    $script:release = $rel
+    $script:release = $rel; $script:releaseKey = "$rel|$bump|$extra"
 }
 WriteRelease 'a'
 
@@ -86,16 +94,24 @@ try {
     # ---- the offline helper's own requests for its test copy (swapp\): run.ps1 attaches to each helper
     # (service worker) and answers them as the test page sets with /__shell/set?mode=..&only=..&release=..&clear=1:
     # mode pass (the server), hold (no answer until the mode changes), 503, or fail (as if offline); only = one
-    # file (e.g. core.js) or all; release = a or b (rewrites swapp\; with bump=0 b keeps a's sw.js).
+    # file (e.g. core.js) or all; release = a or b (rewrites swapp\; with bump=0 b keeps a's sw.js; extra=1
+    # adds a new module); switch=b: the server answers the next page request, then has release b.
     # /__shell/status lists the files asked for.
     $script:shell = @{ mode = 'pass'; only = '' }
     $script:shellSeen = New-Object System.Collections.ArrayList
     $script:shellHeld = New-Object System.Collections.ArrayList
+    $script:switchTo = '' # switch=b: right after answering the next request for the page, the server has release b
     function OnShell($p, $sid) {
         $u = $p.request.url
         $file = ([Uri]$u).AbsolutePath -replace '^.*?/swapp/', ''
         if (-not $file) { $file = './' }
-        [void]$script:shellSeen.Add($file)
+        [void]$script:shellSeen.Add($(if ($sid) { $file } else { "page:$file" })) # page: = straight from a page, not via the helper
+        if ($script:switchTo -and $script:shell.mode -eq 'pass' -and ($file -eq './' -or $file -eq 'index.html')) {
+            Fulfill $p.requestId 'text/html; charset=utf-8' ([IO.File]::ReadAllText("$root\swapp\index.html")) $sid
+            $to = $script:switchTo; $script:switchTo = ''
+            WriteRelease $to
+            return
+        }
         $hit = $script:shell.mode -ne 'pass' -and (-not $script:shell.only -or $file -eq $script:shell.only)
         if (-not $hit) { [void](Send 'Fetch.continueRequest' @{ requestId = $p.requestId } $sid) }
         elseif ($script:shell.mode -eq 'hold') { [void]$script:shellHeld.Add(@{ rid = $p.requestId; sid = $sid }) }
@@ -106,7 +122,8 @@ try {
         $u = $p.request.url
         if ($u -like '*/__shell/set*') {
             $q = Query $u
-            if ($q.release -and $q.release -ne $script:release) { WriteRelease $q.release ($q.bump -ne '0') }
+            if ($q.release -and "$($q.release)|$($q.bump -ne '0')|$($q.extra -eq '1')" -ne $script:releaseKey) { WriteRelease $q.release ($q.bump -ne '0') ($q.extra -eq '1') }
+            if ($q.ContainsKey('switch')) { $script:switchTo = "$($q.switch)" }
             if ($q.mode) { $script:shell = @{ mode = "$($q.mode)"; only = "$($q.only)" } }
             if ($q.clear -eq '1') { $script:shellSeen.Clear() }
             if ($script:shell.mode -ne 'hold') {
@@ -124,7 +141,9 @@ try {
     $fakeLib = Get-Content -Raw "$root\_tests\fixtures\fake-vision.mjs"
     function OnPaused($p, $sid) {
         $u = $p.request.url
-        if ($sid) { OnShell $p $sid; return } # only the helper's swapp\ requests are watched there
+        # swapp\ requests: the helper's own (only those are watched in its session), or a page's that the
+        # helper didn't answer (or with no helper yet): both get the same server answers
+        if ($sid -or $u -like '*/swapp/*') { OnShell $p $sid; return }
         if ($u -like '*/__shell/*') { OnShellControl $p; return }
         if ($u -like '*/__lib/*') {
             if ($u -like '*mode=fake*') { $script:libMode = 'fake' } elseif ($u -like '*mode=block*') { $script:libMode = 'block' }
@@ -203,7 +222,7 @@ try {
     function Eval($code) { return (Call 'Runtime.evaluate' @{ expression = $code; returnByValue = $true }).result.result.value }
     $script:waitFor = $null
     [void](Call 'Fetch.enable' @{ patterns = @(@{ urlPattern = '*://fonts.googleapis.com/*' }, @{ urlPattern = '*://fonts.gstatic.com/*' }, @{ urlPattern = '*/__fonts/*' },
-        @{ urlPattern = '*://cdn.jsdelivr.net/*' }, @{ urlPattern = '*/__lib/*' }, @{ urlPattern = '*/__shell/*' }) })
+        @{ urlPattern = '*://cdn.jsdelivr.net/*' }, @{ urlPattern = '*/__lib/*' }, @{ urlPattern = '*/__shell/*' }, @{ urlPattern = '*/swapp/*' }) })
     [void](Call 'Target.setAutoAttach' @{ autoAttach = $true; waitForDebuggerOnStart = $true; flatten = $true })
     [void](Call 'Runtime.enable' @{})
     [void](Call 'Log.enable' @{})
