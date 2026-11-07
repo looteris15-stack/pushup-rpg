@@ -9,7 +9,9 @@
 //   all game windows (it takes over then, like any update). The save is never touched.
 //   RELEASE RULE: raise SHELL_V whenever a release changes any of these files (or the list), otherwise
 //   phones keep the old release.
-// - Monster pictures: show the saved copy, refresh it in the background.
+// - Monster pictures: show the saved copy, refresh it in the background. One saved copy per picture (its
+//   link without any ?query). Background downloads (a refresh: 5 s each; the warm-up: 5 s in all) never
+//   keep this helper busy for long, so a waiting update can take over soon after the game windows close.
 // - Body tracking library, its model and the font: these links never change, so save once, reuse forever.
 //   Pictures and tracking files are kept across releases.
 // The save (/api/save on the PC server) is never touched.
@@ -21,6 +23,7 @@ const LIB_HOSTS = ["cdn.jsdelivr.net", "storage.googleapis.com", "fonts.googleap
 const BASE = new URL("./", self.location).pathname; // e.g. /pushup-rpg/app/
 const SHELL_URLS = SHELL_FILES.map(f => new URL(f, self.location).href);
 const NET_MS = 5000;     // the repair: the most each download step may take
+const PIC_MS = 5000;     // a picture download in the background: each refresh, and the whole warm-up
 const UPDATE_MS = 20000; // the repair: the most a newer release may take to install
 
 // the whole release or nothing: addAll() fails (and this release isn't installed) if any file does
@@ -30,9 +33,25 @@ self.addEventListener("install", e => {
 
 self.addEventListener("activate", e => {
   e.waitUntil(caches.keys()
-    .then(keys => Promise.all(keys.filter(k => k.startsWith("rpg-") && !KEEP.includes(k)).map(k => caches.delete(k))))
+    .then(keys => Promise.all([...keys.filter(k => k.startsWith("rpg-") && !KEEP.includes(k)).map(k => caches.delete(k)), compactPictures().catch(() => {})]))
     .then(() => self.clients.claim()));
 });
+
+// One saved copy per picture: older helpers saved one per link (with its ?query). Keep a usable copy under the
+// plain link (thumbnail and full size stay apart: they are different files), then drop the others.
+async function compactPictures() {
+  const c = await caches.open(IMG), byPic = new Map();
+  for (const r of await c.keys()) { const k = picKey(r.url); byPic.set(k, [...(byPic.get(k) || []), r]); }
+  for (const [k, list] of byPic) {
+    const others = list.filter(r => r.url !== k);
+    if (!others.length) continue;
+    const plain = await c.match(k);
+    if (!plain || !plain.ok) {
+      for (const r of others.reverse()) { const res = await c.match(r); if (res && res.ok) { await c.put(k, res); break; } } // newest first
+    }
+    for (const r of others) await c.delete(r);
+  }
+}
 
 self.addEventListener("fetch", e => {
   const req = e.request;
@@ -56,14 +75,23 @@ self.addEventListener("message", e => {
   else if (d.type === "repair" && e.ports[0]) e.waitUntil(repair().catch(() => ({ ok: false })).then(r => e.ports[0].postMessage(r)));
 });
 
+// The whole warm-up has PIC_MS: pictures already saved are skipped, and when the time is up it stops (what
+// was saved stays; the rest is tried on the next visit).
 async function warm(urls) {
-  const c = await caches.open(IMG);
-  for (const u of urls) {
-    try { if (!(await c.match(u))) { const r = await fetch(u); if (r.ok) await c.put(u, r); } } catch { /* offline: try next time */ }
+  const c = await caches.open(IMG), stop = new AbortController(), timer = setTimeout(() => stop.abort(), PIC_MS);
+  try {
+    for (const u of urls) {
+      if (stop.signal.aborted) break;
+      const k = picKey(u);
+      try { if (!(await c.match(k))) { const r = await fetch(k, { signal: stop.signal }); if (r.ok) await c.put(k, r); } } catch { /* offline or out of time */ }
+    }
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-const key = req => new URL(req.url).href.split("#")[0];
+// a picture's one saved copy is under its link without any ?query
+const picKey = u => { const x = new URL(u, self.location); return x.origin + x.pathname; };
 
 // which release file a link asks for ("./" for the folder itself), whatever its ?query; null if none
 function shellFile(url) {
@@ -191,12 +219,26 @@ repair();
 </script></body></html>`, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 }
 
+// a picture: the saved copy at once and a refresh in the background, or (not saved yet) from the network
 async function savedThenRefresh(e, req, name) {
-  const cache = await caches.open(name);
-  const saved = await cache.match(key(req), { ignoreSearch: true });
-  const net = fetch(req).then(res => { if (res.ok) cache.put(key(req), res.clone()); return res; });
-  if (saved) { e.waitUntil(net.catch(() => {})); return saved; }
-  return net;
+  const cache = await caches.open(name), k = picKey(req.url);
+  const saved = await cache.match(k);
+  if (saved) { e.waitUntil(refresh(cache, k)); return saved; }
+  const res = await fetch(req);
+  if (res.ok) cache.put(k, res.clone()).catch(() => {}); // not waited for: a slow picture must not keep this helper busy
+  return res;
+}
+
+// a saved picture downloaded again, in PIC_MS at most (the whole picture, until it is saved). A stalled or
+// failed download leaves the saved copy as it was.
+async function refresh(cache, k) {
+  const stop = new AbortController(), timer = setTimeout(() => stop.abort(), PIC_MS);
+  try {
+    const res = await fetch(k, { signal: stop.signal });
+    if (res.ok) await cache.put(k, res);
+  } catch { /* offline or out of time: the saved copy stays */ } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function savedForever(req) {

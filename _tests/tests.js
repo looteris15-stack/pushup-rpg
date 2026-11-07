@@ -479,6 +479,26 @@ async function closeAllAndRelaunch(reg, before) {
   const switchedAfterMs = reg.active && reg.active !== before ? Math.round(performance.now() - t) : null;
   return { switchedAfterMs, ...(await launchB()) };
 }
+// ---- Item 10: the helper's picture cache (run.ps1 puts ash-drake, ash-knight and bog-leech, both sizes, in swapp)
+const PIC = (id, small = false) => new URL(`../swapp/img/monsters/${id}${small ? "-s" : ""}.jpg`, location.href).href;
+const picName = u => u.replace(/^(.*\/)?img\/monsters\//, "");
+const savedPics = async () => (await (await caches.open("rpg-img-v1")).keys()).map(r => picName(r.url)).sort();
+// like until(), for a check that has to wait (a cache or the test server); false when time runs out
+async function untilAsync(fn, ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) { try { if (await fn()) return true; } catch {} await wait(50); }
+  return false;
+}
+// release a in charge (window A open) and release b installed and waiting
+async function waitingUpdate() {
+  await reset(); await clearHelper(); await shellNet("mode=pass&release=a&switch=&clear=1");
+  const A = await installShell("A"), reg = await swReg(), before = reg.active;
+  await shellNet("release=b&mode=pass&clear=1");
+  await reg.update().catch(() => {});
+  await until(() => reg.waiting, 10000, "").catch(() => {});
+  check(reg.waiting, "test setup: release b isn't waiting");
+  return { A, reg, before };
+}
 // a launch in window B (closed again afterwards): how it went
 async function launchB(limit = 15000) {
   const g = await openShell("B", limit);
@@ -2703,6 +2723,85 @@ const tests = [
       if (!(res.window1.game && allFrom(res.window1.release, "a"))) bad.push(`window 1 after going on: ${JSON.stringify(res.window1)}`);
       if (!(n.switchedAfterMs !== null && n.readyMs !== null && allFrom(n.release, "b") && n.saveKept)) bad.push(`after closing: ${JSON.stringify(n)}`);
     } finally { await shellNet("mode=pass&release=a&switch="); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  // ---------------- Item 10 (audit finding #8): the helper's picture cache
+  ["Item 10a One saved copy per picture: older copies saved under links with a ?query become one under the plain link (thumbnail and full size apart, a usable copy kept); later loads with a query add nothing", async () => {
+    await reset(); await clearHelper(); await shellNet("mode=pass&release=a&switch=&clear=1");
+    const bad = [], res = {};
+    try {
+      // what an older helper left: the full-size picture twice (a good copy and an error page) and the thumbnail
+      // once, each under a link with its own query
+      const img = await caches.open("rpg-img-v1"), full = PIC("ash-drake"), thumb = PIC("ash-drake", true);
+      const jpg = body => new Response(body, { status: 200, headers: { "Content-Type": "image/jpeg" } });
+      await img.put(full + "?v=1", jpg("old full"));
+      await img.put(full + "?v=2", new Response("server error", { status: 500 }));
+      await img.put(thumb + "?v=1", jpg("old thumb"));
+      res.before = await savedPics();
+      // the helper installs and takes charge
+      const A = await installShell("A");
+      const body = async u => { const r = await img.match(u); return r ? `${r.status} ${(await r.text()).slice(0, 12)}` : null; };
+      res.afterActivation = { saved: await savedPics(), full: await body(full), thumb: await body(thumb) };
+      // the game loads pictures with a query: a saved one (and its refresh), and one not saved yet
+      const r1 = await A.w.fetch("img/monsters/ash-drake.jpg?cachebust=7"), r2 = await A.w.fetch("img/monsters/ash-knight-s.jpg?v=3");
+      await wait(1500);
+      res.afterLoads = { statuses: [r1.status, r2.status], saved: await savedPics() };
+      const a = res.afterActivation;
+      if (!(a.saved.join() === "ash-drake-s.jpg,ash-drake.jpg" && a.full === "200 old full" && a.thumb === "200 old thumb")) bad.push(`after activation: ${JSON.stringify(a)}`);
+      if (!(r1.status === 200 && r2.status === 200 && res.afterLoads.saved.join() === "ash-drake-s.jpg,ash-drake.jpg,ash-knight-s.jpg")) bad.push(`after loads: ${JSON.stringify(res.afterLoads)}`);
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Item 10b A stalled picture refresh: the saved picture comes at once, the refresh gives up after 5 s and the saved copy stays, and a waiting update takes over within that time once the game windows are closed", async () => {
+    const bad = [], res = {};
+    try {
+      const { A, reg, before } = await waitingUpdate();
+      const img = await caches.open("rpg-img-v1"), full = PIC("ash-drake");
+      await A.w.fetch("img/monsters/ash-drake.jpg"); // from the server, saved
+      await untilAsync(async () => !!(await img.match(full)), 3000);
+      await wait(300);
+      const size0 = (await (await img.match(full))?.blob())?.size || 0;
+      // the picture server hangs; the game shows the picture again
+      await shellNet("mode=hold&only=img/*&clear=1");
+      const t0 = performance.now(), r = await A.w.fetch("img/monsters/ash-drake.jpg"), size = (await r.blob()).size, servedMs = Math.round(performance.now() - t0);
+      await untilAsync(async () => (await shellStatus()).seen.includes("img/monsters/ash-drake.jpg"), 3000);
+      res.refreshAsked = (await shellStatus()).seen.includes("img/monsters/ash-drake.jpg");
+      // the player closes the game: b takes over once the refresh gives up
+      const t1 = performance.now();
+      await close("A");
+      await until(() => reg.active && reg.active !== before && !reg.waiting, 9000, "").catch(() => {});
+      res.switchedAfterCloseMs = reg.active !== before ? Math.round(performance.now() - t1) : null;
+      res.picture = { status: r.status, servedMs, sameSize: size === size0 && size0 > 0 };
+      await shellNet("mode=pass");
+      await wait(300);
+      res.savedCopyKept = ((await (await img.match(full))?.blob())?.size || 0) === size0;
+      if (!(res.picture.status === 200 && servedMs <= 300 && res.picture.sameSize && res.refreshAsked)) bad.push(`picture: ${JSON.stringify(res.picture)}, refresh asked ${res.refreshAsked}`);
+      if (!(res.switchedAfterCloseMs !== null && res.switchedAfterCloseMs <= 7000)) bad.push(`switch after closing: ${res.switchedAfterCloseMs} ms`);
+      if (!res.savedCopyKept) bad.push("the saved picture was lost");
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Item 10c The picture warm-up has 5 s in all: a stalled download stops it (pictures already saved stay, the rest wait for the next visit), and a waiting update takes over within that time once the game windows are closed", async () => {
+    const bad = [], res = {};
+    try {
+      const { reg, before } = await waitingUpdate();
+      // a warm-up of three pictures, none saved yet; the second one hangs
+      await shellNet("mode=hold&only=img/monsters/ash-knight.jpg&clear=1");
+      const t0 = performance.now();
+      reg.active.postMessage({ type: "warm", urls: [PIC("bog-leech"), PIC("ash-knight"), PIC("ash-drake")] });
+      await untilAsync(async () => (await shellStatus()).seen.includes("img/monsters/ash-knight.jpg"), 3000);
+      await close("A");
+      await until(() => reg.active && reg.active !== before && !reg.waiting, 9000, "").catch(() => {});
+      res.switchedAfterWarmUpMs = reg.active !== before ? Math.round(performance.now() - t0) : null;
+      res.asked = (await shellStatus()).seen.filter(f => f.startsWith("img/")).map(picName);
+      res.saved = await savedPics();
+      await shellNet("mode=pass");
+      if (!(res.switchedAfterWarmUpMs !== null && res.switchedAfterWarmUpMs <= 7000)) bad.push(`switch: ${res.switchedAfterWarmUpMs} ms`);
+      if (!(res.saved.join() === "bog-leech.jpg" && !res.asked.includes("ash-drake.jpg"))) bad.push(`saved ${res.saved.join(", ") || "-"}; asked ${res.asked.join(", ")}`);
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);
   }],

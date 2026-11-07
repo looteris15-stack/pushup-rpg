@@ -47,6 +47,10 @@ function WriteRelease([string]$rel, [bool]$bump = $true, [bool]$extra = $false, 
     $script:release = $rel; $script:releaseKey = "$rel|$bump|$extra|$hold"
 }
 WriteRelease 'a'
+# a few real monster pictures (both sizes) for the picture tests; pictures aren't part of a release. Not the
+# whole set: the game's own warm-up would then download ~140 of them during the helper's other tests.
+New-Item -ItemType Directory -Force "$root\swapp\img\monsters" | Out-Null
+foreach ($id in 'ash-drake', 'ash-knight', 'bog-leech') { Copy-Item "$repo\app\img\monsters\$id.jpg", "$repo\app\img\monsters\$id-s.jpg" "$root\swapp\img\monsters" }
 
 $server = Start-Job -ScriptBlock { param($s, $r, $p) & $s -Port $p -Root $r } -ArgumentList "$repo\serve.ps1", $root, $Port
 $edge = $null
@@ -100,7 +104,7 @@ try {
     # ---- the offline helper's own requests for its test copy (swapp\): run.ps1 attaches to each helper
     # (service worker) and answers them as the test page sets with /__shell/set?mode=..&only=..&release=..&clear=1:
     # mode pass (the server), hold (no answer until the mode changes), 503, or fail (as if offline); only = one
-    # file (e.g. core.js) or all; release = a or b (rewrites swapp\; with bump=0 b keeps a's sw.js; extra=1
+    # file (e.g. core.js), a folder (img/*) or all; release = a or b (rewrites swapp\; with bump=0 b keeps a's sw.js; extra=1
     # adds a new module; hold=1 see WriteRelease); switch=b: the server answers the next page request, then
     # has release b.
     # /__shell/status lists the files asked for.
@@ -119,7 +123,8 @@ try {
             WriteRelease $to
             return
         }
-        $hit = $script:shell.mode -ne 'pass' -and (-not $script:shell.only -or $file -eq $script:shell.only)
+        $only = $script:shell.only # one file, or a folder with * (e.g. img/*)
+        $hit = $script:shell.mode -ne 'pass' -and (-not $only -or $file -eq $only -or ($only.EndsWith('*') -and $file.StartsWith($only.TrimEnd('*'))))
         if (-not $hit) { [void](Send 'Fetch.continueRequest' @{ requestId = $p.requestId } $sid) }
         elseif ($script:shell.mode -eq 'hold') { [void]$script:shellHeld.Add(@{ rid = $p.requestId; sid = $sid }) }
         elseif ($script:shell.mode -eq '503') { Fulfill $p.requestId 'text/plain' 'Service Unavailable (test)' $sid 503 }
