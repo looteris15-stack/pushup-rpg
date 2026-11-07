@@ -106,7 +106,7 @@ try {
     # mode pass (the server), hold (no answer until the mode changes), 503, or fail (as if offline); only = one
     # file (e.g. core.js), a folder (img/*) or all; release = a or b (rewrites swapp\; with bump=0 b keeps a's sw.js; extra=1
     # adds a new module; hold=1 see WriteRelease); switch=b: the server answers the next page request, then
-    # has release b.
+    # has release b; quota=N: storage full above N bytes (quota= ends it).
     # /__shell/status lists the files asked for.
     $script:shell = @{ mode = 'pass'; only = '' }
     $script:shellSeen = New-Object System.Collections.ArrayList
@@ -136,6 +136,12 @@ try {
             $q = Query $u
             if ($q.release -and "$($q.release)|$($q.bump -ne '0')|$($q.extra -eq '1')|$($q.hold -eq '1')" -ne $script:releaseKey) { WriteRelease $q.release ($q.bump -ne '0') ($q.extra -eq '1') ($q.hold -eq '1') }
             if ($q.ContainsKey('switch')) { $script:switchTo = "$($q.switch)" }
+            # quota=N: the test site's storage quota is N bytes (DevTools override; quota= puts it back)
+            if ($q.ContainsKey('quota')) {
+                $qp = @{ origin = "http://localhost:$Port" }
+                if ($q.quota) { $qp.quotaSize = [double]$q.quota }
+                [void](Send 'Storage.overrideQuotaForOrigin' $qp)
+            }
             if ($q.mode) { $script:shell = @{ mode = "$($q.mode)"; only = "$($q.only)" } }
             if ($q.clear -eq '1') { $script:shellSeen.Clear() }
             if ($script:shell.mode -ne 'hold') {

@@ -38,18 +38,21 @@ self.addEventListener("activate", e => {
 });
 
 // One saved copy per picture: older helpers saved one per link (with its ?query). Keep a usable copy under the
-// plain link (thumbnail and full size stay apart: they are different files), then drop the others.
+// plain link (thumbnail and full size stay apart: they are different files), then drop the others. If saving
+// under the plain link fails (storage full), the older copies stay: savedPic() still finds a usable one.
 async function compactPictures() {
   const c = await caches.open(IMG), byPic = new Map();
   for (const r of await c.keys()) { const k = picKey(r.url); byPic.set(k, [...(byPic.get(k) || []), r]); }
   for (const [k, list] of byPic) {
     const others = list.filter(r => r.url !== k);
     if (!others.length) continue;
-    const plain = await c.match(k);
-    if (!plain || !plain.ok) {
-      for (const r of others.reverse()) { const res = await c.match(r); if (res && res.ok) { await c.put(k, res); break; } } // newest first
-    }
-    for (const r of others) await c.delete(r);
+    try {
+      const plain = await c.match(k);
+      if (!plain || !plain.ok) {
+        for (const r of [...others].reverse()) { const res = await c.match(r); if (res && res.ok) { await c.put(k, res); break; } } // newest first
+      }
+      for (const r of others) await c.delete(r);
+    } catch { /* keep this picture's older copies */ }
   }
 }
 
@@ -83,7 +86,7 @@ async function warm(urls) {
     for (const u of urls) {
       if (stop.signal.aborted) break;
       const k = picKey(u);
-      try { if (!(await c.match(k))) { const r = await fetch(k, { signal: stop.signal }); if (r.ok) await c.put(k, r); } } catch { /* offline or out of time */ }
+      try { if (!(await savedPic(c, k))) { const r = await fetch(k, { signal: stop.signal }); if (r.ok) await c.put(k, r); } } catch { /* offline or out of time */ }
     }
   } finally {
     clearTimeout(timer);
@@ -222,11 +225,32 @@ repair();
 // a picture: the saved copy at once and a refresh in the background, or (not saved yet) from the network
 async function savedThenRefresh(e, req, name) {
   const cache = await caches.open(name), k = picKey(req.url);
-  const saved = await cache.match(k);
+  const saved = await savedPic(cache, k);
   if (saved) { e.waitUntil(refresh(cache, k)); return saved; }
-  const res = await fetch(req);
-  if (res.ok) cache.put(k, res.clone()).catch(() => {}); // not waited for: a slow picture must not keep this helper busy
-  return res;
+  return fetchPic(e, req, cache, k);
+}
+
+// the saved copy: under the plain link, else a usable copy an older helper saved under a link with a ?query
+// (it stays there when moving it failed, e.g. with storage full)
+async function savedPic(cache, k) {
+  return (await cache.match(k)) || (await cache.matchAll(k, { ignoreSearch: true })).find(r => r.ok);
+}
+
+// a picture not saved yet: the whole picture from the network in PIC_MS at most (then saved), so a stalled
+// download can't keep this helper busy; out of time, the page gets an error
+async function fetchPic(e, req, cache, k) {
+  const stop = new AbortController(), timer = setTimeout(() => stop.abort(), PIC_MS);
+  try {
+    const res = await fetch(req, { signal: stop.signal });
+    if (res.type === "opaque") return res;
+    const pic = new Response(await res.blob(), res);
+    if (pic.ok) e.waitUntil(cache.put(k, pic.clone()).catch(() => {}));
+    return pic;
+  } catch {
+    return new Response("", { status: 504, statusText: "Picture download took too long" });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // a saved picture downloaded again, in PIC_MS at most (the whole picture, until it is saved). A stalled or

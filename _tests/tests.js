@@ -2805,6 +2805,57 @@ const tests = [
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);
   }],
+  ["Item 10d A picture not saved yet comes from the network in 5 s at most: an open window gets an error instead of waiting, and a waiting update takes over within that time once the game windows are closed", async () => {
+    const bad = [], res = {};
+    try {
+      const { A, reg, before } = await waitingUpdate();
+      // 1. the picture server holds its answer: the open window's request ends at the time limit
+      await shellNet("mode=hold&only=img/*&clear=1");
+      const t0 = performance.now();
+      let ended = null;
+      A.w.fetch("img/monsters/ash-knight.jpg").then(r => { ended = { status: r.status, ms: Math.round(performance.now() - t0) }; },
+        e => { ended = { error: e.name, ms: Math.round(performance.now() - t0) }; });
+      await until(() => ended, 8000, "").catch(() => {});
+      res.openWindow = ended || { endedWithin8000ms: false };
+      // 2. another picture not saved yet, then the player closes the game: b takes over once that download gives up
+      A.w.fetch("img/monsters/bog-leech-s.jpg").catch(() => {});
+      await untilAsync(async () => (await shellStatus()).seen.includes("img/monsters/bog-leech-s.jpg"), 3000);
+      const t1 = performance.now();
+      await close("A");
+      await until(() => reg.active && reg.active !== before && !reg.waiting, 9000, "").catch(() => {});
+      res.switchedAfterCloseMs = reg.active !== before ? Math.round(performance.now() - t1) : null;
+      await shellNet("mode=pass");
+      const o = res.openWindow;
+      if (!(o.status === 504 && o.ms >= 4500 && o.ms <= 6500)) bad.push(`open window: ${JSON.stringify(o)}`);
+      if (!(res.switchedAfterCloseMs !== null && res.switchedAfterCloseMs <= 7000)) bad.push(`switch after closing: ${res.switchedAfterCloseMs} ms`);
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Item 10e Storage full while older picture copies are moved to the plain link: they stay, and a usable one is still shown when the server fails", async () => {
+    const bad = [], res = {};
+    try {
+      const { reg, before } = await waitingUpdate(); // a in charge (window A open), b installed and waiting
+      // a picture an older helper saved under a link with a query
+      const img = await caches.open("rpg-img-v1");
+      await img.put(PIC("ash-drake") + "?v=1", new Response("old full", { status: 200, headers: { "Content-Type": "image/jpeg" } }));
+      // storage is full when b takes over (and tries to move that copy)
+      await shellNet("quota=1"); await wait(300);
+      await close("A");
+      await until(() => reg.active && reg.active !== before && !reg.waiting, 9000, "").catch(() => {});
+      res.switched = !!reg.active && reg.active !== before;
+      res.savedAfter = await savedPics();
+      // the picture server fails: the game still shows the saved picture
+      await shellNet("mode=503&only=img/*&clear=1");
+      const B = await openShell("B");
+      const r = await B.w.fetch("img/monsters/ash-drake.jpg").catch(() => null);
+      res.picture = { status: r ? r.status : null, body: r ? (await r.text()).slice(0, 12) : null };
+      if (!(res.switched && res.savedAfter.includes("ash-drake.jpg?v=1"))) bad.push(`after the switch: ${JSON.stringify(res)}`);
+      if (!(res.picture.status === 200 && res.picture.body === "old full")) bad.push(`picture: ${JSON.stringify(res.picture)}`);
+    } finally { await shellNet("quota=&mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();
