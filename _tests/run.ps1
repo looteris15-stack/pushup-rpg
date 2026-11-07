@@ -16,7 +16,7 @@ Copy-Item "$repo\_tests\*" "$root\_tests" -Recurse   # test page, tests and reco
 # the helper can install there (app\ has no icons, so it never installs for the other tests). Release "a" or
 # "b": every shell file carries its release mark, and a newer release's sw.js has its shell version raised.
 $script:release = ''
-function WriteRelease([string]$rel) {
+function WriteRelease([string]$rel, [bool]$bump = $true) {
     New-Item -ItemType Directory -Force "$root\swapp\icons" | Out-Null
     Get-ChildItem "$repo\app" -File | Copy-Item -Destination "$root\swapp" -Force
     Copy-Item "$repo\app\icons\*" "$root\swapp\icons" -Force
@@ -25,7 +25,7 @@ function WriteRelease([string]$rel) {
     [IO.File]::WriteAllText($f, ([IO.File]::ReadAllText($f) -replace '<head>', "<head>`n<meta name=`"release`" content=`"$rel`">"), $utf8)
     foreach ($n in 'game.js', 'core.js', 'data.js') { [IO.File]::AppendAllText("$root\swapp\$n", "`n;(globalThis.__release ||= {})[`"$n`"] = `"$rel`";`n", $utf8) }
     [IO.File]::AppendAllText("$root\swapp\style.css", "`n:root { --release: `"$rel`"; }`n", $utf8)
-    if ($rel -ne 'a') {
+    if ($rel -ne 'a' -and $bump) { # bump=0: the files change but sw.js doesn't (the release rule broken)
         $f = "$root\swapp\sw.js"
         $t = [regex]::Replace([IO.File]::ReadAllText($f), 'const (SHELL_V|V) = (\d+);', { param($m) "const $($m.Groups[1].Value) = $([int]$m.Groups[2].Value + 1);" })
         [IO.File]::WriteAllText($f, $t, $utf8)
@@ -86,7 +86,8 @@ try {
     # ---- the offline helper's own requests for its test copy (swapp\): run.ps1 attaches to each helper
     # (service worker) and answers them as the test page sets with /__shell/set?mode=..&only=..&release=..&clear=1:
     # mode pass (the server), hold (no answer until the mode changes), 503, or fail (as if offline); only = one
-    # file (e.g. core.js) or all; release = a or b (rewrites swapp\). /__shell/status lists the files asked for.
+    # file (e.g. core.js) or all; release = a or b (rewrites swapp\; with bump=0 b keeps a's sw.js).
+    # /__shell/status lists the files asked for.
     $script:shell = @{ mode = 'pass'; only = '' }
     $script:shellSeen = New-Object System.Collections.ArrayList
     $script:shellHeld = New-Object System.Collections.ArrayList
@@ -105,7 +106,7 @@ try {
         $u = $p.request.url
         if ($u -like '*/__shell/set*') {
             $q = Query $u
-            if ($q.release -and $q.release -ne $script:release) { WriteRelease $q.release }
+            if ($q.release -and $q.release -ne $script:release) { WriteRelease $q.release ($q.bump -ne '0') }
             if ($q.mode) { $script:shell = @{ mode = "$($q.mode)"; only = "$($q.only)" } }
             if ($q.clear -eq '1') { $script:shellSeen.Clear() }
             if ($script:shell.mode -ne 'hold') {

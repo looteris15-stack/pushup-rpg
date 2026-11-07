@@ -35,7 +35,7 @@ self.addEventListener("fetch", e => {
   if (url.origin === self.location.origin) {
     if (!url.pathname.startsWith(BASE) || url.pathname.includes("/api/")) return;
     if (url.pathname.startsWith(BASE + "img/")) e.respondWith(savedThenRefresh(e, req, IMG));
-    else if (shellFile(url)) e.respondWith(fromRelease(shellFile(url), req));
+    else if (shellFile(url)) e.respondWith(fromRelease(shellFile(url), req, e));
     // any other file here isn't part of a release: the network, as without this helper
   } else if (LIB_HOSTS.includes(url.host)) {
     e.respondWith(savedForever(req));
@@ -61,20 +61,48 @@ function shellFile(url) {
   return SHELL_FILES.includes(f) ? f : null;
 }
 
-// the saved file (a page keeps its own link, so launch flags like ?debug still work)
-async function fromRelease(file, req) {
-  return (await caches.match(new URL(file, self.location).href, { cacheName: SHELL })) || fromNetwork(req);
+const SHELL_URLS = SHELL_FILES.map(f => new URL(f, self.location).href);
+const shellVersion = name => +(/^rpg-shell-v(\d+)$/.exec(name) || [])[1] || 0;
+
+// the saved file (a page keeps its own link, so launch flags like ?debug still work), always from the
+// release its page was given at launch, so a page never gets files from two releases
+const launches = new Map(); // page (client id) -> its release (cache name, or null = the network)
+async function fromRelease(file, req, e) {
+  const page = e.resultingClientId || e.clientId;
+  let name = page ? launches.get(page) : undefined;
+  if (name === undefined) {
+    name = await wholeRelease();
+    if (page) { launches.set(page, name); if (launches.size > 20) launches.delete(launches.keys().next().value); }
+  }
+  if (!name) return fromNetwork(req);
+  return (await caches.match(new URL(file, self.location).href, { cacheName: name })) || unavailable();
 }
 
-// not in the saved release (rare: storage cleared): the network, for at most MISS_MS. Nothing is saved
-// from here, so a release is never mixed with files from another one.
+// The saved release to use: this helper's own if it has every file, else the newest other saved one that
+// has every file (an update waiting for the game windows to close), else none: then all shell files come
+// from the network (one server, one release). A file missing from a release is never filled in from
+// another release or from the network.
+async function wholeRelease() {
+  const names = (await caches.keys()).filter(shellVersion)
+    .sort((a, b) => (b === SHELL) - (a === SHELL) || shellVersion(b) - shellVersion(a));
+  for (const name of names) {
+    const have = new Set((await (await caches.open(name)).keys()).map(r => r.url));
+    if (SHELL_URLS.every(u => have.has(u))) return name;
+  }
+  return null;
+}
+
+const unavailable = () => new Response("Pushup RPG: this file could not be loaded (no connection).", { status: 504, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+
+// no whole release saved (rare: storage cleared): the network, for at most MISS_MS. Nothing is saved from
+// here, so a release is never mixed with files from another one.
 async function fromNetwork(req) {
   const stop = new AbortController(), timer = setTimeout(() => stop.abort(), MISS_MS);
   try {
     const res = await fetch(req.url, { cache: "no-cache", credentials: "same-origin", signal: stop.signal });
     return new Response(await res.blob(), res);
   } catch {
-    return new Response("Pushup RPG: this file could not be loaded (no connection).", { status: 504, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    return unavailable();
   } finally {
     clearTimeout(timer);
   }

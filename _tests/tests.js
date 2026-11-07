@@ -403,6 +403,8 @@ const shellStatus = async () => (await fetch("/__shell/status")).json();
 // no helper and none of its saved files (before and after each Item 9 test, so other tests never meet them)
 async function clearHelper() {
   for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+  // really gone (a new visit while it is still going would bring it back, with any update it had waiting)
+  for (let i = 0; i < 60 && (await navigator.serviceWorker.getRegistrations()).length; i++) await wait(50);
   for (const k of await caches.keys()) if (k.startsWith("rpg-")) await caches.delete(k);
 }
 const swReg = () => navigator.serviceWorker.getRegistration(new URL("../swapp/", location.href).href);
@@ -2549,6 +2551,50 @@ const tests = [
     for (const f of list) if (!(await fetch(`../swapp/${f}`, { method: "HEAD" })).ok) notThere.push(f);
     check(!missing.length && !notThere.length, `loaded at start but not in the release list: ${missing.join(", ") || "-"}; listed but not on the server: ${notThere.join(", ") || "-"}`);
     return `release list: ${list.join(", ")}`;
+  }],
+  ["Item 9e A file missing from the saved release while an update waits (network on or off), or while the server already has the next release: each launch uses one whole release", async () => {
+    const bad = [], res = {};
+    const oneRelease = r => !!r && typeof r === "object" && !!r.html && allFrom(r, r.html);
+    const dropData = async name => { const c = await caches.open(name); for (const r of await c.keys()) if (new URL(r.url).pathname.endsWith("/data.js")) await c.delete(r); };
+    const launch = async (name, extra = {}) => {
+      const g = await openShell("B");
+      const asked = (await shellStatus()).seen.filter(f => !f.startsWith("img/"));
+      const r = res[name] = { readyMs: g.ready, release: g.release, asked, ...extra };
+      await close("B");
+      if (!(r.readyMs !== null && oneRelease(r.release))) bad.push(`${name}: ${JSON.stringify(r)}`);
+      return r;
+    };
+    try {
+      // 1. nothing to install: the server already has release b's files but the same sw.js (the release rule
+      //    broken), so the saved release a is incomplete and no other release is saved. (First: after a helper
+      //    with an update waiting was unregistered, Edge replaced the next new helper during a launch.)
+      await reset(); await clearHelper(); await shellNet("mode=pass&release=a&clear=1");
+      const A1 = await installShell("A");
+      const reg1 = await swReg(), active1 = reg1.active;
+      await dropData((await caches.keys()).find(k => k.startsWith("rpg-shell-")));
+      await shellNet("release=b&bump=0&mode=pass&clear=1");
+      await launch("server on b with the same sw.js");
+      res.after1 = { sameHelper: reg1.active === active1, waiting: !!reg1.waiting, openWindow: releaseOf(A1.w, A1.d) };
+      if (!(res.after1.sameHelper && !res.after1.waiting && allFrom(res.after1.openWindow, "a"))) bad.push(`case 1 setup or open window: ${JSON.stringify(res.after1)}`);
+      // 2-3. release a in use (window A open), release b installed and waiting; then data.js goes missing from a
+      await shellNet("mode=pass&release=a&clear=1"); await reset(); await clearHelper();
+      const A = await installShell("A");
+      const reg = await swReg();
+      const aName = (await caches.keys()).find(k => k.startsWith("rpg-shell-"));
+      await shellNet("release=b&mode=pass&clear=1");
+      await reg.update().catch(() => {});
+      await until(() => reg.waiting, 10000, "").catch(() => {});
+      check(reg.waiting, "test setup: release b isn't waiting");
+      await dropData(aName);
+      for (const mode of ["pass", "fail"]) {
+        await shellNet(`mode=${mode}&clear=1`);
+        await launch(`b waiting, network ${mode}`, { stillWaiting: !!reg.waiting });
+      }
+      res.openWindow = releaseOf(A.w, A.d);
+      if (!allFrom(res.openWindow, "a")) bad.push(`open window: ${JSON.stringify(res.openWindow)}`);
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
