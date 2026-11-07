@@ -56,7 +56,21 @@ async function load() {
   const v = d.querySelector("#video"), src = Object.getOwnPropertyDescriptor(w.HTMLMediaElement.prototype, "srcObject");
   Object.defineProperty(v, "srcObject", { configurable: true, get() { return src.get.call(this); },
     set(s) { if (s) ins.attach.push({ t: w.performance.now(), frames: ins.frames }); src.set.call(this, s); } });
+  // camera frames really shown (requestVideoFrameCallback): ins.pf = the latest frame's number
+  ins.pf = 0; ins.vframes = [];
+  if (v.requestVideoFrameCallback) {
+    const onVf = (now, meta) => { ins.pf = meta.presentedFrames; if (ins.vframes.length < 20000) ins.vframes.push(w.performance.now()); v.requestVideoFrameCallback(onVf); };
+    v.requestVideoFrameCallback(onVf);
+  }
+  // the tracker's frame loop: how long each run takes
+  ins.loops = [];
+  const raf = w.requestAnimationFrame.bind(w);
+  w.requestAnimationFrame = cb => raf(cb.name !== "loop" ? cb : ts => {
+    const t0 = w.performance.now();
+    try { cb(ts); } finally { if (ins.loops.length < 20000) ins.loops.push({ t: t0, ms: w.performance.now() - t0 }); }
+  });
   // inference timing: once the game has the library, wrap its detectForVideo (same module in this window)
+  ins.calls = [];
   (async () => {
     await until(() => w.performance.getEntriesByName(LIB).length, 300000, "the library");
     const { PoseLandmarker } = await w.eval(`import(${JSON.stringify(LIB)})`);
@@ -64,10 +78,80 @@ async function load() {
     PoseLandmarker.prototype.detectForVideo = function (...a) {
       const t0 = w.performance.now(), f = ins.frames;
       try { return det.apply(this, a); }
-      finally { if (ins.infer.length < 400) ins.infer.push({ t: t0, ms: w.performance.now() - t0, frames: f }); }
+      finally {
+        const ms = w.performance.now() - t0;
+        if (ins.infer.length < 400) ins.infer.push({ t: t0, ms, frames: f });
+        if (ins.calls.length < 20000) ins.calls.push({ t: t0, ms, pf: ins.pf, ts: a[1] });
+      }
     };
   })().catch(e => { ins.patchError = String(e); });
   return { w, d, ins };
+}
+
+// ---- loop mode: detector calls, video frames and loop runs over a time window
+const q = (a, p) => a.length ? +a[Math.min(a.length - 1, Math.floor(a.length * p))].toFixed(1) : null;
+function stats({ ins }, t0, t1) {
+  const secs = (t1 - t0) / 1000;
+  const calls = ins.calls.filter(c => c.t >= t0 && c.t < t1);
+  const iv = calls.slice(1).map((c, i) => c.t - calls[i].t).sort((a, b) => a - b);
+  const loops = ins.loops.filter(l => l.t >= t0 && l.t < t1).map(l => l.ms).sort((a, b) => a - b);
+  const inf = calls.map(c => c.ms).sort((a, b) => a - b);
+  let ordered = true;
+  for (let i = 1; i < calls.length; i++) if (!(calls[i].ts > calls[i - 1].ts)) ordered = false;
+  return {
+    secs: +secs.toFixed(1), detectorCalls: calls.length, callsPerSec: +(calls.length / secs).toFixed(1),
+    cameraFramesPerSec: +(ins.vframes.filter(x => x >= t0 && x < t1).length / secs).toFixed(1),
+    callsOnRepeatedFrame: calls.slice(1).filter((c, i) => c.pf === calls[i].pf).length,
+    intervalMedianMs: q(iv, 0.5), intervalP95Ms: q(iv, 0.95), intervalMinMs: q(iv, 0),
+    inferMedianMs: q(inf, 0.5), inferP95Ms: q(inf, 0.95),
+    loopCallbacks: loops.length, loopPerSec: +(loops.length / secs).toFixed(1), loopP95Ms: q(loops, 0.95), loopMaxMs: q(loops, 1),
+    timestampsIncreasing: ordered,
+  };
+}
+async function startAndWait({ w, d }, where) {
+  if (where === "mine") {
+    d.querySelector('[data-action="goto"][data-to="dungeon"]').click();
+    await until(() => d.querySelector('[data-action="enterFloor"]'), 3000, "the mine");
+    d.querySelector('[data-action="enterFloor"]').click();
+  } else {
+    d.querySelector('[data-action="goto"][data-to="map"]').click();
+    await until(() => d.querySelector('.mrow[data-id="field-mouse"]'), 3000, "the map");
+    d.querySelector('.mrow[data-id="field-mouse"]').click();
+    await until(() => [...d.querySelectorAll("#modal button")].find(x => /fight/i.test(x.textContent) && !x.disabled), 3000, "the Fight button");
+    [...d.querySelectorAll("#modal button")].find(x => /fight/i.test(x.textContent) && !x.disabled).click();
+  }
+  await until(() => w.PushupRPG.fight, 120000, "the fight to be ready");
+}
+async function loopBench(g, activeMs) {
+  const { w, d, ins } = g;
+  window.__stage = "warm-up start"; await fight(g); // first start (cold), then Back: the model is ready after this
+  // 1. a fight being tracked
+  window.__stage = "active"; await startAndWait(g, "map");
+  await wait(1000);
+  let t0 = w.performance.now(); await wait(activeMs);
+  const active = stats(g, t0, w.performance.now());
+  d.querySelector("#btnFlee").click(); await wait(800);
+  // 2. a mine-room break (90 s): room 1 is won with 5 reps from the debug API
+  window.__stage = "break"; await startAndWait(g, "mine");
+  await wait(500);
+  // the exact moment the break ends: the game hides the break panel as it sets up the next room
+  const panel = d.querySelector("#restPanel"), hid = Object.getOwnPropertyDescriptor(w.HTMLElement.prototype, "hidden");
+  let breakEnd = null, shown = false;
+  Object.defineProperty(panel, "hidden", { configurable: true, get() { return hid.get.call(this); },
+    set(x) { if (!x) shown = true; else if (shown && breakEnd === null) breakEnd = w.performance.now(); hid.set.call(this, x); } });
+  for (let i = 0; i < 6 && !w.PushupRPG.rest; i++) { w.PushupRPG.repEvent({ type: "rep", count: 1, depth: true, downSecs: 3 }); await wait(60); }
+  await until(() => w.PushupRPG.rest, 3000, "the break");
+  const v = d.querySelector("#video"), b0 = w.performance.now(), vt0 = v.currentTime, clock0 = d.querySelector("#restTime").textContent;
+  const locks0 = ins.lock.length;
+  await until(() => !w.PushupRPG.rest, 120000, "the break to end");
+  const b1 = breakEnd ?? w.performance.now();
+  const brk = { ...stats(g, b0, b1), countdownFrom: clock0, previewAdvancedSecs: +(v.currentTime - vt0).toFixed(1), previewLive: !!v.srcObject && v.srcObject.getTracks().some(t => t.readyState === "live"),
+    lockAnswersDuring: ins.lock.length - locks0 };
+  await wait(1500);
+  const firstAfter = ins.calls.find(c => c.t >= b1);
+  const after = { nextRoomReady: !!w.PushupRPG.fight, firstCallAfterBreakMs: firstAfter ? Math.round(firstAfter.t - b1) : null, ...stats(g, b1 + 300, w.performance.now()) };
+  d.querySelector("#btnFlee").click(); await wait(500);
+  return { delegate: w.PushupRPG.delegate, active, brk, after };
 }
 
 // one Fight tap (Field Mouse) until the fight is ready; then 1.5 s of tracking, then Back
@@ -117,6 +201,11 @@ try {
   window.__stage = "loading the game";
   let g = await load();
   window.__g = g;
+  const params = new URLSearchParams(location.search);
+  if (params.get("mode") === "loop") {
+    window.__bench = { model: MODEL, mode: "loop", ...(await loopBench(g, +(params.get("secs") || 15) * 1000)) };
+    throw null;
+  }
   window.__stage = "cold fight";
   const cold = await fight(g);          // nothing downloaded yet (fresh browser profile)
   window.__stage = "warm fight";
@@ -127,7 +216,7 @@ try {
   window.__stage = "cached fight";
   const cached = await fight(g);
   window.__bench = { model: MODEL, cold, warm, cached };
-} catch (e) { window.__bench = { error: String(e && e.stack || e) }; }
+} catch (e) { if (e !== null) window.__bench = { error: String(e && e.stack || e) }; }
 log.textContent = JSON.stringify(window.__bench, null, 1);
 window.__benchDone = true;
 </script>

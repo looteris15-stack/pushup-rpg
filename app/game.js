@@ -1507,7 +1507,9 @@ function resultModal({ tone, eyebrow, title, lines, buttons }) {
 function startRest(o) {
   rest = { endsAt: performance.now() + o.sec * 1000, beeped: 0, onDone: o.onDone, quitReason: o.quitReason };
   beat(); // a break counts as busy too: no other window may take over the run
-  // reps don't count in a break: drop a rep in progress now (the next fight or round starts fresh anyway)
+  // no body tracking in a break (the camera picture and the screen lock stay on), and a rep in progress
+  // is dropped now (the next fight or round starts fresh anyway)
+  tracker.hold(true);
   tracker.counter.reset();
   resetDepthMeter();
   $("restTitle").textContent = o.title;
@@ -1534,6 +1536,7 @@ function endRest() {
   const { onDone, endsAt } = rest;
   rest = null;
   onDone();
+  tracker.hold(false); // the next room or round (set up fresh by onDone) is tracked again from its first frame
   // a break that ran out while you were away: the start timer counts from the end of the break
   if (fight && fight.timedStart && !fight.started) fight.waitSince = Math.min(fight.waitSince, endsAt);
 }

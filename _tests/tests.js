@@ -85,8 +85,18 @@ async function open(id) {
     },
     async tapEnterFloor() { await g.goto("dungeon"); d.querySelector('[data-action="enterFloor"]').click(); await wait(300); },
     async tapContinue() { await g.goto("dungeon"); d.querySelector('[data-action="continueRun"]').click(); await wait(300); },
-    // a fake camera picture source (its tracks can be checked for "ended")
-    fakeStream() { const c = d.createElement("canvas"); c.width = 64; c.height = 48; c.getContext("2d").fillRect(0, 0, 8, 8); return c.captureStream(5); },
+    // a fake camera picture source (its tracks can be checked for "ended"): a small 4:3 picture redrawn
+    // 30 times a second, so it delivers real new frames like a camera (a still canvas sends none)
+    fakeStream() {
+      const c = d.createElement("canvas"); c.width = 64; c.height = 48;
+      const x = c.getContext("2d"), s = c.captureStream(30);
+      let k = 0;
+      const iv = w.setInterval(() => {
+        if (s.getVideoTracks().every(t => t.readyState === "ended")) { w.clearInterval(iv); return; }
+        x.fillStyle = k++ % 2 ? "#000" : "#fff"; x.fillRect(0, 0, 8, 8);
+      }, 33);
+      return s;
+    },
     // the browser's camera question stays open until answer() is called; answer() returns the stream it gave
     slowCamera() {
       let give;
@@ -379,6 +389,109 @@ function slowModelNet(g, ms = 400, n = 1000) {
   return net;
 }
 const FULL = { ...BASE, settings: { ...BASE.settings, model: "full" } };
+// ---- Item 8: real body points through the tracker's own frame path
+// 33 MediaPipe pose points for a side view (left side to the camera) in plank: body and legs straight and
+// level, arms at this elbow angle. They are laid out in a 4:3 picture, so any 4:3 video gives these angles.
+function plankPose(elbow) {
+  const W = 640, H = 480, P = (x, y, visibility = 0.99) => ({ x: x / W, y: y / H, z: 0, visibility });
+  const lm = Array.from({ length: 33 }, () => P(320, 240, 0.1)); // the far side: hardly visible
+  const r = elbow * Math.PI / 180, el = [200, 260];               // upper arm straight down from the shoulder
+  Object.assign(lm, { 11: P(200, 200), 13: P(...el), 15: P(el[0] + 60 * Math.sin(r), el[1] - 60 * Math.cos(r)),
+    23: P(350, 200), 25: P(425, 200), 27: P(500, 200) });
+  return lm;
+}
+// a fake model showing what the test plays: pose.queue = elbow angles, one per inference; when it is empty,
+// pose.e is shown (null = nobody seen). Each call is recorded in pose.calls ({ at, ts }).
+function poseModel(pose, w) {
+  pose.calls ||= []; pose.queue ||= [];
+  return { detectForVideo(video, ts) {
+    if (pose.queue.length) pose.e = pose.queue.shift();
+    pose.calls.push({ at: w.performance.now(), ts, ready: !!w.PushupRPG?.fight });
+    return { landmarks: pose.e == null ? [] : [plankPose(pose.e)] };
+  }, close() {} };
+}
+// one clean rep, as elbow angles one inference apart: from straight arms down to the bottom and up again
+const ONE_REP = [168, 160, 150, 140, 125, 110, 95, 80, 68, 60, 56, 55, 55, 58, 70, 90, 115, 140, 160, 168, 170, 170, 170, 170];
+// counts the pose drawings on the tracker's overlay (each drawn skeleton strokes at least once)
+function countDrawing(g) {
+  const ctx = g.d.querySelector("#overlay")?.getContext("2d") || g.d.querySelector("canvas").getContext("2d");
+  const n = { strokes: 0 }, stroke = ctx.stroke.bind(ctx);
+  ctx.stroke = (...a) => { n.strokes++; return stroke(...a); };
+  return n;
+}
+// counts the rep counter's updates (the tracker calls counter.update once per tracked frame)
+function countUpdates(g) {
+  const c = g.api.counter, n = { updates: 0 }, up = c.update;
+  c.update = (...a) => { n.updates++; return up.apply(c, a); };
+  return n;
+}
+// Item 8: a second tracker (from the game's own core.js) on a simulated clock: camera frames at the given
+// times (with requestVideoFrameCallback, like a real camera), screen frames at hz, performance.now on the
+// same clock. feed: [{ t: ms, e: elbow angle or null }]. Returns the detector calls and counter events.
+async function simTracker(g, { hz = 60, feed, stallAt = -1, stallMs = 0 }) {
+  const { w, d } = g;
+  const core = await w.eval(`import(${JSON.stringify(new URL("core.js", w.location.href).href)})`);
+  const sim = { t: w.performance.now(), raf: new Map(), rafId: 0, vfc: null, fi: -1, calls: [], events: [], presented: 0 };
+  const base = sim.t;
+  w.performance.now = () => sim.t;
+  w.requestAnimationFrame = cb => { const id = ++sim.rafId; sim.raf.set(id, cb); return id; };
+  w.cancelAnimationFrame = id => sim.raf.delete(id);
+  const video = d.createElement("video"), canvas = d.createElement("canvas"), frame = d.createElement("div");
+  Object.defineProperties(video, {
+    currentTime: { configurable: true, get: () => (sim.t - base) / 1000 }, // a live stream's clock never stops
+    readyState: { configurable: true, get: () => 4 },
+    videoWidth: { configurable: true, get: () => 640 }, videoHeight: { configurable: true, get: () => 480 },
+  });
+  video.requestVideoFrameCallback = cb => { sim.vfc = cb; return 1; };
+  const tr = core.createTracker({ video, canvas, frame, getCfg: COUNTER_CFG,
+    onEvent: ev => sim.events.push({ ...ev, at: sim.t - base }), onFrame: () => {} });
+  g.api.hooks.setModelLoader(async () => ({ lm: { detectForVideo(v, ts) {
+    sim.calls.push({ at: sim.t - base, ts, fi: sim.fi });
+    const f = feed[sim.fi];
+    return { landmarks: f && f.e != null ? [plankPose(f.e)] : [] };
+  }, close() {} }, used: "GPU" }));
+  g.fastCamera(); g.fakeWakeLock(false);
+  const step = 1000 / hz;
+  let nextRaf = sim.t + step, nf = 0;
+  const advance = until => { // runs the clock to `until` (ms from base), delivering camera and screen frames in order
+    while (true) {
+      const nextFeed = nf < feed.length ? base + feed[nf].t : Infinity;
+      const next = Math.min(nextRaf, nextFeed);
+      if (next > base + until) { sim.t = base + until; return; }
+      sim.t = next;
+      if (next === nextFeed) {
+        sim.fi = nf++; sim.presented++;
+        const cb = sim.vfc; sim.vfc = null; if (cb) cb(sim.t, { presentedFrames: sim.presented, mediaTime: feed[sim.fi].t / 1000 });
+      } else {
+        nextRaf += step;
+        if (stallAt >= 0 && sim.t - base >= stallAt && stallMs) { nextRaf += stallMs; stallMs = 0; } // the page was busy
+        const cbs = [...sim.raf.values()]; sim.raf.clear();
+        for (const cb of cbs) cb(sim.t);
+      }
+    }
+  };
+  // start it (its first frame is the readiness check), running the clock while the start waits
+  advance(1); // the first camera frame is there before the start
+  let ready = false, err = null;
+  tr.startCamera("user", "lite").then(() => { ready = true; }, e => { err = e; });
+  for (let i = 0; i < 400 && !ready && !err; i++) { advance(sim.t - base + step); await wait(5); }
+  check(ready, `test setup: the simulated tracker didn't start (${err ? err.message : "timed out"})`);
+  const readyAt = sim.t - base;
+  return {
+    sim, tr, readyAt, advance,
+    run(toMs) { advance(toMs); },
+    stop() { tr.stop(); },
+    stats(fromMs, toMs) {
+      const c = sim.calls.filter(x => x.at >= fromMs && x.at < toMs), iv = c.slice(1).map((x, i) => x.at - c[i].at);
+      const fis = c.map(x => x.fi);
+      let increasing = true; for (let i = 1; i < c.length; i++) if (!(c[i].ts > c[i - 1].ts)) increasing = false;
+      return { calls: c.length, perSec: +(c.length / ((toMs - fromMs) / 1000)).toFixed(1), minIntervalMs: iv.length ? +Math.min(...iv).toFixed(1) : null,
+        repeatedFrames: fis.length - new Set(fis).size, timestampsIncreasing: increasing };
+    },
+  };
+}
+// a feed of camera frames at fps for ms, all showing elbow angle e
+const steadyFeed = (fps, ms, e = 170) => Array.from({ length: Math.floor(ms * fps / 1000) }, (_, i) => ({ t: i * 1000 / fps, e }));
 // ---- sound: the base save has sound off; this one has it on (voice stays off)
 const SOUND_ON = { ...BASE, settings: { ...BASE.settings, sound: true } };
 // does the audio engine's clock still move (it stops while the engine sleeps)?
@@ -2021,6 +2134,181 @@ const tests = [
     if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
     check(!bad.length, bad.join(" || "));
     return `${JSON.stringify(res)}; retry: ${JSON.stringify(retry)}`;
+  }],
+  // ---------------- Item 8 (audit finding #2): no body tracking during breaks; at most 30 inferences a second
+  ["Item 8a Mine-room and boss-round breaks: from the frame that ends the set, no inference, counting or drawing; preview, lock and countdown stay; hidden and back stays paused; quitting lets go", async () => {
+    const bad = [], notes = [];
+    for (const where of ["mine", "round"]) {
+      await reset(where === "round" ? { ...BASE, unlockedZones: 7 } : BASE);
+      const A = await open("A");
+      await skipWarmUp(A);
+      A.api.strictCamera = true;
+      const cam = {}, pose = { e: 170 };
+      A.camera(cam);
+      A.api.hooks.setModelLoader(async () => ({ lm: poseModel(pose, A.w), used: "GPU" }));
+      const wl = A.fakeWakeLock(false), loop = A.countLoop();
+      if (where === "mine") await A.enterFloor(); else await A.fightMonster("ash-drake");
+      check(A.fight && !A.fight.over, `${where}: test setup: the fight didn't start`);
+      const need = where === "mine" ? A.fight.total : A.fight.rounds[0];
+      await A.reps(need - 1); // all but the last rep from the debug button
+      // the last rep comes through the camera frames; the break starts inside that frame
+      const ups = countUpdates(A), drawn = countDrawing(A), panel = A.d.querySelector("#restPanel"), v = A.d.querySelector("#video");
+      const hid = Object.getOwnPropertyDescriptor(A.w.HTMLElement.prototype, "hidden");
+      let at = null;
+      Object.defineProperty(panel, "hidden", { configurable: true, get() { return hid.get.call(this); },
+        set(x) { if (!x && !at) at = { calls: pose.calls.length, updates: ups.updates, strokes: drawn.strokes, loopRuns: loop.runs }; hid.set.call(this, x); } });
+      pose.queue.push(...ONE_REP);
+      await until(() => A.api.rest, 4000, "the break").catch(() => {});
+      if (!A.api.rest || !at) { bad.push(`${where}: test setup: the last rep didn't start the break`); continue; }
+      const clock0 = A.text("#restTime"), ct0 = v.currentTime;
+      await wait(1500);
+      const since = () => ({ calls: pose.calls.length - at.calls, updates: ups.updates - at.updates, strokes: drawn.strokes - at.strokes, loopRuns: loop.runs - at.loopRuns });
+      const during = { ...since(), preview: liveTracks([A_video(A.d)]) === 1 && v.currentTime > ct0 && !v.paused, locks: heldLocks(wl),
+        countdown: `${clock0} -> ${A.text("#restTime")}`, fightNow: !!A.d.querySelector("#btnFightNow") && !A.d.querySelector("#btnFightNow").closest("[hidden]") };
+      // a short look away and back during the break: the camera comes back, tracking stays off
+      const s1 = A_video(A.d);
+      A.setVisible(false); await wait(200); A.setVisible(true); await wait(700);
+      const back = { ...since(), freshPreview: !!A_video(A.d) && A_video(A.d) !== s1 && liveTracks([A_video(A.d)]) === 1, locks: heldLocks(wl), stillBreak: !!A.api.rest };
+      // quit during the break: camera and lock let go
+      const q = A.d.querySelector("#btnQuitRun"); q.click(); await wait(80); q.click(); await wait(400);
+      const r0 = loop.runs; await wait(300);
+      const quit = { liveTracks: liveTracks(cam.streams), locks: heldLocks(wl), trackerRunning: A.api.trackerRunning, loopRuns: loop.runs - r0 };
+      const zero = x => !x.calls && !x.updates && !x.strokes && !x.loopRuns;
+      if (!(zero(during) && during.preview && during.locks === 1 && during.countdown.split(" -> ")[0] !== during.countdown.split(" -> ")[1] && during.fightNow))
+        bad.push(`${where} break: ${JSON.stringify(during)}`);
+      if (!(zero(back) && back.freshPreview && back.locks === 1 && back.stillBreak)) bad.push(`${where} hidden and back: ${JSON.stringify(back)}`);
+      if (!(!quit.liveTracks && !quit.locks && !quit.trackerRunning && !quit.loopRuns)) bad.push(`${where} quit: ${JSON.stringify(quit)}`);
+      notes.push(`${where}: break ${JSON.stringify(during)}; back ${JSON.stringify(back)}; quit ${JSON.stringify(quit)}`);
+      if (A.errors.length) bad.push(`${where} errors: ` + A.errors.join(" | "));
+    }
+    check(!bad.length, bad.join(" || "));
+    return notes.join("; ");
+  }],
+  ["Item 8b After a break (Fight now, or time up): one loop again, the first frame tracked at once, the first rep counts once; start window, counter and HUD fresh", async () => {
+    const bad = [], notes = [];
+    for (const [where, how] of [["mine", "fight now"], ["round", "time up"]]) {
+      await reset(where === "round" ? { ...BASE, unlockedZones: 7 } : BASE);
+      const A = await open("A");
+      await skipWarmUp(A);
+      A.api.strictCamera = true;
+      const cam = {}, pose = { e: 170 };
+      A.camera(cam);
+      A.api.hooks.setModelLoader(async () => ({ lm: poseModel(pose, A.w), used: "GPU" }));
+      A.fakeWakeLock(false);
+      const loop = A.countLoop();
+      if (where === "mine") await A.enterFloor(); else await A.fightMonster("ash-drake");
+      check(A.fight && !A.fight.over, `${where}: test setup: the fight didn't start`);
+      const need = where === "mine" ? A.fight.total : A.fight.rounds[0];
+      await A.reps(need - 1);
+      // halfway down a rep when the last hit lands: that part-rep must not carry over the break
+      pose.queue.push(...ONE_REP.slice(0, 9));
+      await wait(600);
+      A.rep();
+      await until(() => A.api.rest, 3000, "the break").catch(() => {});
+      if (!A.api.rest) { bad.push(`${where}: test setup: no break`); continue; }
+      pose.e = 170; // in plank, arms straight, as the break ends
+      await wait(400);
+      // the moment the game really ends the break (it hides the break panel as it sets up the next set)
+      const panel = A.d.querySelector("#restPanel"), hid = Object.getOwnPropertyDescriptor(A.w.HTMLElement.prototype, "hidden");
+      let endAt = null;
+      Object.defineProperty(panel, "hidden", { configurable: true, get() { return hid.get.call(this); },
+        set(x) { if (x && endAt === null) endAt = A.w.performance.now(); hid.set.call(this, x); } });
+      const st0 = loop.starts, c0 = pose.calls.length, tEnd = A.w.performance.now();
+      if (how === "fight now") A.d.querySelector("#btnFightNow").click(); else A.api.skipRest();
+      await until(() => !A.api.rest && A.fight && !A.fight.over, 2000, "the next set").catch(() => {});
+      await wait(150);
+      const f = A.fight, first = endAt === null ? null : pose.calls.slice(c0).find(c => c.at >= endAt);
+      const resumed = { nextSet: !!f && !A.api.rest, loopStarts: loop.starts - st0, breakEndedAfterMs: endAt === null ? null : Math.round(endAt - tEnd),
+        firstFrameAfterEndMs: first ? Math.round(first.at - endAt) : null,
+        timedStart: !!f && f.timedStart && !f.started, windowFromEndMs: f ? Math.round(f.waitSince - tEnd) : null,
+        counter: A.api.counter.state, partRep: keptFrames(A), downTime: A.text("#downTime"), banner: A.text("#banner") };
+      await wait(250); // the game redraws the "Attack in" timer every 200 ms
+      resumed.threat = A.text("#threatText");
+      // the first rep after the break
+      const reps0 = A.fight ? A.fight.reps : 0;
+      pose.queue.push(...ONE_REP);
+      await until(() => A.fight && A.fight.reps > reps0, 4000, "the first rep").catch(() => {});
+      await wait(600);
+      const rep = { reps: A.fight ? A.fight.reps - reps0 : null, banner: A.text("#banner") };
+      const ok = resumed.nextSet && resumed.loopStarts === 1 && resumed.firstFrameAfterEndMs !== null && resumed.firstFrameAfterEndMs <= 50
+        && resumed.timedStart && resumed.windowFromEndMs !== null && resumed.windowFromEndMs >= -50 && resumed.windowFromEndMs <= 300 && /(29|30) s/.test(resumed.threat)
+        && resumed.partRep === 0 && resumed.downTime === "0.0 s" && !/no rep|keep your body|lost sight/i.test(resumed.banner)
+        && rep.reps === 1 && !/no rep/i.test(rep.banner);
+      if (!ok) bad.push(`${where} (${how}): ${JSON.stringify(resumed)}; first rep ${JSON.stringify(rep)}`);
+      notes.push(`${where} (${how}): ${JSON.stringify(resumed)}; first rep ${JSON.stringify(rep)}`);
+      if (A.errors.length) bad.push(`${where} errors: ` + A.errors.join(" | "));
+    }
+    check(!bad.length, bad.join(" || "));
+    return notes.join("; ");
+  }],
+  ["Item 8c At most 30 inferences a second, each on a new camera frame: 60 fps camera (60 and 120 Hz screens), every frame of a 30 fps camera, no burst after a stall", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    const res = {}, bad = [];
+    for (const [name, fps, hz] of [["60fps@60Hz", 60, 60], ["60fps@120Hz", 60, 120], ["30fps@60Hz", 30, 60]]) {
+      const s = await simTracker(A, { hz, feed: steadyFeed(fps, 11000) });
+      s.run(10500);
+      const st = s.stats(500, 10500);
+      res[name] = { firstFrameBeforeReady: s.sim.calls.length > 0 && s.sim.calls[0].at <= s.readyAt, cameraFramesPerSec: fps, ...st };
+      s.stop();
+      const r = res[name];
+      if (!(r.firstFrameBeforeReady && r.perSec >= 29 && r.perSec <= 30.5 && r.minIntervalMs >= 30 && !r.repeatedFrames && r.timestampsIncreasing)) bad.push(`${name}: ${JSON.stringify(r)}`);
+    }
+    // the page busy for 250 ms, or one screen frame late (60 fps camera, 60 Hz screen): afterwards the same
+    // pace, no quick catch-up
+    for (const stallMs of [250, 17]) {
+      const s = await simTracker(A, { hz: 60, feed: steadyFeed(60, 6000), stallAt: 3000, stallMs });
+      s.run(5500);
+      const after = s.sim.calls.filter(c => c.at >= 3000);
+      const iv = after.slice(1).map((c, i) => c.at - after[i].at);
+      const r = res[`stall${stallMs}ms`] = { minIntervalAfterMs: iv.length ? +Math.min(...iv).toFixed(1) : null,
+        callsInSecondAfter: s.sim.calls.filter(c => c.at >= 3000 + stallMs && c.at < 4000 + stallMs).length };
+      s.stop();
+      if (!(r.minIntervalAfterMs >= 30 && r.callsInSecondAfter <= 31)) bad.push(`stall ${stallMs} ms: ${JSON.stringify(r)}`);
+    }
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
+  }],
+  ["Item 8d Through the paced frame path (60 fps camera): the recorded reps, slow-rep times and the 300 ms gap rule stay the same", async () => {
+    await reset();
+    const A = await open("A");
+    await skipWarmUp(A);
+    // what this same path gave before the pacing (measured on 3c8412f: every screen frame tracked). It differs
+    // a little from the counter-only replay in #5d, because the tracker smooths the angles.
+    const BEFORE = {
+      normal: [[29685, 0.8], [31502, 0.6], [33602, 0.7], [35635, 0.6], [37719, 0.5]],
+      slow: [[25465, 1.8], [33465, 2.5], [53415, 4.3], [58949, 2.0], [63982, 1.3]],
+    };
+    const res = {}, bad = [];
+    for (const name of ["normal", "slow"]) {
+      const fx = await (await fetch(`fixtures/${name}.json`)).json();
+      const t0 = fx.frames[0][0], end = fx.frames.at(-1)[0] - t0, before = BEFORE[name];
+      const s = await simTracker(A, { hz: 60, feed: fx.frames.map(([t, e]) => ({ t: t - t0, e })) });
+      s.run(end + 500);
+      const reps = s.sim.events.filter(e => e.type === "rep").map(e => [Math.round(e.at + t0), e.downSecs]);
+      const st = s.stats(s.readyAt, end);
+      s.stop();
+      res[name] = { reps, before, inferencesPerSec: st.perSec, repeatedFrames: st.repeatedFrames };
+      // same reps (within a frame or two), same slow-rep times (within 0.15 s) and the same verdict against 2 s
+      const same = reps.length === before.length && reps.every(([t, down], i) => Math.abs(t - before[i][0]) <= 60
+        && Math.abs(down - before[i][1]) <= 0.15 && (down >= 2) === (before[i][1] >= 2));
+      if (!same || st.perSec > 30.5 || st.repeatedFrames) bad.push(`${name}: ${JSON.stringify(res[name])}`);
+    }
+    // tracking gaps inside a rep (60 fps camera): 180 ms still counts, 400 ms cancels it
+    const at60 = angles => angles.flatMap(e => [e, e]).map((e, i) => ({ t: i * 1000 / 60, e }));
+    for (const [gap, want] of [[180, 1], [400, 0]]) {
+      const feed = at60([...hold(170, 700), ...DOWN, ...unseen(gap), ...UP, ...hold(170, 700)]);
+      const s = await simTracker(A, { hz: 60, feed });
+      s.run(feed.at(-1).t + 300);
+      const reps = s.sim.events.filter(e => e.type === "rep").length, gapNoRep = s.sim.events.some(e => e.type === "norep" && e.gap);
+      const st = s.stats(s.readyAt, feed.at(-1).t);
+      s.stop();
+      res[`gap${gap}`] = { reps, gapNoRep, inferencesPerSec: st.perSec };
+      if (reps !== want || gapNoRep !== (want === 0) || st.perSec > 30.5) bad.push(`gap ${gap} ms: ${JSON.stringify(res[`gap${gap}`])}`);
+    }
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

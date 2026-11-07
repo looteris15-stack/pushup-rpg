@@ -431,10 +431,22 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     video.srcObject = s;
     video.muted = true;
   }
+  // The pace: at most 30 inferences a second, each on a camera frame not tracked yet. requestVideoFrameCallback
+  // says when a new frame has arrived (a live camera's currentTime moves on every screen frame, so it can't
+  // tell); without it, currentTime is the only check. Two inferences are never closer than about 1/30 s, so a
+  // faster camera's extra frames are skipped and a late frame is never followed by a quick catch-up; a 30 fps
+  // camera still gets every frame tracked.
+  const STEP_MS = 1000 / 30;
+  const watchesFrames = typeof video.requestVideoFrameCallback === "function";
+  let lastRun = -Infinity, frameNo = 0, doneFrame = -1;
+  if (watchesFrames) { const seen = () => { frameNo++; video.requestVideoFrameCallback(seen); }; video.requestVideoFrameCallback(seen); }
+  const newFrame = () => video.currentTime !== lastVideoTime && (!watchesFrames || frameNo !== doneFrame);
   function startLoop() {
     cancelAnimationFrame(rafId);
     fpsT = performance.now();
     frames = 0;
+    lastRun = -Infinity; // the first frame goes at once (a start waits for it)
+    doneFrame = -1;      // even if no new frame has been seen yet: the picture there now
     loop();
   }
 
@@ -574,6 +586,17 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     startLoop();
   }
 
+  // A break (between mine rooms or boss rounds): the camera, its picture and the screen lock stay on, but
+  // no body tracking runs (no inference, rep counting or drawing) until hold(false) starts the next set.
+  // Hidden and back during a break, resume() brings the camera back but tracking stays off.
+  let held = false;
+  const processing = () => tracking() && !held;
+  function hold(on) {
+    held = !!on;
+    if (held) { cancelAnimationFrame(rafId); rafId = 0; ctx.clearRect(0, 0, canvas.width, canvas.height); }
+    else if (tracking() && liveStream()) { side = null; resetSmooth(); startLoop(); }
+  }
+
   function stop() {
     session++; // a start still waiting for something gives up
     camGen++;  // a camera or screen lock still on its way is switched off when it arrives
@@ -581,6 +604,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     running = false;
     paused = false;
     starting = false;
+    held = false;
     onFirstFrame = null;
     cancelAnimationFrame(rafId);
     rafId = 0;
@@ -600,11 +624,14 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
   function resetSmooth() { sm.elbow = sm.bodyBend = sm.knee = null; }
 
   function loop() {
-    if (!tracking()) return; // stopped or hidden: no frame work, and no next frame
+    if (!processing()) return; // stopped, hidden or in a break: no frame work, and no next frame
     rafId = requestAnimationFrame(loop);
-    if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
-    lastVideoTime = video.currentTime;
+    if (!landmarker || video.readyState < 2 || !newFrame()) return;
     const now = performance.now();
+    if (now - lastRun < STEP_MS - 2) return; // too soon for the pace (2 ms for frame-time jitter): this frame waits
+    lastRun = now;
+    lastVideoTime = video.currentTime;
+    doneFrame = frameNo;
     let res;
     try { res = landmarker.detectForVideo(video, now); } catch (e) { console.error(e); return; }
     if (onFirstFrame) { const f = onFirstFrame; onFirstFrame = null; f(true); } // a start waits for this frame
@@ -621,7 +648,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     frames++;
     if (now - fpsT > 1000) { fps = Math.round(frames * 1000 / (now - fpsT)); frames = 0; fpsT = now; }
     counter.update(m, now).forEach(onEvent);
-    if (!tracking()) return; // that rep ended the fight (stop() ran): nothing more to show
+    if (!processing()) return; // that rep ended the fight or the set (a break): nothing more to show
     onFrame(m, now);
     draw(lm, m);
   }
@@ -661,6 +688,7 @@ export function createTracker({ video, canvas, frame, getCfg, onEvent, onFrame }
     stop,
     pause,
     resume,
+    hold,
     counter,
     get running() { return running; },
     get fps() { return fps; },

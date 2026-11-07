@@ -5,9 +5,13 @@
 #   cold   = first Fight after opening (nothing downloaded yet)
 #   warm   = Fight again on the same page (the ready model is reused)
 #   cached = the page opened again, then Fight (files come from the browser cache)
+# -Mode loop [-Fps 60]: after one start, measures the tracking loop instead: detector calls, camera frames
+#   and loop run times during 15 s of a fight, then during a whole 90 s mine-room break and just after it.
+#   -Fps sets the fake camera's frame rate (Edge's default is 30).
 # The game's offline helper (service worker) is switched off for the bench: its own downloads would not be
 # slowed down by the network setting. Like run.ps1 it copies the game to a temporary folder (save untouched).
 param([int]$Runs = 3, [int]$CpuThrottle = 1, [int]$DownKbps = 0, [int]$LatencyMs = 0, [string]$Model = "full",
+      [string]$Mode = "startup", [int]$Fps = 0,
       [int]$Port = 8004, [int]$DevPort = 9336, [int]$TimeoutSec = 400)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -25,9 +29,9 @@ try {
         $prof = "$root\edge-$run"
         $edge = Start-Process "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" -PassThru -ArgumentList `
             "--headless=new", "--remote-debugging-port=$DevPort", "--user-data-dir=`"$prof`"", "--no-first-run", `
-            "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream", "--autoplay-policy=no-user-gesture-required", `
+            "--use-fake-device-for-media-stream$(if ($Fps -gt 0) { "=fps=$Fps" })", "--use-fake-ui-for-media-stream", "--autoplay-policy=no-user-gesture-required", `
             "--host-resolver-rules=`"MAP fonts.googleapis.com 127.0.0.1, MAP fonts.gstatic.com 127.0.0.1`"", `
-            "http://localhost:$Port/_tests/bench.html?model=$Model"
+            "http://localhost:$Port/_tests/bench.html?model=$Model&mode=$Mode"
         $target = $null
         for ($i = 0; $i -lt 40 -and -not $target; $i++) {
             try { $target = (Invoke-RestMethod "http://127.0.0.1:$DevPort/json" -TimeoutSec 2) | Where-Object { $_.type -eq 'page' -and $_.url -like '*bench*' } | Select-Object -First 1 } catch {}
