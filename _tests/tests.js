@@ -389,6 +389,54 @@ function slowModelNet(g, ms = 400, n = 1000) {
   return net;
 }
 const FULL = { ...BASE, settings: { ...BASE.settings, model: "full" } };
+// ---- Item 9: the offline helper (service worker) in its own copy of the game, ../swapp/ (run.ps1 makes it,
+// with the icons, so the helper can install there). Every shell file there carries a release mark (a or b).
+const SW_GAME = "../swapp/?debug";
+// sets what the helper's own requests for swapp/ get (see run.ps1): mode pass | hold | 503 | fail, only = one
+// file or all, release = a | b, clear=1 forgets the files asked for so far
+async function shellNet(params) {
+  const r = await fetch(`/__shell/set?${params}`).catch(() => null);
+  check(r && r.ok && /json/.test(r.headers.get("content-type") || ""), "the shell control is missing: run the tests with _tests\\run.ps1");
+  return r.json();
+}
+const shellStatus = async () => (await fetch("/__shell/status")).json();
+// no helper and none of its saved files (before and after each Item 9 test, so other tests never meet them)
+async function clearHelper() {
+  for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+  for (const k of await caches.keys()) if (k.startsWith("rpg-")) await caches.delete(k);
+}
+const swReg = () => navigator.serviceWorker.getRegistration(new URL("../swapp/", location.href).href);
+// which release each shell file in a game window came from
+function releaseOf(w, d) {
+  try {
+    return { html: d.querySelector('meta[name="release"]')?.content || null,
+      css: w.getComputedStyle(d.documentElement).getPropertyValue("--release").trim().replace(/"/g, "") || null,
+      ...Object.fromEntries(["game.js", "core.js", "data.js"].map(n => [n, w.__release?.[n] || null])) };
+  } catch (e) { return String(e); }
+}
+const allFrom = (r, rel) => !!r && typeof r === "object" && Object.values(r).every(v => v === rel);
+// opens the helper's copy in window id with its own ?query (like a launch from a link or the home screen);
+// ready = ms until Camp works (null if not within limit)
+async function openShell(id, limit = 8000) {
+  const el = document.getElementById(id), t0 = performance.now();
+  el.src = `${SW_GAME}&win=${id}${Date.now()}`;
+  let ready = null;
+  while (performance.now() - t0 < limit) {
+    try {
+      const d = el.contentDocument;
+      if (el.contentWindow.PushupRPG && !d.getElementById("camp").hidden && d.getElementById("campTitle").textContent) { ready = Math.round(performance.now() - t0); break; }
+    } catch {}
+    await wait(5);
+  }
+  const w = el.contentWindow, d = el.contentDocument;
+  return { w, d, ready, release: releaseOf(w, d), search: w.location.search, debug: !!w.PushupRPG };
+}
+// the first visit: the helper installs release a and takes charge of the window
+async function installShell(id) {
+  const g = await openShell(id);
+  await until(() => g.w.navigator.serviceWorker.controller, 10000, "the offline helper to take charge");
+  return g;
+}
 // ---- Item 8: real body points through the tracker's own frame path
 // 33 MediaPipe pose points for a side view (left side to the camera) in plank: body and legs straight and
 // level, arms at this elbow angle. They are laid out in a 4:3 picture, so any 4:3 video gives these angles.
@@ -2381,6 +2429,126 @@ const tests = [
     }
     check(!bad.length, bad.join(" || "));
     return notes.join("; ");
+  }],
+  // ---------------- Item 9 (audit finding #3): the installed game starts from its saved release
+  ["Item 9a A launch with the game saved: the shell stalled, failing (503) or offline, Camp comes from the saved release at once, with no shell requests and the launch link kept", async () => {
+    await reset(); await clearHelper(); await shellNet("mode=pass&release=a&clear=1");
+    const bad = [], res = {};
+    try {
+      const first = await installShell("A");
+      res.firstVisit = { readyMs: first.ready, release: first.release };
+      await close("A");
+      for (const mode of ["hold", "503", "fail"]) {
+        await shellNet(`mode=${mode}&clear=1`);
+        const g = await openShell("A");
+        const asked = (await shellStatus()).seen.filter(f => !f.startsWith("img/"));
+        const r = res[mode] = { readyMs: g.ready, shellRequests: asked.length, asked: asked.slice(0, 8), release: g.release, search: g.search.slice(0, 40), debug: g.debug };
+        await close("A");
+        await shellNet("mode=pass");
+        if (!(r.readyMs !== null && r.readyMs <= 1500 && r.shellRequests === 0 && allFrom(r.release, "a") && /[?&]debug(&|$)/.test(g.search) && /[?&]win=A\d/.test(g.search) && r.debug))
+          bad.push(`${mode}: ${JSON.stringify(r)}`);
+      }
+      const shell = (await caches.keys()).filter(k => k.startsWith("rpg-shell-"));
+      res.savedShell = await Promise.all(shell.map(async k => `${k}: ${(await (await caches.open(k)).keys()).length} files`));
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
+  }],
+  ["Item 9b A file missing from the saved release comes from the network with a time limit (5 s), and is not added to that release", async () => {
+    await reset(); await clearHelper(); await shellNet("mode=pass&release=a&clear=1");
+    const bad = [], res = {};
+    try {
+      const A = await installShell("A");
+      const shellName = (await caches.keys()).find(k => k.startsWith("rpg-shell-"));
+      const shell = await caches.open(shellName), isData = r => new URL(r.url).pathname.endsWith("/data.js");
+      for (const r of (await shell.keys()).filter(isData)) await shell.delete(r);
+      // 1. the network hangs: the request ends within the time limit instead of waiting for ever
+      await shellNet("mode=hold&only=data.js&clear=1");
+      const t0 = performance.now();
+      let ended = null;
+      A.w.fetch("data.js").then(r => { ended = { status: r.status, ms: Math.round(performance.now() - t0) }; },
+        e => { ended = { error: e.name, ms: Math.round(performance.now() - t0) }; });
+      await until(() => ended, 7500, "").catch(() => {});
+      res.stalled = ended || { endedWithinMs: null };
+      res.stalledAsked = (await shellStatus()).seen.filter(f => f === "data.js").length;
+      await shellNet("mode=pass");
+      await until(() => ended, 3000, "").catch(() => {});
+      // 2. the network works: the file comes from it, and the saved release isn't changed
+      const t1 = performance.now(), r2 = await A.w.fetch("data.js").catch(() => null);
+      res.online = { status: r2 ? r2.status : null, ms: Math.round(performance.now() - t1), release: r2 ? ((await r2.text()).match(/\["data\.js"\] = "(\w)"/) || [])[1] || null : null };
+      await wait(300);
+      res.addedToRelease = (await shell.keys()).filter(isData).length;
+      const s = res.stalled;
+      if (!(s.ms >= 4500 && s.ms <= 6000 && res.stalledAsked >= 1)) bad.push(`stalled network: ${JSON.stringify(s)} (asked ${res.stalledAsked}x)`);
+      if (!(res.online.status === 200 && res.online.ms <= 1500 && res.online.release === "a" && res.addedToRelease === 0)) bad.push(`network back: ${JSON.stringify(res.online)}, added to the saved release: ${res.addedToRelease}`);
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
+  }],
+  ["Item 9c An update installs as one whole release and switches only once the game windows are closed; a broken update keeps the old release; saved pictures and tracking files stay", async () => {
+    await reset(); await clearHelper(); await shellNet("mode=pass&release=a&clear=1");
+    const bad = [], res = {};
+    const PIC = new URL("../swapp/img/test-pic.jpg", location.href).href, MODEL = "https://cdn.jsdelivr.net/npm/test/model.task";
+    try {
+      const A = await installShell("A");
+      const reg = await swReg(), active0 = reg && reg.active, ctl0 = A.w.navigator.serviceWorker.controller;
+      check(active0 && ctl0, "test setup: no helper in charge");
+      await (await caches.open("rpg-img-v1")).put(PIC, new Response("picture"));
+      await (await caches.open("rpg-lib-v1")).put(MODEL, new Response("model"));
+      const installDone = async () => {
+        await until(() => reg.installing || reg.waiting || reg.active !== active0, 3000, "").catch(() => {});
+        await until(() => !reg.installing, 10000, "").catch(() => {});
+        await wait(300);
+      };
+      // 1. release b goes up but its core.js fails (503): it doesn't install, and the old release stays in use
+      await shellNet("release=b&mode=503&only=core.js&clear=1");
+      await reg.update().catch(() => {});
+      await installDone();
+      const B1 = await openShell("B");
+      res.brokenUpdate = { waiting: !!reg.waiting, sameHelper: reg.active === active0, openWindow: releaseOf(A.w, A.d), newWindow: B1.release, newWindowReadyMs: B1.ready,
+        coreAsked: (await shellStatus()).seen.filter(f => f === "core.js").length };
+      await close("B");
+      // 2. fixed: release b installs as a whole, then waits while a game window is open
+      await shellNet("mode=pass&clear=1");
+      await reg.update().catch(() => {});
+      await installDone();
+      const B2 = await openShell("B");
+      res.whileOpen = { waiting: !!reg.waiting, sameHelper: reg.active === active0, sameInWindow: A.w.navigator.serviceWorker.controller === ctl0,
+        openWindow: releaseOf(A.w, A.d), newWindow: B2.release };
+      // 3. all game windows closed: release b takes over, and the next launch is b throughout
+      await close("A"); await close("B");
+      await until(() => reg.active && reg.active !== active0 && !reg.waiting, 8000, "").catch(() => {});
+      const A2 = await openShell("A");
+      const keys = await caches.keys();
+      const kept = async (prefix, url) => { for (const k of keys.filter(k => k.startsWith(prefix))) if (await (await caches.open(k)).match(url)) return true; return false; };
+      res.afterClose = { switched: !!reg.active && reg.active !== active0, release: A2.release, readyMs: A2.ready, shellCaches: keys.filter(k => k.startsWith("rpg-shell-")),
+        pictureKept: await kept("rpg-img-", PIC), modelKept: await kept("rpg-lib-", MODEL) };
+      await close("A");
+      const b1 = res.brokenUpdate, w = res.whileOpen, a = res.afterClose;
+      if (!(!b1.waiting && b1.sameHelper && allFrom(b1.openWindow, "a") && allFrom(b1.newWindow, "a") && b1.newWindowReadyMs !== null && b1.coreAsked >= 1)) bad.push(`broken update: ${JSON.stringify(b1)}`);
+      if (!(w.waiting && w.sameHelper && w.sameInWindow && allFrom(w.openWindow, "a") && allFrom(w.newWindow, "a"))) bad.push(`while a window is open: ${JSON.stringify(w)}`);
+      if (!(a.switched && allFrom(a.release, "b") && a.readyMs !== null && a.shellCaches.length === 1 && a.pictureKept && a.modelKept)) bad.push(`after closing: ${JSON.stringify(a)}`);
+    } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
+  }],
+  ["Item 9d The saved release lists every file the game loads at start (one left off would never work offline)", async () => {
+    const sw = await (await fetch("../app/sw.js")).text();
+    const list = JSON.parse(sw.match(/SHELL_FILES\s*=\s*(\[[^\]]*\])/)[1]);
+    const doc = new DOMParser().parseFromString(await (await fetch("../app/index.html")).text(), "text/html");
+    const local = u => !/^([a-z]+:|\/\/)/i.test(u);
+    const need = new Set(["./", "index.html"]);
+    for (const l of doc.querySelectorAll("link[href]")) if (local(l.getAttribute("href")) && ["stylesheet", "modulepreload", "manifest", "icon"].some(t => l.relList.contains(t))) need.add(l.getAttribute("href"));
+    for (const s of doc.querySelectorAll("script[src]")) if (local(s.getAttribute("src"))) need.add(s.getAttribute("src"));
+    for (const f of [...need].filter(f => f.endsWith(".js"))) {
+      const src = await (await fetch(`../app/${f}`)).text();
+      for (const m of src.matchAll(/^\s*import\b[^"'`]*?from\s*["'](\.\/[^"']+)["']/gm)) need.add(m[1].slice(2));
+    }
+    const missing = [...need].filter(f => !list.includes(f));
+    const notThere = [];
+    for (const f of list) if (!(await fetch(`../swapp/${f}`, { method: "HEAD" })).ok) notThere.push(f);
+    check(!missing.length && !notThere.length, `loaded at start but not in the release list: ${missing.join(", ") || "-"}; listed but not on the server: ${notThere.join(", ") || "-"}`);
+    return `release list: ${list.join(", ")}`;
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {

@@ -5,13 +5,34 @@
 # blocked inside the test browser, so tests don't depend on the internet.
 #        -CpuThrottle 4 slows the test page's CPU down 4x (like a cheap phone), for timing checks.
 #        -Only "Item 2" runs only the tests whose name contains that text.
-param([int]$Port = 8002, [int]$DevPort = 9334, [int]$TimeoutSec = 300, [int]$CpuThrottle = 1, [string]$Only = "")
+param([int]$Port = 8002, [int]$DevPort = 9334, [int]$TimeoutSec = 600, [int]$CpuThrottle = 1, [string]$Only = "")
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $root = Join-Path $env:TEMP ("pushup-rpg-tests\run-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force "$root\app", "$root\_tests" | Out-Null
 Get-ChildItem "$repo\app" -File | Copy-Item -Destination "$root\app"
 Copy-Item "$repo\_tests\*" "$root\_tests" -Recurse   # test page, tests and recorded-fight fixtures
+# The offline helper's (service worker's) own copy for its tests: the whole game with its icons in swapp\, so
+# the helper can install there (app\ has no icons, so it never installs for the other tests). Release "a" or
+# "b": every shell file carries its release mark, and a newer release's sw.js has its shell version raised.
+$script:release = ''
+function WriteRelease([string]$rel) {
+    New-Item -ItemType Directory -Force "$root\swapp\icons" | Out-Null
+    Get-ChildItem "$repo\app" -File | Copy-Item -Destination "$root\swapp" -Force
+    Copy-Item "$repo\app\icons\*" "$root\swapp\icons" -Force
+    $utf8 = New-Object Text.UTF8Encoding $false
+    $f = "$root\swapp\index.html"
+    [IO.File]::WriteAllText($f, ([IO.File]::ReadAllText($f) -replace '<head>', "<head>`n<meta name=`"release`" content=`"$rel`">"), $utf8)
+    foreach ($n in 'game.js', 'core.js', 'data.js') { [IO.File]::AppendAllText("$root\swapp\$n", "`n;(globalThis.__release ||= {})[`"$n`"] = `"$rel`";`n", $utf8) }
+    [IO.File]::AppendAllText("$root\swapp\style.css", "`n:root { --release: `"$rel`"; }`n", $utf8)
+    if ($rel -ne 'a') {
+        $f = "$root\swapp\sw.js"
+        $t = [regex]::Replace([IO.File]::ReadAllText($f), 'const (SHELL_V|V) = (\d+);', { param($m) "const $($m.Groups[1].Value) = $([int]$m.Groups[2].Value + 1);" })
+        [IO.File]::WriteAllText($f, $t, $utf8)
+    }
+    $script:release = $rel
+}
+WriteRelease 'a'
 
 $server = Start-Job -ScriptBlock { param($s, $r, $p) & $s -Port $p -Root $r } -ArgumentList "$repo\serve.ps1", $root, $Port
 $edge = $null
@@ -32,9 +53,11 @@ try {
     $ws = New-Object System.Net.WebSockets.ClientWebSocket
     $ws.ConnectAsync([Uri]$target.webSocketDebuggerUrl, [Threading.CancellationToken]::None).Wait()
     $script:id = 0
-    function Send($method, $params) {
+    function Send($method, $params, $sid = $null) {
         $script:id++
-        $bytes = [Text.Encoding]::UTF8.GetBytes((@{ id = $script:id; method = $method; params = $params } | ConvertTo-Json -Compress -Depth 8))
+        $msg = @{ id = $script:id; method = $method; params = $params }
+        if ($sid) { $msg.sessionId = $sid } # a command for an attached target (the offline helper)
+        $bytes = [Text.Encoding]::UTF8.GetBytes(($msg | ConvertTo-Json -Compress -Depth 8))
         $ws.SendAsync((New-Object ArraySegment[byte] (, $bytes)), 'Text', $true, [Threading.CancellationToken]::None).Wait()
         return $script:id
     }
@@ -49,19 +72,59 @@ try {
     $script:seen = New-Object System.Collections.ArrayList
     $script:log = New-Object System.Collections.ArrayList
     $standIn = "@font-face{font-family:'Oxanium';font-style:normal;font-weight:100 900;font-display:swap;src:local('Segoe UI');}"
-    function Fulfill($rid, $type, $body) {
-        [void](Send 'Fetch.fulfillRequest' @{ requestId = $rid; responseCode = 200
+    function Fulfill($rid, $type, $body, $sid = $null, [int]$code = 200) {
+        [void](Send 'Fetch.fulfillRequest' @{ requestId = $rid; responseCode = $code
             responseHeaders = @(@{ name = 'Content-Type'; value = $type }, @{ name = 'Access-Control-Allow-Origin'; value = '*' })
-            body = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body)) })
+            body = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($body)) } $sid)
     }
-    function FailReq($rid, $why) { [void](Send 'Fetch.failRequest' @{ requestId = $rid; errorReason = $why }) }
+    function FailReq($rid, $why, $sid = $null) { [void](Send 'Fetch.failRequest' @{ requestId = $rid; errorReason = $why } $sid) }
+    function Query($u) {
+        $q = @{}
+        foreach ($kv in ([Uri]$u).Query.TrimStart('?').Split('&')) { $k, $v = $kv.Split('=', 2); if ($k) { $q[$k] = [Uri]::UnescapeDataString("$v") } }
+        return $q
+    }
+    # ---- the offline helper's own requests for its test copy (swapp\): run.ps1 attaches to each helper
+    # (service worker) and answers them as the test page sets with /__shell/set?mode=..&only=..&release=..&clear=1:
+    # mode pass (the server), hold (no answer until the mode changes), 503, or fail (as if offline); only = one
+    # file (e.g. core.js) or all; release = a or b (rewrites swapp\). /__shell/status lists the files asked for.
+    $script:shell = @{ mode = 'pass'; only = '' }
+    $script:shellSeen = New-Object System.Collections.ArrayList
+    $script:shellHeld = New-Object System.Collections.ArrayList
+    function OnShell($p, $sid) {
+        $u = $p.request.url
+        $file = ([Uri]$u).AbsolutePath -replace '^.*?/swapp/', ''
+        if (-not $file) { $file = './' }
+        [void]$script:shellSeen.Add($file)
+        $hit = $script:shell.mode -ne 'pass' -and (-not $script:shell.only -or $file -eq $script:shell.only)
+        if (-not $hit) { [void](Send 'Fetch.continueRequest' @{ requestId = $p.requestId } $sid) }
+        elseif ($script:shell.mode -eq 'hold') { [void]$script:shellHeld.Add(@{ rid = $p.requestId; sid = $sid }) }
+        elseif ($script:shell.mode -eq '503') { Fulfill $p.requestId 'text/plain' 'Service Unavailable (test)' $sid 503 }
+        else { FailReq $p.requestId 'InternetDisconnected' $sid }
+    }
+    function OnShellControl($p) {
+        $u = $p.request.url
+        if ($u -like '*/__shell/set*') {
+            $q = Query $u
+            if ($q.release -and $q.release -ne $script:release) { WriteRelease $q.release }
+            if ($q.mode) { $script:shell = @{ mode = "$($q.mode)"; only = "$($q.only)" } }
+            if ($q.clear -eq '1') { $script:shellSeen.Clear() }
+            if ($script:shell.mode -ne 'hold') {
+                foreach ($h in @($script:shellHeld)) { [void](Send 'Fetch.continueRequest' @{ requestId = $h.rid } $h.sid) }
+                $script:shellHeld.Clear()
+            }
+        }
+        $status = @{ mode = $script:shell.mode; only = $script:shell.only; release = $script:release; seen = @($script:shellSeen); held = $script:shellHeld.Count }
+        Fulfill $p.requestId 'application/json' ($status | ConvertTo-Json -Compress -Depth 4)
+    }
     function AddLog($line) { if ($script:log.Count -lt 300) { [void]$script:log.Add($line) } }
     # ---- the body-tracking library link: blocked like the rest of the internet, unless a test asks for
     # the stand-in (/__lib/set?mode=fake answers it with fixtures\fake-vision.mjs; mode=block switches back)
     $script:libMode = 'block'
     $fakeLib = Get-Content -Raw "$root\_tests\fixtures\fake-vision.mjs"
-    function OnPaused($p) {
+    function OnPaused($p, $sid) {
         $u = $p.request.url
+        if ($sid) { OnShell $p $sid; return } # only the helper's swapp\ requests are watched there
+        if ($u -like '*/__shell/*') { OnShellControl $p; return }
         if ($u -like '*/__lib/*') {
             if ($u -like '*mode=fake*') { $script:libMode = 'fake' } elseif ($u -like '*mode=block*') { $script:libMode = 'block' }
             Fulfill $p.requestId 'application/json' (@{ mode = $script:libMode } | ConvertTo-Json -Compress)
@@ -73,8 +136,7 @@ try {
         }
         if ($u -like '*/__fonts/*') {
             if ($u -like '*/__fonts/set*') {
-                $q = @{}
-                foreach ($kv in ([Uri]$u).Query.TrimStart('?').Split('&')) { $k, $v = $kv.Split('=', 2); if ($k) { $q[$k] = [Uri]::UnescapeDataString("$v") } }
+                $q = Query $u
                 $script:font = @{ mode = "$($q.mode)"; ms = [int]("0" + $q.ms); then = "$($q.then)" }
                 if ($q.clear -eq '1') { $script:seen.Clear(); $script:log.Clear() }
             }
@@ -101,7 +163,14 @@ try {
     function Handle($m) {
         if ($null -ne $m.id) { if ($m.id -eq $script:waitFor) { $script:reply = $m }; return }
         switch ($m.method) {
-            'Fetch.requestPaused' { OnPaused $m.params }
+            'Fetch.requestPaused' { OnPaused $m.params $m.sessionId }
+            # a new target (an offline helper, a worker) waits until it's let go: for a helper, its requests
+            # for the test copy are watched first
+            'Target.attachedToTarget' {
+                $sid = $m.params.sessionId
+                if ($m.params.targetInfo.type -eq 'service_worker') { [void](Send 'Fetch.enable' @{ patterns = @(@{ urlPattern = '*/swapp/*' }) } $sid) }
+                [void](Send 'Runtime.runIfWaitingForDebugger' @{} $sid)
+            }
             'Runtime.exceptionThrown' { $d = $m.params.exceptionDetails; AddLog ("exception: " + $(if ($d.exception.description) { $d.exception.description } else { $d.text })) }
             'Runtime.consoleAPICalled' { if ($m.params.type -in 'error', 'warning', 'assert') { AddLog ("console.$($m.params.type): " + (($m.params.args | ForEach-Object { if ($null -ne $_.value) { $_.value } else { $_.description } }) -join ' ')) } }
             'Log.entryAdded' { $e = $m.params.entry; if ($e.level -in 'error', 'warning') { AddLog ("$($e.source) $($e.level): $($e.text) $($e.url)") } }
@@ -133,17 +202,21 @@ try {
     function Eval($code) { return (Call 'Runtime.evaluate' @{ expression = $code; returnByValue = $true }).result.result.value }
     $script:waitFor = $null
     [void](Call 'Fetch.enable' @{ patterns = @(@{ urlPattern = '*://fonts.googleapis.com/*' }, @{ urlPattern = '*://fonts.gstatic.com/*' }, @{ urlPattern = '*/__fonts/*' },
-        @{ urlPattern = '*://cdn.jsdelivr.net/*' }, @{ urlPattern = '*/__lib/*' }) })
+        @{ urlPattern = '*://cdn.jsdelivr.net/*' }, @{ urlPattern = '*/__lib/*' }, @{ urlPattern = '*/__shell/*' }) })
+    [void](Call 'Target.setAutoAttach' @{ autoAttach = $true; waitForDebuggerOnStart = $true; flatten = $true })
     [void](Call 'Runtime.enable' @{})
     [void](Call 'Log.enable' @{})
     if ($CpuThrottle -gt 1) { [void](Call 'Emulation.setCPUThrottlingRate' @{ rate = $CpuThrottle }); Write-Output "CPU slowed down ${CpuThrottle}x" }
 
     $end = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $end -and (Eval 'window.__done === true') -ne $true) { Pump 1000 }
+    $done = (Eval 'window.__done === true') -eq $true
     $results = Eval 'JSON.stringify(window.__results || [])' | ConvertFrom-Json
     $ws.Dispose()
     if (-not $results) { Write-Output "No results (did the test page load?)"; exit 99 }
     $failed = 0
+    # out of time: the tests that ran are listed, but the run counts as failed (the rest never ran)
+    if (-not $done) { $failed++; Write-Output "FAIL  TIMED OUT after $TimeoutSec s: only $(@($results).Count) tests ran (use -TimeoutSec)" }
     foreach ($r in $results) {
         if ($r.pass) { Write-Output ("PASS  {0}  ({1} s)" -f $r.name, $r.secs); if ($r.note) { Write-Output ("      {0}" -f $r.note) } }
         else { $failed++; Write-Output ("FAIL  {0}  ({1} s)`n      {2}" -f $r.name, $r.secs, $r.detail) }
