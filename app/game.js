@@ -891,7 +891,8 @@ let rest = null;   // a break: between mine rooms, or between rounds of a big mo
 let hiddenAt = 0, flashUntil = 0, flashTimer = 0, lastBeep = 0;
 
 const fakeReps = () => DEBUG && !tracker.running;
-const plankState = () => (fakeReps() ? "up" : tracker.counter.state);
+let fedFrames = false; // tests (?debug): frames fed through the real counter, so the fight text follows them
+const plankState = () => (fakeReps() && !fedFrames ? "up" : tracker.counter.state);
 
 // Fight startup (camera question, then body tracking) can take a while. A Back button works the whole
 // time; going back counts for nothing, because no fight has begun yet. Returns true when the fight can begin.
@@ -1145,6 +1146,16 @@ function renderDepth(m, now) {
   if (c && st === "down" && secs >= need && !meter.okPlayed) { meter.okPlayed = true; sfx.slowOk(); }
 }
 
+// A slow rep at the bottom: its time so far (the same number the meter shows and the rule judges), and
+// whether that clock has stopped. It stops at the lowest point (core.js downSecsOf), so after a short time
+// without sinking any further, staying down can't make this rep slow enough. Frame times, like the rule.
+const STALL_MS = 800;
+function slowBottom(c) {
+  const low = c.trace.find(p => p.e <= c.minElbow + 3);
+  const last = c.trace[c.trace.length - 1];
+  return { secs: downSecsOf(c) || 0, stalled: !!low && last.t - low.t >= STALL_MS };
+}
+
 const STATE_TEXT = {
   lost: ["Can't see you. Show your whole body from the side.", "warn"],
   idle: ["Back into plank!", "warn"],
@@ -1172,6 +1183,15 @@ function renderBanner() {
   if (fight.m.slow && (key === "up" || key === "down")) {
     setBanner(`Go down slowly · ${slowSecs(fight.m)} s`, "");
     return;
+  }
+  // slow monsters: at depth, "Push up!" only once the way down took long enough (the green meter + chime)
+  if (fight.m.slow && key === "depth") {
+    const need = slowSecs(fight.m), b = slowBottom(tracker.counter.cycle);
+    if (b.secs < need) {
+      if (b.stalled) setBanner("Too fast this time. Push up, then go slower.", "warn");
+      else setBanner(`Lower, slowly… ${b.secs.toFixed(1)} / ${need} s`, "");
+      return;
+    }
   }
   const [text, kind] = STATE_TEXT[key] || STATE_TEXT.up;
   setBanner(text, kind);
@@ -1847,7 +1867,7 @@ if (DEBUG) {
     skipRest() { if (rest) rest.endsAt = performance.now(); },
     repEvent: ev => onRepEvent(ev),
     // feed one body measurement through the real rep counter and the HUD, like a camera frame would
-    frame: (m, t) => { tracker.counter.update(m, t).forEach(onRepEvent); onTrackFrame(m, t); },
+    frame: (m, t) => { fedFrames = true; tracker.counter.update(m, t).forEach(onRepEvent); onTrackFrame(m, t); },
     get counter() { return tracker.counter; },
     get meterCycle() { return meter.cycle; }, // the rep the live depth meter is following
     get trackerRunning() { return tracker.running; },

@@ -640,6 +640,8 @@ const UP = [55, 60, 75, 100, 130, 155, 165, 170];                           // b
 const LOCKOUT = [170, 170, 171, 170];                                       // seen again with straight arms
 const unseen = ms => Array.from({ length: Math.round(ms / FRAME_MS) }, () => null); // nobody seen for about ms
 const hold = (elbow, ms) => Array.from({ length: Math.round(ms / FRAME_MS) }, () => elbow); // still for about ms
+// moves the elbow evenly from a to b in about secs (the first frame is already one step past a)
+const glide = (a, b, secs) => { const n = Math.max(1, Math.round(secs * 1000 / FRAME_MS)); return Array.from({ length: n }, (_, i) => a + (b - a) * (i + 1) / n); };
 // straight arms, then down to the bottom in about secs, then back up (a "slow rep")
 function slowRep(secs) {
   const n = Math.round(secs * 1000 / FRAME_MS);
@@ -3067,6 +3069,134 @@ const tests = [
     if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
     return JSON.stringify(res);
+  }],
+  // ------------------------------------------- Journal 7 (Day 5): "Push up!" only when a slow rep is slow enough
+  ["Journal 7a Slow fight: reaching depth before 2 s doesn't say \"Push up!\"; it says to keep going down slowly, with the same time as the meter", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("moss-slime");
+    // straight arms, then down to depth in about 1.3 s (like the phone recording at 0:37)
+    playFrames(A, 1e8, [...LOCKOUT, ...glide(160, 60, 1.3)]);
+    const c = A.api.counter.cycle, banner = A.text("#banner"), meter = A.text("#downTime");
+    check(c && c.depth, `test setup: not at depth (counter "${A.api.counter.state}")`);
+    check(!/push up/i.test(banner), `says "${banner}" with only ${meter} down`);
+    const m = /^Lower, slowly… (\d\.\d) \/ 2 s$/.exec(banner);
+    check(m && +m[1] < 2, `expected "Lower, slowly… x.x / 2 s", got "${banner}"`);
+    check(`${m[1]} s` === meter, `the text says ${m[1]} s, the meter ${meter}`);
+    check(!A.d.querySelector("#banner").classList.contains("good"), "the text is green");
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `"${banner}" (meter ${meter})`;
+  }],
+  ["Journal 7b Slow fight, stopped at the bottom under 2 s: after about 0.8 s it says the rep is too fast; pushing up is still judged too fast", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("moss-slime");
+    let t = playFrames(A, 1e8, [...LOCKOUT, ...glide(160, 60, 1.3), ...hold(60, 400)]);
+    const early = A.text("#banner");
+    check(/^Lower, slowly…/.test(early), `0.4 s still at the bottom: "${early}" (it can't know yet)`);
+    t = playFrames(A, t, hold(60, 600));
+    const stalled = A.text("#banner"), cls = A.d.querySelector("#banner").className;
+    check(stalled === "Too fast this time. Push up, then go slower.", `1 s still at the bottom: "${stalled}"`);
+    check(/\bwarn\b/.test(cls), `the warning isn't in the warning colour (class "${cls}")`);
+    // sinking further moves the clock on again: the text follows the meter
+    const t2 = playFrames(A, t, glide(60, 52, 0.2));
+    const again = A.text("#banner"), green = A.d.querySelector("#downTime").classList.contains("ok");
+    check(green ? again === "Push up!" : again === `Lower, slowly… ${A.text("#downTime").replace(" s", "")} / 2 s`,
+      `after sinking further: "${again}" with the meter at ${A.text("#downTime")}${green ? " (green)" : ""}`);
+    // a fresh rep: stop at the bottom, then push up: no hit, the usual "too fast"
+    // (it stops at 55°, where UP starts: going any lower on the way up would move the clock on)
+    playFrames(A, t2, [...UP, ...LOCKOUT]);
+    const clock = A.shiftClock(); clock.skip(3000);
+    t = playFrames(A, t2 + 3000, [...LOCKOUT, ...glide(160, 55, 1.0), ...hold(55, 1000), ...UP]);
+    const reps = A.fight.reps, after = A.text("#banner");
+    check(reps <= 1 && /^No rep: Too fast: \d\.\d s down, need 2 s/.test(after), `pushing up from a stopped 1 s rep: "${after}" (${reps} hits)`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `0.4 s: "${early}" · 1 s: "${stalled}" · sinking: "${again}" · pushed up: "${after}" (${reps} hits)`;
+  }],
+  ["Journal 7c Slow fight: \"Push up!\" shows from the first frame where both depth and 2 s are reached (the green meter and the chime), never before", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("moss-slime");
+    const clock = A.shiftClock();
+    // per frame: is it "Push up!", and are depth and 2 s both reached?
+    const watch = (t, frames) => {
+      const rows = [];
+      for (const e of frames) {
+        A.api.frame(plank(e), t); t += FRAME_MS;
+        const c = A.api.counter.cycle;
+        rows.push({ push: A.text("#banner") === "Push up!", both: !!c && c.depth && A.d.querySelector("#downTime").classList.contains("ok") });
+      }
+      return { rows, t };
+    };
+    const res = {};
+    // 1. depth first (at about 1 s), then still sinking slowly until the time is enough
+    let r = watch(1e8, [...LOCKOUT, ...glide(160, 62, 1.0), ...glide(62, 40, 1.6)]);
+    res.depthFirst = { push: r.rows.findIndex(x => x.push), both: r.rows.findIndex(x => x.both) };
+    let t = playFrames(A, r.t, [...UP, ...LOCKOUT]);
+    res.hits1 = A.fight.reps;
+    clock.skip(3000); // the "Hit!" message is over
+    // 2. 2 s first (still above depth), then depth at about 2.2 s
+    r = watch(t + 3000, slowRep(2.4).slice(0, -UP.length));
+    res.timeFirst = { push: r.rows.findIndex(x => x.push), both: r.rows.findIndex(x => x.both) };
+    playFrames(A, r.t, UP);
+    res.hits2 = A.fight.reps;
+    const bad = [];
+    for (const k of ["depthFirst", "timeFirst"]) {
+      if (res[k].both < 0 || res[k].push !== res[k].both) bad.push(`${k}: "Push up!" first at frame ${res[k].push}, depth + 2 s first at frame ${res[k].both}`);
+    }
+    if (res.hits1 !== 1 || res.hits2 !== 2) bad.push(`hits ${res.hits1} then ${res.hits2} (1 then 2 expected)`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
+  }],
+  ["Journal 7d Normal fight: \"Push up!\" still shows right at depth", async () => {
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("field-mouse");
+    const at = DOWN.findIndex(e => e <= 63);
+    let t = playFrames(A, 1e8, [...LOCKOUT, ...DOWN.slice(0, at)]);
+    const before = A.text("#banner");
+    t = playFrames(A, t, [DOWN[at]]);
+    const atDepth = A.text("#banner");
+    check(before !== "Push up!" && atDepth === "Push up!", `one frame above depth: "${before}", at depth: "${atDepth}"`);
+    playFrames(A, t, [...DOWN.slice(at + 1), ...UP]);
+    check(A.fight.reps === 1, `${A.fight.reps} hits (1 expected)`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+  }],
+  ["Journal 7e Your recorded slow reps: \"Push up!\" never shows before depth and 2 s; the too-fast tries never show it, the slow ones do", async () => {
+    const { downSecsOf } = await import(`../app/core.js?t=${Date.now()}`);
+    const fx = await (await fetch("fixtures/slow.json")).json();
+    await reset();
+    const A = await open("A");
+    await A.fightMonster("moss-slime");
+    const clock = A.shiftClock();
+    const early = [], tries = [];
+    let cur = null, shown = false;
+    for (const [ft, e] of fx.frames) {
+      A.api.frame(e == null ? null : plank(e), 1e8 + ft);
+      const c = A.api.counter.cycle, banner = A.text("#banner");
+      if (cur && c !== cur) { if (cur.depth) tries.push({ secs: downSecsOf(cur), shown }); shown = false; }
+      cur = c;
+      if (banner === "Push up!") {
+        shown = true;
+        const secs = c ? downSecsOf(c) : null;
+        if (!(c && c.depth && secs >= 2)) early.push(`${(ft / 1000).toFixed(2)} s: ${secs} s`);
+      }
+      // a "Hit!" or "No rep" message holds the text for a moment: let the game's clock pass it, so every
+      // rep is seen (the frames keep their own times, so the reps are timed exactly as recorded)
+      if (/^(Hit|No rep)/.test(banner)) clock.skip(3000);
+    }
+    check(A.fight && !A.fight.over, `test setup: the fight ended (${A.modal().slice(0, 60)})`);
+    const fast = tries.filter(x => x.secs < 2), slow = tries.filter(x => x.secs >= 2);
+    check(fast.length >= 2 && slow.length >= 2, `test setup: tries ${JSON.stringify(tries)}`);
+    const bad = [];
+    if (early.length) bad.push(`"Push up!" too early at ${early.slice(0, 5).join(", ")}`);
+    const fastShown = fast.filter(x => x.shown), slowMissing = slow.filter(x => !x.shown);
+    if (fastShown.length) bad.push(`too-fast tries that said "Push up!": ${fastShown.map(x => x.secs).join(", ")} s`);
+    if (slowMissing.length) bad.push(`slow tries that never said "Push up!": ${slowMissing.map(x => x.secs).join(", ")} s`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return `tries at depth: ${tries.map(x => `${x.secs} s${x.shown ? " (Push up!)" : ""}`).join(", ")}`;
   }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
