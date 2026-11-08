@@ -27,10 +27,11 @@ export const RULES = {
 // A new rule shows up on a normal monster first (practice), and only later on a boss (the test).
 // hpBefore: a monster's HP before it was lowered. Wins from then gave more pushups and XP, so a backup is checked
 // against the larger number (keep it when lowering HP again; use the highest it ever had).
-// oneSetBefore: it was one set (no rounds) of hpBefore HP. Backups from then can have a strength test that
-// opened its area, and wanderers with that many HP (startZoneFor ... { before: true }, wanderHpEver).
-// Late game (Nov 2026): the Frost Giant (36) is the biggest single set. After it, fights come in rounds:
-// the Ashlands teach them, Dragon's Spine has 20-rep rounds, more of them each fight.
+// hpLow: a plain monster's lowest HP before it was raised. A strength test back then needed only that much
+// to start in its area, so backups are checked with it (startZoneFor ... { before: true }).
+// oneSetBefore: hpBefore was one set (not rounds), so wanderers back then could have that many HP (wanderHpEver).
+// The world map is one set per fight (strength); fights in rounds belong in the mine (endurance).
+// From Peat Bog on, each normal monster is 3-4 more than the one before, up to the Elder Dragon's 60.
 export const ZONES = [
   {
     id: "meadow", name: "Meadow Edge", blurb: "Small beasts at the forest edge. Good for your first fights.",
@@ -53,45 +54,48 @@ export const ZONES = [
   {
     id: "bog", name: "Peat Bog", blurb: "Soft ground, heavy monsters.",
     monsters: [
-      { id: "bog-leech", name: "Bog Leech", hp: 15 },
-      { id: "swamp-lurker", name: "Swamp Lurker", hp: 11, slow: 2 },
-      { id: "bog-troll", name: "Bog Troll", hp: 18 },
-      { id: "mire-king", name: "Mire King", hp: 14, boss: true, slow: 2 },
+      // raised in Nov 2026 (were 15 / 11 / 18 / 14)
+      { id: "bog-leech", name: "Bog Leech", hp: 17, hpLow: 15 },
+      { id: "swamp-lurker", name: "Swamp Lurker", hp: 12, slow: 2 },
+      { id: "bog-troll", name: "Bog Troll", hp: 20, hpLow: 18 },
+      { id: "mire-king", name: "Mire King", hp: 15, boss: true, slow: 2 },
     ],
   },
   {
     id: "ridge", name: "Pine Ridge", blurb: "Steep paths. The big animals live here.",
     monsters: [
-      { id: "ridge-boar", name: "Ridge Boar", hp: 21 },
-      { id: "shadow-lynx", name: "Shadow Lynx", hp: 23 },
-      { id: "stone-golem", name: "Stone Golem", hp: 26 },
-      { id: "elder-bear", name: "Elder Bear", hp: 30, boss: true },
+      // raised in Nov 2026 (were 21 / 23 / 26 / 30)
+      { id: "ridge-boar", name: "Ridge Boar", hp: 24, hpLow: 21 },
+      { id: "shadow-lynx", name: "Shadow Lynx", hp: 28, hpLow: 23 },
+      { id: "stone-golem", name: "Stone Golem", hp: 32, hpLow: 26 },
+      { id: "elder-bear", name: "Elder Bear", hp: 36, boss: true, hpLow: 30 },
     ],
   },
   {
     id: "peaks", name: "Frost Peaks", blurb: "Cold wind and giants.",
     monsters: [
-      { id: "ice-wraith", name: "Ice Wraith", hp: 22, slow: 3 },
-      { id: "frost-giant", name: "Frost Giant", hp: 36 },
-      { id: "white-wyrm", name: "White Wyrm", hp: 28, boss: true, slow: 3 },
+      // raised in Nov 2026 (were 22 / 36 / 28)
+      { id: "ice-wraith", name: "Ice Wraith", hp: 24, slow: 3 },
+      { id: "frost-giant", name: "Frost Giant", hp: 40, hpLow: 36 },
+      { id: "white-wyrm", name: "White Wyrm", hp: 31, boss: true, slow: 3 },
     ],
   },
   {
-    id: "ash", name: "The Ashlands", blurb: "Burnt land. Here the fights come in rounds: a set, a break, then the next set.",
+    id: "ash", name: "The Ashlands", blurb: "Burnt land. The biggest sets so far.",
     monsters: [
-      // one set of 44 / 50 / 60 until Nov 2026
-      { id: "ember-hound", name: "Ember Hound", rounds: [16, 16], hpBefore: 44, oneSetBefore: true },
-      { id: "ash-knight", name: "Ash Knight", rounds: [19, 19], hpBefore: 50, oneSetBefore: true },
-      { id: "burnt-king", name: "The Burnt King", rounds: [16, 16, 16], boss: true, hpBefore: 60, oneSetBefore: true },
+      // 44 / 50 / 60 until Nov 2026 (then two weeks in rounds: 2x16, 2x19, 3x16)
+      { id: "ember-hound", name: "Ember Hound", hp: 44, hpBefore: 44, oneSetBefore: true },
+      { id: "ash-knight", name: "Ash Knight", hp: 48, hpBefore: 50, oneSetBefore: true },
+      { id: "burnt-king", name: "The Burnt King", hp: 52, boss: true, hpBefore: 60, oneSetBefore: true },
     ],
   },
   {
-    id: "spine", name: "Dragon's Spine", blurb: "The end of the map. The longest fights: up to four rounds of 20.",
+    id: "spine", name: "Dragon's Spine", blurb: "The end of the map. The dragon waits at the top: 60 in one set.",
     monsters: [
-      // 30+30, 35x3 and 40x4 until Nov 2026
-      { id: "ash-drake", name: "Ash Drake", rounds: [20, 20], hpBefore: 60 },
-      { id: "stone-colossus", name: "Stone Colossus", rounds: [20, 20, 20], hpBefore: 105 },
-      { id: "elder-dragon", name: "The Elder Dragon", rounds: [20, 20, 20, 20], boss: true, hpBefore: 160 },
+      // in rounds until Nov 2026: 30+30, 35x3, 40x4 (then 2x20, 3x20, 4x20)
+      { id: "ash-drake", name: "Ash Drake", hp: 34, slow: 3, hpBefore: 60 },
+      { id: "stone-colossus", name: "Stone Colossus", hp: 56, hpBefore: 105 },
+      { id: "elder-dragon", name: "The Elder Dragon", hp: 60, boss: true, hpBefore: 160 },
     ],
   },
 ];
@@ -212,12 +216,13 @@ export function xpReward(m, where) {
 }
 
 // Strength test: you start in the highest area whose hardest plain fight (no special rules) you could win.
-// before: the rule as it was before areas changed to rounds (checks backups made back then).
+// Never in the last area: the dragon is always earned.
+// before: also counts the lower HP some monsters had before (checks backups made back then).
 export function startZoneFor(reps, { before = false } = {}) {
   let zi = 0;
   ZONES.forEach((z, i) => {
-    const plain = z.monsters.filter(m => !m.slow && (!m.rounds || (before && m.oneSetBefore)))
-      .map(m => (before && m.oneSetBefore ? m.hpBefore : m.hp));
+    if (i === ZONES.length - 1) return;
+    const plain = z.monsters.filter(m => !m.slow && !m.rounds).map(m => (before && m.hpLow ? Math.min(m.hp, m.hpLow) : m.hp));
     if (plain.length && Math.max(...plain) <= reps) zi = i;
   });
   return zi;
@@ -225,7 +230,7 @@ export function startZoneFor(reps, { before = false } = {}) {
 
 // The most HP a wanderer ever had: they take the HP of plain monsters, including ones that were plain before.
 export const wanderHpEver = Math.max(...ZONES.flatMap(z => z.monsters)
-  .filter(m => !m.slow && (!m.rounds || m.oneSetBefore)).map(m => Math.max(m.hp, m.hpBefore || 0)));
+  .filter(m => !m.slow && (!m.rounds || m.oneSetBefore)).map(m => Math.max(m.hp, m.oneSetBefore ? m.hpBefore : 0)));
 
 export function findMonster(id) {
   for (const [zi, zone] of ZONES.entries()) {
