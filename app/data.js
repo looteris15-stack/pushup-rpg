@@ -27,6 +27,10 @@ export const RULES = {
 // A new rule shows up on a normal monster first (practice), and only later on a boss (the test).
 // hpBefore: a monster's HP before it was lowered. Wins from then gave more pushups and XP, so a backup is checked
 // against the larger number (keep it when lowering HP again; use the highest it ever had).
+// oneSetBefore: it was one set (no rounds) of hpBefore HP. Backups from then can have a strength test that
+// opened its area, and wanderers with that many HP (startZoneFor ... { before: true }, wanderHpEver).
+// Late game (Nov 2026): the Frost Giant (36) is the biggest single set. After it, fights come in rounds:
+// the Ashlands teach them, Dragon's Spine has 20-rep rounds, more of them each fight.
 export const ZONES = [
   {
     id: "meadow", name: "Meadow Edge", blurb: "Small beasts at the forest edge. Good for your first fights.",
@@ -40,7 +44,7 @@ export const ZONES = [
   {
     id: "birch", name: "Birch Forest", blurb: "Goblins and wolves live between the white trees.",
     monsters: [
-      { id: "forest-goblin", name: "Forest Goblin", hp: 9 },
+      { id: "forest-goblin", name: "Forest Goblin", hp: 7, hpBefore: 9 }, // 9 HP until Nov 2026
       { id: "moss-slime", name: "Moss Slime", hp: 5, slow: 2, hpBefore: 7 }, // 7 HP until Nov 2026
       { id: "grey-wolf", name: "Grey Wolf", hp: 12 },
       { id: "goblin-chief", name: "Goblin Chief", hp: 14, boss: true },
@@ -73,19 +77,21 @@ export const ZONES = [
     ],
   },
   {
-    id: "ash", name: "The Ashlands", blurb: "Burnt land. The biggest single-set monsters live here.",
+    id: "ash", name: "The Ashlands", blurb: "Burnt land. Here the fights come in rounds: a set, a break, then the next set.",
     monsters: [
-      { id: "ember-hound", name: "Ember Hound", hp: 44 },
-      { id: "ash-knight", name: "Ash Knight", hp: 50 },
-      { id: "burnt-king", name: "The Burnt King", hp: 60, boss: true },
+      // one set of 44 / 50 / 60 until Nov 2026
+      { id: "ember-hound", name: "Ember Hound", rounds: [16, 16], hpBefore: 44, oneSetBefore: true },
+      { id: "ash-knight", name: "Ash Knight", rounds: [19, 19], hpBefore: 50, oneSetBefore: true },
+      { id: "burnt-king", name: "The Burnt King", rounds: [16, 16, 16], boss: true, hpBefore: 60, oneSetBefore: true },
     ],
   },
   {
-    id: "spine", name: "Dragon's Spine", blurb: "The end of the map. Every monster here takes several sets.",
+    id: "spine", name: "Dragon's Spine", blurb: "The end of the map. The longest fights: up to four rounds of 20.",
     monsters: [
-      { id: "ash-drake", name: "Ash Drake", rounds: [30, 30] },
-      { id: "stone-colossus", name: "Stone Colossus", rounds: [35, 35, 35] },
-      { id: "elder-dragon", name: "The Elder Dragon", rounds: [40, 40, 40, 40], boss: true },
+      // 30+30, 35x3 and 40x4 until Nov 2026
+      { id: "ash-drake", name: "Ash Drake", rounds: [20, 20], hpBefore: 60 },
+      { id: "stone-colossus", name: "Stone Colossus", rounds: [20, 20, 20], hpBefore: 105 },
+      { id: "elder-dragon", name: "The Elder Dragon", rounds: [20, 20, 20, 20], boss: true, hpBefore: 160 },
     ],
   },
 ];
@@ -206,14 +212,20 @@ export function xpReward(m, where) {
 }
 
 // Strength test: you start in the highest area whose hardest plain fight (no special rules) you could win.
-export function startZoneFor(reps) {
+// before: the rule as it was before areas changed to rounds (checks backups made back then).
+export function startZoneFor(reps, { before = false } = {}) {
   let zi = 0;
   ZONES.forEach((z, i) => {
-    const plain = z.monsters.filter(m => !m.slow && !m.rounds).map(m => m.hp);
+    const plain = z.monsters.filter(m => !m.slow && (!m.rounds || (before && m.oneSetBefore)))
+      .map(m => (before && m.oneSetBefore ? m.hpBefore : m.hp));
     if (plain.length && Math.max(...plain) <= reps) zi = i;
   });
   return zi;
 }
+
+// The most HP a wanderer ever had: they take the HP of plain monsters, including ones that were plain before.
+export const wanderHpEver = Math.max(...ZONES.flatMap(z => z.monsters)
+  .filter(m => !m.slow && (!m.rounds || m.oneSetBefore)).map(m => Math.max(m.hp, m.hpBefore || 0)));
 
 export function findMonster(id) {
   for (const [zi, zone] of ZONES.entries()) {

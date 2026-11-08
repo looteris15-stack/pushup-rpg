@@ -3198,6 +3198,97 @@ const tests = [
     check(!bad.length, bad.join(" || "));
     return `tries at depth: ${tries.map(x => `${x.secs} s${x.shown ? " (Push up!)" : ""}`).join(", ")}`;
   }],
+  // ------------------------------------------- Journal 8 (Day 5): new HP plan
+  ["Journal 8a The numbers: Forest Goblin 7; the Ashlands in rounds (2x16, 2x19, 3x16); Dragon's Spine in 20-rep rounds (2, 3, 4); lowered monsters keep their old HP for backups", async () => {
+    const { ZONES, xpReward } = await import(`../app/data.js?t=${Date.now()}`);
+    const all = Object.fromEntries(ZONES.flatMap(z => z.monsters).map(m => [m.id, m]));
+    const want = {
+      "forest-goblin": { hp: 7, hpBefore: 9 },
+      "ember-hound": { rounds: [16, 16], hp: 32, hpBefore: 44 },
+      "ash-knight": { rounds: [19, 19], hp: 38, hpBefore: 50 },
+      "burnt-king": { rounds: [16, 16, 16], hp: 48, hpBefore: 60 },
+      "ash-drake": { rounds: [20, 20], hp: 40, hpBefore: 60 },
+      "stone-colossus": { rounds: [20, 20, 20], hp: 60, hpBefore: 105 },
+      "elder-dragon": { rounds: [20, 20, 20, 20], hp: 80, hpBefore: 160 },
+    };
+    const bad = [];
+    for (const [id, w] of Object.entries(want)) {
+      const m = all[id], got = m && { hp: m.hp, hpBefore: m.hpBefore, ...(w.rounds ? { rounds: m.rounds } : {}) };
+      if (JSON.stringify(got) !== JSON.stringify({ hp: w.hp, hpBefore: w.hpBefore, ...(w.rounds ? { rounds: w.rounds } : {}) })) bad.push(`${id}: ${JSON.stringify(got)}`);
+    }
+    // the biggest single set left on the map is the Frost Giant; the first fight of each late area is a step in
+    const single = ZONES.flatMap(z => z.monsters).filter(m => !m.rounds).map(m => m.hp);
+    if (Math.max(...single) !== 36) bad.push(`biggest single set ${Math.max(...single)} (36 expected)`);
+    const xp = { goblin: xpReward(all["forest-goblin"], "world"), drake: xpReward(all["ash-drake"], "world"), dragon: xpReward(all["elder-dragon"], "world") };
+    if (!(xp.goblin === 7 && xp.drake === 40 && xp.dragon === 160)) bad.push(`XP ${JSON.stringify(xp)}`);
+    check(!bad.length, bad.join(" || "));
+    return `Ashlands ${["ember-hound", "ash-knight", "burnt-king"].map(id => all[id].rounds.join("+")).join(", ")}; Spine ${["ash-drake", "stone-colossus", "elder-dragon"].map(id => all[id].rounds.join("+")).join(", ")}; XP ${JSON.stringify(xp)}`;
+  }],
+  ["Journal 8b In the game: a Forest Goblin win is 7 hits for 7 XP; the Ash Drake fight is 20 + 20 with the rules saying so", async () => {
+    await reset();
+    let A = await open("A");
+    const xp0 = A.state.xp;
+    await A.fightMonster("forest-goblin");
+    const total = A.fight ? A.fight.total : null;
+    await A.reps(total || 0); await wait(300);
+    const goblin = { total, won: /defeated/i.test(A.modal()), gained: A.state.xp - xp0 };
+    await reset({ ...BASE, unlockedZones: 7 });
+    A = await open("A");
+    await A.goto("map");
+    A.d.querySelector('.mrow[data-id="ash-drake"]').click(); await wait(200);
+    const rules = A.modal();
+    A.closeModal();
+    await A.fightMonster("ash-drake");
+    const drake = { total: A.fight && A.fight.total, rounds: A.fight && A.fight.rounds, rulesSay: (rules.match(/\d+ rounds: [\d +]+ pushups/) || [])[0] || rules.slice(0, 80) };
+    const bad = [];
+    if (!(goblin.total === 7 && goblin.won && goblin.gained === 7)) bad.push(`Forest Goblin: ${JSON.stringify(goblin)}`);
+    if (!(drake.total === 40 && JSON.stringify(drake.rounds) === "[20,20]" && drake.rulesSay === "2 rounds: 20 + 20 pushups")) bad.push(`Ash Drake: ${JSON.stringify(drake)}`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify({ goblin, drake });
+  }],
+  ["Journal 8c Backups from before still restore (Forest Goblin at 9, Elder Dragon at 160, a 60 HP wanderer, Ashlands opened by a strength test of 60); one pushup over the old limit is still refused", async () => {
+    await reset();
+    const A = await open("A");
+    // strength test 60 (that opened the Ashlands then), then the Burnt King (opens the Spine), the dragon,
+    // a Forest Goblin and a wanderer at the old biggest wanderer HP (60): every number at the old limit
+    const before = { ...BASE, tested: true, testResult: 60, unlockedZones: 7, xp: 60 + 9 + 120 + 320 + 120,
+      kills: { "forest-goblin": 1, "burnt-king": 1, "elder-dragon": 1, "wanderer-golden-boar": 1 }, losses: {},
+      stats: { pushups: 60 + 9 + 60 + 160 + 60, fights: 4, wins: 4, bestSet: 60, biggestKill: 160, deepestFloor: 0 } };
+    const res = {
+      oldBackup: flat(await A.restoreCode(oldCode(before))).slice(0, 90),
+      tooManyPushups: flat(await A.restoreCode(oldCode({ ...before, stats: { ...before.stats, pushups: before.stats.pushups + 1 } }))).slice(0, 110),
+      tooMuchXp: flat(await A.restoreCode(oldCode({ ...before, xp: before.xp + 1 }))).slice(0, 110),
+    };
+    const bad = [];
+    if (!/restored/i.test(res.oldBackup)) bad.push(`the backup from before was refused: "${res.oldBackup}"`);
+    if (/restored/i.test(res.tooManyPushups)) bad.push(`one pushup too many was accepted: "${res.tooManyPushups}"`);
+    if (/restored/i.test(res.tooMuchXp)) bad.push(`one XP too many was accepted: "${res.tooMuchXp}"`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
+    return JSON.stringify(res);
+  }],
+  ["Journal 8d The strength test places you at most in Frost Peaks now (the Ashlands are rounds); wanderers for late areas have Frost Giant HP (36, or 25 with slow reps)", async () => {
+    const { startZoneFor, ZONES } = await import(`../app/data.js?t=${Date.now()}`);
+    const res = { place: Object.fromEntries([8, 14, 30, 36, 60, 200].map(r => [r, ZONES[startZoneFor(r)].id])) };
+    const bad = [];
+    const want = { 8: "meadow", 14: "birch", 30: "ridge", 36: "peaks", 60: "peaks", 200: "peaks" };
+    if (JSON.stringify(res.place) !== JSON.stringify(want)) bad.push(`placement ${JSON.stringify(res.place)}`);
+    // a player with every area open: look at the next days until a wanderer shows up
+    await reset({ ...BASE, unlockedZones: 7 });
+    const A = await open("A");
+    res.wanderers = [];
+    for (let d = 0; d < 8 && res.wanderers.length < 3; d++) {
+      A.api.timeTravel(24);
+      const w = A.api.wanderer();
+      if (w) res.wanderers.push(`${w.id}:${w.hp}`);
+      if (w && w.hp !== (w.slow ? 25 : 36)) bad.push(`${w.id} has ${w.hp} HP`);
+    }
+    if (!res.wanderers.length) bad.push("test setup: no wanderer in 8 days");
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();

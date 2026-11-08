@@ -1,5 +1,5 @@
 import { createTracker, initAudio, quietAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake, testHooks } from "./core.js";
-import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, slowSecs, pauseSecs, artUrl } from "./data.js";
+import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, wanderHpEver, slowSecs, pauseSecs, artUrl } from "./data.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
 const SAVE_KEY = "pushupRPG.save.v1";
@@ -642,7 +642,7 @@ function readBackupOnce(text) {
 
 // Rules every real save follows. A backup that breaks one was changed by hand (or is broken).
 // Returns what is wrong, or null when it all adds up.
-const WANDER_HP_MAX = Math.max(...ZONES.flatMap(z => z.monsters.filter(m => !m.slow && !m.rounds).map(m => m.hp)));
+const WANDER_HP_MAX = wanderHpEver; // the most a wanderer ever had (60 until the Ashlands changed to rounds)
 function checkSave(s) {
   const whole = v => Number.isFinite(v) && v >= 0 && Math.floor(v) === v;
   // the monster lists may be missing or null (cleanSave repairs them), but never an array or a plain value
@@ -687,7 +687,8 @@ function checkSave(s) {
   if (s.xp > maxXp) return `${num(s.xp)} XP, but its wins could give at most ${num(maxXp)}`;
 
   // areas open only through the strength test and then each area's boss in turn
-  let canOpen = s.tested ? startZoneFor(test) + 1 : 1;
+  // (the test may be from before the Ashlands changed to rounds, when a big result could open them)
+  let canOpen = s.tested ? Math.max(startZoneFor(test), startZoneFor(test, { before: true })) + 1 : 1;
   while (canOpen < ZONES.length && kills[ZONES[canOpen - 1].monsters.find(m => m.boss).id]) canOpen++;
   const open = s.unlockedZones ?? 1;
   if (open < 1 || open > canOpen) return `${open} areas open, but only ${canOpen} could be`;
