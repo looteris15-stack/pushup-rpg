@@ -295,6 +295,10 @@ function setFightArt(m) {
   img.hidden = !url;
   if (url && img.getAttribute("src") !== url) img.src = url;
 }
+// a monster's HP as shown: "17 HP", or for one fought in rounds "2 × 16" ("20 + 25" when the rounds differ)
+const hpText = m => (m.rounds && m.rounds.length > 1
+  ? (m.rounds.every(r => r === m.rounds[0]) ? `${m.rounds.length} × ${m.rounds[0]}` : m.rounds.join(" + "))
+  : `${m.hp} HP`);
 const chips = m => [
   m.boss ? '<span class="chip boss">Boss</span>' : "",
   m.rounds ? `<span class="chip">${m.rounds.length} rounds</span>` : "",
@@ -484,12 +488,12 @@ function renderDungeon() {
   $("dgFloor").innerHTML = `
     <div class="m-row"><h2>Floor ${shown} of ${total}</h2><span class="hp-range">${sum} pushups in total</span></div>
     <ol class="rooms">
-      ${rooms.map((m, i) => `<li class="${i < done ? "done" : i === done ? "next" : ""}"><span class="beast">${thumb(m.id)}<span>Room ${i + 1}: <b>${esc(m.name)}</b> ${chips(m)}</span></span><span class="mhp">${m.hp} HP</span></li>`).join("")}
+      ${rooms.map((m, i) => `<li class="${i < done ? "done" : i === done ? "next" : ""}"><span class="beast">${thumb(m.id)}<span>Room ${i + 1}: <b>${esc(m.name)}</b> ${chips(m)}</span></span><span class="mhp">${hpText(m)}</span></li>`).join("")}
       <li class="safe"><span>Safe room</span><span>progress saved</span></li>
     </ol>
     ${button ? `<div class="row">${button}</div>` : ""}`;
   $("dgRules").innerHTML = `
-    <li>Fight ${rooms.length} rooms in a row. Each monster is one set.</li>
+    <li>Fight ${rooms.length} rooms in a row. Each monster is one set, except big ones in rounds (from floor 6): several sets with ${RULES.roundRestSec} seconds of rest between them.</li>
     <li>You get ${RULES.restBetweenRoomsSec} seconds of rest between rooms. Then do your first rep within ${RULES.dungeonStartSec} seconds.</li>
     <li>Reach the safe room to save the floor and get +${RULES.floorBonusXp} XP times the floor number.</li>
     <li>Lose or leave before the safe room: the mine closes for ${RULES.dungeonLockDays} days and you recover ${RULES.restHoursAfterLoss} hours.</li>
@@ -1601,13 +1605,17 @@ function roundBreak() {
   sfx.win();
   say(`Round ${f.round} done. Rest.`);
   renderFightHud();
+  // in the mine, giving up between rounds is leaving the mine (closed for days, unless it's a replay)
+  const run = f.where === "dungeon" ? state.run : null;
   startRest({
     sec: RULES.roundRestSec,
     title: `Round ${f.round} of ${f.rounds.length} done`,
     next: `Next: round ${f.round + 1}, <b>${f.roundLeft} pushups</b>. ${f.hpLeft} HP left in total.`,
-    quitLabel: "Give up",
+    quitLabel: run ? "Leave the mine" : "Give up",
     quitReason: "You gave up between rounds.",
-    warn: "Giving up counts as a loss. Leaving the app longer than the break does too.",
+    warn: !run ? "Giving up counts as a loss. Leaving the app longer than the break does too."
+      : run.replay ? `Leaving now counts as a loss: ${RULES.restHoursAfterLoss} hours of rest (the mine stays open). Leaving the app longer than the break does too.`
+      : `Leaving now closes the mine for ${RULES.dungeonLockDays} days. Leaving the app longer than the break does too.`,
     onDone: resumeRound,
   });
 }
@@ -1635,7 +1643,7 @@ function mineBreak(sec, title, lines) {
   startRest({
     sec,
     title,
-    next: `${lines.length ? lines.join("<br>") + "<br>" : ""}Next: <b>${esc(next.name)}</b>, ${next.hp} HP (room ${run.room + 1} of ${rooms.length})${next.slow ? `<br><span class="chip slow">Slow reps · ${slowSecs(next)} s down</span>` : ""}`,
+    next: `${lines.length ? lines.join("<br>") + "<br>" : ""}Next: <b>${esc(next.name)}</b>, ${hpText(next)} (room ${run.room + 1} of ${rooms.length})${next.slow ? `<br><span class="chip slow">Slow reps · ${slowSecs(next)} s down</span>` : ""}${next.rounds && next.rounds.length > 1 ? `<br>${next.rounds.length} rounds with ${RULES.roundRestSec} s of rest between them.` : ""}`,
     quitLabel: "Leave the mine",
     quitReason: run.replay ? "You left the replay before the safe room." : "You left the mine before the safe room.",
     warn: run.replay

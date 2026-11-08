@@ -14,7 +14,7 @@ export const RULES = {
   leaveAppSec: 10,          // a fight that has started: away from the app longer than this = you gave up
   slowDownSec: 2,           // "slow reps": going down must take this long (2 early, 3 in later areas)
   slowHardSec: 3,
-  specialHpMult: 0.7,       // slow-rep monsters get fewer HP, because each rep is harder
+  specialHpMult: 0.7,       // slow-rep monsters get fewer HP, because each rep is harder (map and mine set theirs by hand; wanderers use this)
   specialXpMult: 1.5,       // ...and more XP per HP
   bossXpMult: 2,
   dungeonXpMult: 1.5,
@@ -101,7 +101,24 @@ export const ZONES = [
 ];
 for (const z of ZONES) for (const m of z.monsters) if (m.rounds) m.hp = m.rounds.reduce((a, b) => a + b, 0);
 
-// The mine: each floor is 3 rooms in a row, then a safe room. HP = 3 + 2 x floor + room.
+// The mine (endurance): each floor is 3 rooms in a row, then a safe room. Balanced to the world map (Nov 2026):
+// with 90 s breaks, every pushup already done on a floor costs about 1/4 rep in the next set (a slow rep counts
+// 1/0.7), so floor 1 is like a ~10 HP map monster and floor 10 like the Elder Dragon (~60).
+// From floor 6, the last room of a floor is fought in rounds (a break between, like between rooms).
+// Each room: HP, [rounds], or { slow: HP } (2 s slow reps, 3 s from floor 6). All rooms only went up, so
+// wins from before need no hpBefore.
+const FLOOR_HP = [
+  [5, 6, 7],
+  [7, 8, 9],
+  [9, { slow: 7 }, 11],
+  [12, 13, 14],
+  [{ slow: 10 }, 16, 17],
+  [{ slow: 13 }, 20, [16, 16]],
+  [22, 23, [20, 20]],
+  [26, 27, { slow: 20 }],
+  [30, 31, [22, 22, 22]],
+  [32, 33, [25, 25, 25, 25]],
+];
 const FLOOR_NAMES = [
   ["Mine Rat", "Cave Bat", "Tunnel Goblin"],
   ["Bat Swarm", "Rock Crawler", "Goblin Guard"],
@@ -114,16 +131,17 @@ const FLOOR_NAMES = [
   ["Abyss Crawler", "Night Golem", "Hollow Guard"],
   ["Stone Warden", "Elder Drake", "The Deep King"],
 ];
-const SLOW_IN_MINE = new Set(["Lantern Ghost", "Crystal Slime", "Mine Wraith", "Deep Wraith"]);
 export const DUNGEON = {
   name: "The Old Mine",
   floors: FLOOR_NAMES.map((names, fi) => names.map((name, ri) => {
-    const hp = 3 + 2 * (fi + 1) + ri;
-    const slow = SLOW_IN_MINE.has(name) && (fi + 1 >= 6 ? RULES.slowHardSec : RULES.slowDownSec);
+    const spec = FLOOR_HP[fi][ri];
+    const rounds = Array.isArray(spec) ? spec : null;
+    const slow = spec && spec.slow ? (fi + 1 >= 6 ? RULES.slowHardSec : RULES.slowDownSec) : 0;
     return {
       id: `mine-${fi + 1}-${ri + 1}`,
       name,
-      hp: slow ? Math.round(hp * RULES.specialHpMult) : hp,
+      hp: rounds ? rounds.reduce((a, b) => a + b, 0) : slow ? spec.slow : spec,
+      ...(rounds ? { rounds } : {}),
       slow,
       boss: fi === FLOOR_NAMES.length - 1 && ri === names.length - 1,
     };

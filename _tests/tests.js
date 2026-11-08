@@ -665,11 +665,14 @@ function playFrames(g, t, frames) {
   return t;
 }
 
-// a world-map monster that is fought in rounds (with a break between), or null when the map has none
-async function roundFightId() {
-  const { ZONES } = await import(`../app/data.js?t=${Date.now()}`);
-  const m = ZONES.flatMap(z => z.monsters).find(x => x.rounds && x.rounds.length > 1);
-  return m ? m.id : null;
+// a mine run waiting at floor 6, room 3: the Rust Golem, fought in 2 rounds of 16
+const ROUND_ROOM = { ...BASE, dungeonFloor: 6, stats: { ...BASE.stats, deepestFloor: 5 }, run: { floor: 6, room: 2 } };
+// continues that run: the short "back in the mine" break is skipped, then the round room starts
+async function startRoundRoom(A) {
+  await A.continueRun();
+  await until(() => A.api.rest || (A.fight && !A.fight.over), 5000, "the run to continue").catch(() => {});
+  if (A.api.rest) A.api.skipRest();
+  await until(() => A.fight && !A.fight.over, 4000, "the round room").catch(() => {});
 }
 
 // leaving before a fight really began must cost nothing: no loss, no rest, no mine lock, no leftover fight
@@ -2277,10 +2280,8 @@ const tests = [
   // ---------------- Item 8 (audit finding #2): no body tracking during breaks; at most 30 inferences a second
   ["Item 8a Mine-room and boss-round breaks: from the frame that ends the set, no inference, counting or drawing; preview, lock and countdown stay; hidden and back stays paused; quitting lets go", async () => {
     const bad = [], notes = [];
-    const roundId = await roundFightId();
     for (const where of ["mine", "round"]) {
-      if (where === "round" && !roundId) { notes.push("round: skipped, no fight in rounds on the map right now"); continue; }
-      await reset(where === "round" ? { ...BASE, unlockedZones: 7 } : BASE);
+      await reset(where === "round" ? ROUND_ROOM : BASE);
       const A = await open("A");
       await skipWarmUp(A);
       A.api.strictCamera = true;
@@ -2288,7 +2289,7 @@ const tests = [
       A.camera(cam);
       A.api.hooks.setModelLoader(async () => ({ lm: poseModel(pose, A.w), used: "GPU" }));
       const wl = A.fakeWakeLock(false), loop = A.countLoop();
-      if (where === "mine") await A.enterFloor(); else await A.fightMonster(roundId);
+      if (where === "mine") await A.enterFloor(); else await startRoundRoom(A);
       check(A.fight && !A.fight.over, `${where}: test setup: the fight didn't start`);
       const need = where === "mine" ? A.fight.total : A.fight.rounds[0];
       await A.reps(need - 1); // all but the last rep from the debug button
@@ -2327,10 +2328,8 @@ const tests = [
   }],
   ["Item 8b After a break (Fight now, or time up): one loop again, the first frame tracked at once, the first rep counts once; start window, counter and HUD fresh", async () => {
     const bad = [], notes = [];
-    const roundId = await roundFightId();
     for (const [where, how] of [["mine", "fight now"], ["round", "time up"]]) {
-      if (where === "round" && !roundId) { notes.push("round: skipped, no fight in rounds on the map right now"); continue; }
-      await reset(where === "round" ? { ...BASE, unlockedZones: 7 } : BASE);
+      await reset(where === "round" ? ROUND_ROOM : BASE);
       const A = await open("A");
       await skipWarmUp(A);
       A.api.strictCamera = true;
@@ -2339,7 +2338,7 @@ const tests = [
       A.api.hooks.setModelLoader(async () => ({ lm: poseModel(pose, A.w), used: "GPU" }));
       A.fakeWakeLock(false);
       const loop = A.countLoop();
-      if (where === "mine") await A.enterFloor(); else await A.fightMonster(roundId);
+      if (where === "mine") await A.enterFloor(); else await startRoundRoom(A);
       check(A.fight && !A.fight.over, `${where}: test setup: the fight didn't start`);
       const need = where === "mine" ? A.fight.total : A.fight.rounds[0];
       await A.reps(need - 1);
@@ -3319,6 +3318,107 @@ const tests = [
     if (!res.wanderers.length) bad.push("test setup: no wanderer in 8 days");
     if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
     check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  // ------------------------------------------- Mine step 2: the mine balanced to the world map, rounds from floor 6
+  ["Mine 2a Every room as agreed (HP, slow reps, rounds); each floor is harder than the one before by the 1/4-rep rule, and floor 10 is like the Elder Dragon (~60)", async () => {
+    const { DUNGEON, slowSecs } = await import(`../app/data.js?t=${Date.now()}`);
+    // per floor: rooms as HP, [rounds], or "Ns" for N slow reps
+    const WANT = [
+      [5, 6, 7], [7, 8, 9], [9, "7s", 11], [12, 13, 14], ["10s", 16, 17],
+      ["13s", 20, [16, 16]], [22, 23, [20, 20]], [26, 27, "20s"], [30, 31, [22, 22, 22]], [32, 33, [25, 25, 25, 25]],
+    ];
+    const bad = [], show = r => (r.rounds && r.rounds.length > 1 ? `[${r.rounds.join(",")}]` : r.slow ? `${r.hp}s${slowSecs(r)}` : String(r.hp));
+    const want = WANT.map((rooms, fi) => rooms.map(r => (Array.isArray(r) ? `[${r.join(",")}]` : typeof r === "string" ? `${parseInt(r)}s${fi + 1 >= 6 ? 3 : 2}` : String(r))));
+    const got = DUNGEON.floors.map(rooms => rooms.map(show));
+    if (JSON.stringify(got) !== JSON.stringify(want)) bad.push(`rooms ${JSON.stringify(got)}`);
+    const totals = DUNGEON.floors.map(rooms => rooms.reduce((a, m) => a + m.hp, 0));
+    if (totals.join() !== "18,24,27,39,43,65,85,73,127,165") bad.push(`totals ${totals.join(", ")}`);
+    const boss = DUNGEON.floors.flat().filter(m => m.boss).map(m => m.name);
+    if (boss.join() !== "The Deep King") bad.push(`bosses: ${boss.join(", ")}`);
+    // the 1/4-rep rule: every pushup already done on the floor costs a quarter rep in the next set; a slow rep counts 1/0.7
+    const need = DUNGEON.floors.map(rooms => {
+      let done = 0, most = 0;
+      for (const m of rooms) for (const set of (m.rounds && m.rounds.length > 1 ? m.rounds : [m.hp])) {
+        const eff = m.slow ? set / 0.7 : set;
+        most = Math.max(most, eff + done / 4);
+        done += eff;
+      }
+      return Math.round(most);
+    });
+    if (!need.every((n, i) => i === 0 || n > need[i - 1])) bad.push(`not harder floor by floor: ${need.join(", ")}`);
+    if (!(need[9] >= 58 && need[9] <= 62)) bad.push(`floor 10 needs ~${need[9]} (about 60 expected)`);
+    check(!bad.length, bad.join(" || "));
+    return `like a map monster of: ${need.join(", ")}`;
+  }],
+  ["Mine 2b A round room: the mine screen shows it; Rust Golem is 16, a 90 s break, then 30 s to start, then 16 more; winning clears the floor", async () => {
+    await reset(ROUND_ROOM);
+    const A = await open("A");
+    await A.goto("dungeon");
+    const res = { floorText: A.text("#dgFloor").slice(0, 400), rules: A.text("#dgRules") };
+    const xp0 = A.state.xp;
+    await startRoundRoom(A);
+    res.fight = A.fight ? { name: A.fight.m.name, rounds: A.fight.rounds, total: A.fight.total } : null;
+    await A.reps(16);
+    await until(() => A.api.rest, 3000, "the round break").catch(() => {});
+    res.brk = { on: !!A.api.rest, title: A.text("#restTitle"), clock: A.text("#restTime"), next: A.text("#restNext"), warn: A.text("#restWarn"), quit: A.text("#btnQuitRun") };
+    A.api.skipRest();
+    await until(() => A.fight && !A.api.rest, 2000, "round 2").catch(() => {});
+    await wait(300);
+    res.round2 = { timedStart: !!A.fight && A.fight.timedStart && !A.fight.started, threat: A.text("#threatText"), where: A.text("#fWhere") };
+    await A.reps(16);
+    await wait(400);
+    const s = saved();
+    res.after = { modal: A.modal().slice(0, 120), deepest: s.stats.deepestFloor, floor: s.dungeonFloor, kill: (s.kills || {})["mine-6-3"] || 0, xpGained: s.xp - xp0, run: s.run };
+    const bad = [];
+    if (!/65 pushups in total/.test(res.floorText) || !/Rust Golem.*2 × 16/.test(res.floorText)) bad.push(`mine screen: "${res.floorText}"`);
+    if (!/rounds/i.test(res.rules)) bad.push(`the mine rules don't explain rounds: "${res.rules}"`);
+    if (!(res.fight && res.fight.name === "Rust Golem" && JSON.stringify(res.fight.rounds) === "[16,16]" && res.fight.total === 32)) bad.push(`fight ${JSON.stringify(res.fight)}`);
+    if (!(res.brk.on && /round 1 of 2/i.test(res.brk.title) && /1:(30|29)/.test(res.brk.clock) && /16 pushups/.test(res.brk.next) && /7 days/.test(res.brk.warn) && /leave the mine/i.test(res.brk.quit))) bad.push(`break ${JSON.stringify(res.brk)}`);
+    if (!(res.round2.timedStart && /Attack in (30|29) s/.test(res.round2.threat) && /round 2 of 2/i.test(res.round2.where))) bad.push(`round 2 ${JSON.stringify(res.round2)}`);
+    // 32 HP x 1.5 for the mine = 48 XP, + 60 for reaching the safe room of floor 6
+    if (!(/floor 6 cleared/i.test(res.after.modal) && res.after.deepest === 6 && res.after.floor === 7 && res.after.kill === 1 && res.after.xpGained === 48 + 60 && !res.after.run)) bad.push(`after ${JSON.stringify(res.after)}`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Mine 2c Giving up between rounds: the mine closes for 7 days (on a replay: only the 10-hour rest, the mine stays open)", async () => {
+    const res = {}, bad = [];
+    for (const replay of [false, true]) {
+      await reset(replay ? { ...ROUND_ROOM, dungeonFloor: 7, stats: { ...BASE.stats, deepestFloor: 6 }, run: { floor: 6, room: 2, replay: true } } : ROUND_ROOM);
+      const A = await open("A");
+      await startRoundRoom(A);
+      await A.reps(16);
+      await until(() => A.api.rest, 3000, "the round break").catch(() => {});
+      const k = replay ? "replay" : "run";
+      if (!A.api.rest || !/round 1 of 2/i.test(A.text("#restTitle"))) { bad.push(`${k}: test setup: no round break ("${A.text("#restTitle")}")`); continue; }
+      const warn = A.text("#restWarn");
+      const q = A.d.querySelector("#btnQuitRun"); q.click(); await wait(80); q.click(); await wait(400);
+      const s = saved();
+      res[k] = { warn, rest: s.restUntil > Date.now() + 9.9 * 3600e3, locked: s.dungeonLockedUntil > Date.now() + 6.9 * 86400e3, run: s.run, loss: (s.losses || {})["mine-6-3"] || 0, modal: A.modal().slice(0, 100) };
+      const r = res[k];
+      if (!(r.rest && !r.run && r.loss === 1 && (replay ? !r.locked && !/7 days/.test(r.warn) : r.locked && /7 days/.test(r.warn)))) bad.push(`${k}: ${JSON.stringify(r)}`);
+      if (A.errors.length) bad.push(`${k} errors: ` + A.errors.join(" | "));
+    }
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Mine 2d A backup with the new big rooms (The Deep King: 100 pushups, 300 XP) restores; one more pushup or XP is refused", async () => {
+    await reset();
+    const A = await open("A");
+    const deep = { ...GOOD, dungeonFloor: 11, xp: 15 + 300, kills: { "mine-10-3": 1 }, losses: {},
+      stats: { ...GOOD.stats, pushups: 15 + 100, fights: 1, wins: 1, biggestKill: 100, deepestFloor: 10 } };
+    const res = {
+      ok: flat(await A.restoreCode(oldCode(deep))).slice(0, 80),
+      pushup: flat(await A.restoreCode(oldCode({ ...deep, stats: { ...deep.stats, pushups: 116 } }))).slice(0, 110),
+      xp: flat(await A.restoreCode(oldCode({ ...deep, xp: 15 + 300 + 550 + 1 }))).slice(0, 110),
+    };
+    const bad = [];
+    if (!/restored/i.test(res.ok)) bad.push(`refused: "${res.ok}"`);
+    if (/restored/i.test(res.pushup)) bad.push(`one pushup too many was accepted: "${res.pushup}"`);
+    if (/restored/i.test(res.xp)) bad.push(`one XP too many was accepted: "${res.xp}"`);
+    if (A.errors.length) bad.push("errors: " + A.errors.join(" | "));
+    check(!bad.length, bad.join(" || "));
     return JSON.stringify(res);
   }],
   // ------------------------------------------------------------ earlier fixes keep working
