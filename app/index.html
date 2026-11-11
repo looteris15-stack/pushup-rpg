@@ -151,16 +151,18 @@
         <label for="restoreText">Restore a backup</label>
         <textarea id="restoreText" placeholder="Paste a backup code, or the whole backup message, here"></textarea>
       </div>
+      <!-- Restore comes first: its "Tap again..." text is long, and this way it grows in place (stays under
+           the finger) instead of jumping to the next line on a phone -->
       <div class="row">
-        <label class="btn file-btn"><input type="file" id="restoreFile" accept=".txt,text/plain">Open backup file</label>
         <button type="button" id="btnRestore">Restore</button>
+        <label class="btn file-btn"><input type="file" id="restoreFile" accept=".txt,text/plain">Open backup file</label>
       </div>
       <p class="fine" id="backupMsg" role="status"></p>
       <p class="fine" id="storageNote"></p>
     </div>
     <div class="card-block panel">
       <h2>Progress</h2>
-      <p class="fine">Start again from level 1. Your settings stay. This cannot be undone.</p>
+      <p class="fine">Start again from level 1. Your settings stay, and so does a rest or mine closure that is still running. This cannot be undone.</p>
       <div class="row"><button type="button" id="btnWipe" class="danger-btn">Reset all progress</button></div>
     </div>
   </div>

@@ -7,6 +7,7 @@ export const RULES = {
   restBetweenRoomsSec: 90,  // break between rooms in the mine
   roundRestSec: 90,         // break between rounds of a big monster
   dungeonStartSec: 30,      // after a break, do the first rep within this time
+  lateStartSec: 10,         // back in the game after the break already ended: at least this much of that time is left
   maxPauseSec: 15,          // after the first rep: no strict rep for this long = the monster gets you
   slowPauseSec: 20,         // ...in a fight with 2 s slow reps (each try takes longer)
   slowHardPauseSec: 23,     // ...in a fight with 3 s slow reps

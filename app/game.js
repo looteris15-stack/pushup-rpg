@@ -14,6 +14,7 @@ const SETTING_RANGES = { depth: [40, 120], top: [140, 178], bend: [8, 40], knee:
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`; // "1 hit", "2 hits"
+const the = name => (name.startsWith("The ") ? name : "the " + name); // "the Old Badger", but "The Burnt King"
 let timeOffset = 0; // debug only: pretend time has passed
 const now = () => Date.now() + timeOffset;
 
@@ -376,7 +377,7 @@ function renderMap() {
     const prevBoss = zi > 0 ? ZONES[zi - 1].monsters.find(m => m.boss) : null;
     return `<section class="zone panel${open ? "" : " locked"}">
       <header><div><h2>${esc(z.name)}</h2><p class="fine">${esc(z.blurb)}</p></div><span class="hp-range">${Math.min(...hp)}–${Math.max(...hp)} HP</span></header>
-      ${open ? `<div class="mlist">${z.monsters.map(m => monsterRow(m, z)).join("")}</div>` : `<p class="fine">Locked. Beat the ${esc(prevBoss.name)} to open it.</p>`}
+      ${open ? `<div class="mlist">${z.monsters.map(m => monsterRow(m, z)).join("")}</div>` : `<p class="fine">Locked. Beat ${esc(the(prevBoss.name))} to open it.</p>`}
     </section>`;
   }).join("");
 }
@@ -465,9 +466,15 @@ function renderDungeon() {
   const t = now(), F = state.dungeonFloor, run = state.run, total = DUNGEON.floors.length;
   let status, button = "";
   if (run) {
+    // a break that was on when the game was closed keeps its own end (continueRun): say what comes next
+    const late = run.breakEndsAt + RULES.dungeonStartSec * 1000;
+    const next = !run.breakEndsAt ? "You get a short break first."
+      : run.breakEndsAt > t ? `The rest of your break comes first: ${until(run.breakEndsAt)}.`
+      : late > t ? `Your break is over: continue within ${until(late)} and the next room starts right away.`
+      : "You were away longer than the break, so the run counts as left.";
     status = run.replay
-      ? `<span class="chip warn">Replay not finished</span> You are replaying floor ${run.floor}, room ${run.room + 1}. You get a short break first.`
-      : `<span class="chip warn">Run not finished</span> You are on floor ${run.floor}, room ${run.room + 1}. You get a short break first.`;
+      ? `<span class="chip warn">Replay not finished</span> You are replaying floor ${run.floor}, room ${run.room + 1}. ${next}`
+      : `<span class="chip warn">Run not finished</span> You are on floor ${run.floor}, room ${run.room + 1}. ${next}`;
     button = `<button type="button" class="primary" data-action="continueRun">Continue the run</button>`;
   } else if (state.dungeonLockedUntil > t) {
     status = `<span class="chip bad">Closed</span> The mine is closed after your last run. It opens again in ${until(state.dungeonLockedUntil)} (${fmtAt(state.dungeonLockedUntil)}).`;
@@ -483,7 +490,8 @@ function renderDungeon() {
 
   const shown = run ? run.floor : Math.min(F, total);
   const rooms = DUNGEON.floors[shown - 1];
-  const done = run ? run.room : 0;
+  // rooms already beaten: those of the run, or all of them once the whole mine is conquered (no "next" room then)
+  const done = run ? run.room : F > total ? rooms.length : 0;
   const sum = rooms.reduce((a, m) => a + m.hp, 0);
   $("dgFloor").innerHTML = `
     <div class="m-row"><h2>Floor ${shown} of ${total}</h2><span class="hp-range">${sum} pushups in total</span></div>
@@ -505,7 +513,8 @@ function renderDungeon() {
   $("dgLadder").innerHTML = DUNGEON.floors.map((_, i) => {
     const f = i + 1;
     if (f < F && canReplay) return `<button type="button" class="done" data-action="replayFloor" data-floor="${f}" title="Play floor ${f} again">${f}</button>`;
-    return `<span class="${f < F ? "done" : f === here ? "here" : ""}" title="Floor ${f}">${f}</span>`;
+    // "here" also marks a cleared floor that is being replayed
+    return `<span class="${[f < F ? "done" : "", f === here ? "here" : ""].filter(Boolean).join(" ")}" title="Floor ${f}">${f}</span>`;
   }).join("");
 }
 
@@ -754,10 +763,33 @@ function cleanSave(s, keepMark = false) {
   out.wandererDone = str(s.wandererDone, 20);
   const w = s.wanderToday;
   out.wanderToday = w && typeof w === "object" && typeof w.key === "string" && Number.isFinite(w.hp) ? { key: w.key.slice(0, 20), hp: w.hp } : null;
-  if (out.run) out.run = { floor: out.run.floor, room: out.run.room, ...(Number.isFinite(out.run.breakEndsAt) ? { breakEndsAt: out.run.breakEndsAt } : {}),
+  // a restored run loses its break deadline too: it belonged to the day the backup was made, and would
+  // count the run as left the moment the backup is used
+  if (out.run) out.run = { floor: out.run.floor, room: out.run.room, ...(keepMark && Number.isFinite(out.run.breakEndsAt) ? { breakEndsAt: out.run.breakEndsAt } : {}),
     ...(out.run.replay === true ? { replay: true } : {}) };
   if (!keepMark) out.fightMark = null;
   return out;
+}
+
+// Restoring a backup or starting over never cancels a penalty, otherwise either would undo a loss: a rest or
+// mine closure that is still running stays, and a mine run that is on the line (past its first room, or in
+// a break) counts as left, like "Leave the mine". Call it before the progress is replaced; the function it
+// returns puts the penalties into the new progress and says what it kept ("" = nothing).
+const runOnTheLine = () => !!state.run && (state.run.room > 0 || !!state.run.breakEndsAt);
+function penaltiesToKeep() {
+  const t = now(), run = state.run;
+  let rest = state.restUntil || 0, lock = state.dungeonLockedUntil || 0;
+  const leftRun = runOnTheLine();
+  if (leftRun) {
+    rest = Math.max(rest, t + RULES.restHoursAfterLoss * 3600e3);
+    if (!run.replay) lock = Math.max(lock, t + RULES.dungeonLockDays * 86400e3);
+  }
+  return s => {
+    const kept = (rest > t && rest > (s.restUntil || 0)) || (lock > t && lock > (s.dungeonLockedUntil || 0));
+    s.restUntil = Math.max(s.restUntil || 0, rest);
+    s.dungeonLockedUntil = Math.max(s.dungeonLockedUntil || 0, lock);
+    return !kept ? "" : leftRun ? " Your unfinished mine run counts as left." : " The rest or mine closure you had still runs.";
+  };
 }
 
 function backupInfo() {
@@ -845,24 +877,28 @@ $("btnRestore").addEventListener("click", e => {
   const saved = r.save;
   if (!btn.dataset.armed) {
     restoreArmedText = text;
-    $("backupMsg").textContent = `Backup found: level ${levelFromXp(saved.xp || 0)}, ${plural(saved.stats.pushups || 0, "pushup")}.`;
+    $("backupMsg").textContent = `Backup found: level ${levelFromXp(saved.xp || 0)}, ${plural(saved.stats.pushups || 0, "pushup")}.`
+      + (runOnTheLine() ? " Restoring it counts as leaving your unfinished mine run." : "");
   }
   confirmTap(btn, "Tap again to replace your progress", () => {
     lastRead = restoreArmedText = null;
-    const rev = state.rev;
+    const rev = state.rev, keep = penaltiesToKeep();
     state = normalize(cleanSave(saved));
     needsSave = false;
     state.rev = Math.max(rev, state.rev || 0);
+    const kept = keep(state);
     applySettings();
     renderSettings();
     $("restoreText").value = "";
     // the progress now equals the backup it came from, so it counts as backed up
-    markBackedUp(`Restored: level ${levelFromXp(state.xp)}, ${plural(state.stats.pushups, "pushup")} done.`);
+    markBackedUp(`Restored: level ${levelFromXp(state.xp)}, ${plural(state.stats.pushups, "pushup")} done.${kept}`);
   });
 });
 
 $("btnWipe").addEventListener("click", e => confirmTap(e.currentTarget, "Tap again to reset everything", () => {
+  const keep = penaltiesToKeep();
   state = { ...freshState(state.settings), rev: state.rev };
+  keep(state);
   save();
   show("camp");
 }));
@@ -1379,7 +1415,7 @@ function win() {
     : rewardFor(f.m, f.where);
   state.xp += gain;
   recordFight(f, true);
-  const lines = [`+${gain} XP for ${f.m.name.startsWith("The ") ? "" : "the "}${esc(f.m.name)}.`];
+  const lines = [`+${gain} XP for ${esc(the(f.m.name))}.`];
   if (f.maxSet > prevBest) lines.push(`New best set: ${plural(f.maxSet, "pushup")}!`);
   sfx.win();
 
@@ -1632,11 +1668,12 @@ function resumeRound() {
   say(`Round ${f.round + 1}. Get into plank.`);
 }
 
-function mineBreak(sec, title, lines) {
+// endsAt: a break that was already on (back after the game was closed) keeps the end it had
+function mineBreak(sec, title, lines, endsAt = now() + sec * 1000) {
   fight = null;
   const run = state.run;
-  // remembered in the save: closing the game can't stretch a break (see settleLeftFight)
-  run.breakEndsAt = now() + sec * 1000;
+  // remembered in the save: closing the game can't stretch a break (see settleLeftFight and continueRun)
+  run.breakEndsAt = endsAt;
   save();
   const rooms = DUNGEON.floors[run.floor - 1];
   const next = rooms[run.room];
@@ -1706,9 +1743,19 @@ async function continueRun() {
   if (!mayStartHere()) return;
   if (!state.run) return;
   if (!(await openFightScreen("dungeon", continueRun))) return;
-  // back after the game was closed: only what was left of the break (a full minute if no break was on)
-  const left = state.run.breakEndsAt ? Math.ceil((state.run.breakEndsAt - now()) / 1000) : 60;
-  mineBreak(Math.max(5, left), "Back in the mine", []);
+  const run = state.run;
+  if (!run) { syncLost(); return; } // the run was ended in another window while the camera started
+  // Back after the game was closed. No break was on: a full minute. A break that was on keeps its own end,
+  // and one that is over isn't given again, so closing and reopening the game can't stretch a break.
+  const endsAt = run.breakEndsAt;
+  if (!endsAt) { mineBreak(60, "Back in the mine", []); return; }
+  const left = endsAt - now();
+  if (left > 0) { mineBreak(left / 1000, "Back in the mine", [], endsAt); return; }
+  // The break is over: the next room starts at once, and its start timer counts from the end of the break
+  // (with at least lateStartSec left, to get into plank). From here the fight is on the line (markFight in
+  // beginFight), so closing the game again loses it.
+  beginFight(DUNGEON.floors[run.floor - 1][run.room], "dungeon", true, DUNGEON.name);
+  fight.waitSince -= Math.min(-left, (RULES.dungeonStartSec - RULES.lateStartSec) * 1000);
 }
 
 // ---------- controls ----------
@@ -1795,6 +1842,10 @@ function settleAway(t) {
 window.addEventListener("beforeunload", e => {
   if ((fight && committed(fight)) || rest) { e.preventDefault(); e.returnValue = ""; }
 });
+// A page that is really going away (closed or reloaded) takes its "fight running" signal with it, so the
+// game opened again right after isn't told a fight is active in another tab. When the phone kills the app
+// without telling the page, the signal just gets old (ALIVE_FRESH), as before.
+window.addEventListener("pagehide", stopBeat);
 
 // ---------- installable app + offline ----------
 

@@ -305,6 +305,8 @@ output { color: var(--torch); font-family: var(--display); font-weight: 700; fon
 .m-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 #fArt { flex: none; width: clamp(56px, 20vmin, 104px); aspect-ratio: 1; border-radius: 10px; object-fit: cover; border: 1px solid var(--line); }
 .m-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+/* fight HUD: when the name and the HP text don't fit side by side, the HP goes under the name, never over it */
+.monster .m-row { flex-wrap: wrap; gap: 3px 8px; }
 #fName { font: 700 clamp(14px, 3.6vmin, 20px)/1.1 var(--display); min-width: 0; }
 #fHp { font: 600 13px/1 var(--display); color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .hpbar { height: 12px; border-radius: 6px; background: rgba(238, 243, 236, 0.1); overflow: hidden; }
@@ -331,13 +333,15 @@ output { color: var(--torch); font-family: var(--display); font-weight: 700; fon
 #banner.bad { color: var(--bad); }
 #banner.warn { color: var(--warn); }
 
+/* the break card sits in the middle; on a screen too short for it (a small phone on its side) it scrolls
+   instead of being cut off (auto margins centre it without hiding its top) */
 #restPanel {
   position: absolute; inset: 0; z-index: 5;
-  display: grid; place-items: center;
+  display: flex; overflow-y: auto;
   padding: 16px max(16px, env(safe-area-inset-right, 0px)) 16px max(16px, env(safe-area-inset-left, 0px));
   background: rgba(6, 9, 8, 0.55);
 }
-#restPanel .card { max-width: 440px; text-align: center; align-items: center; gap: 10px; padding: 18px; }
+#restPanel .card { max-width: 440px; margin: auto; text-align: center; align-items: center; gap: 10px; padding: 18px; }
 #restTime { font: 800 clamp(44px, 12vmin, 72px)/1 var(--display); color: var(--torch); font-variant-numeric: tabular-nums; }
 
 .hud-bottom {
@@ -349,6 +353,29 @@ output { color: var(--torch); font-family: var(--display); font-weight: 700; fon
 }
 #debug { font: 12px/1.3 var(--mono); color: var(--muted); padding: 7px 10px; min-width: 0; font-variant-numeric: tabular-nums; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* Upright phone: the monster panel is too narrow for the picture beside all of its text (the name ran
+   into the HP, the slow-reps tag left the screen). So it takes all the width beside the hits, and stacks:
+   where you are on top, the picture beside name and HP, then the bars and notes across the whole panel. */
+@media (max-width: 520px) {
+  .monster {
+    flex: 1; width: auto; max-width: 420px;
+    display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px;
+  }
+  .m-info { display: contents; }
+  #fWhere { grid-row: 1; grid-column: 1 / -1; }
+  #fArt { grid-row: 2; grid-column: 1; width: 64px; }
+  .monster .m-row { grid-row: 2; grid-column: 2; }
+  #fArt[hidden] + .m-info .m-row { grid-column: 1 / -1; } /* no picture (strength test) */
+  .hpbar, .threat, #stayNote { grid-column: 1 / -1; }
+  #fHp { white-space: normal; }
+  /* on the narrowest phones the tag breaks into two lines instead of sticking out */
+  #fWhere .chip { white-space: normal; line-height: 1.25; }
+}
+/* the narrowest phones: the readout under the banner takes two lines, so the banner sits a bit higher */
+@media (max-width: 340px) {
+  #banner { bottom: calc(env(safe-area-inset-bottom, 0px) + 116px); }
+}
 
 @keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.18); } 100% { transform: scale(1); } }
 @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-6px); } 50% { transform: translateX(5px); } 75% { transform: translateX(-3px); } }

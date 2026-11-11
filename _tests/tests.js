@@ -3421,6 +3421,159 @@ const tests = [
     check(!bad.length, bad.join(" || "));
     return JSON.stringify(res);
   }],
+  // ------------------------------------------------------------ full-game check (Nov 2026)
+  ["Check 1 The map never says \"the The\": a locked area names its boss the right way", async () => {
+    await reset();
+    const A = await open("A");
+    await A.goto("map");
+    const t = A.text("#mapZones");
+    check(!/the The/.test(t), `doubled "the": "${(t.match(/.{0,20}the The.{0,20}/) || [""])[0]}"`);
+    check(/Beat The Burnt King to open it/.test(t), "Dragon's Spine doesn't name The Burnt King");
+    check(/Beat the Goblin Chief to open it/.test(t), "Peat Bog doesn't name the Goblin Chief");
+  }],
+  ["Check 2 Closing the game can't stretch a mine break: a break still on keeps its end; one that is over starts the next room with what is left of its 30 s (at least 10 s)", async () => {
+    const bad = [], res = {};
+    // a run saved in a break that ended `over` seconds ago (negative: still on); the game is opened and continued
+    const back = async over => {
+      const endsAt = Date.now() - over * 1000;
+      await reset({ ...BASE, run: { floor: 1, room: 1, breakEndsAt: endsAt } });
+      const A = await open("A");
+      await A.goto("dungeon");
+      const status = A.text("#dgStatus");
+      await A.continueRun();
+      const s = saved(), f = A.fight && !A.fight.over ? A.fight : null;
+      return { A, endsAt, r: { status: status.slice(0, 110), rest: !!A.api.rest, fight: !!f, timedStart: !!(f && f.timedStart), threat: A.text("#threatText"),
+        // what is left of the start timer, and what would be left counting from the end of the break
+        leftMs: f ? Math.round(30000 - (A.w.performance.now() - f.waitSince)) : null, fromBreakEndMs: Math.round(30000 - (Date.now() - endsAt)),
+        mark: !!s.fightMark, run: s.run, modal: A.modal().slice(0, 60) } };
+    };
+    // 1. over for 12 s: no new break, the room starts, the timer counts from the end of the break
+    let b = await back(12);
+    res.over12 = b.r;
+    if (!(b.r.fight && !b.r.rest && b.r.timedStart && b.r.mark && !b.r.run.breakEndsAt && Math.abs(b.r.leftMs - b.r.fromBreakEndMs) < 700 && /break is over/i.test(b.r.status))) bad.push(`over 12 s: ${JSON.stringify(b.r)}`);
+    // 2. over for 24 s: the room starts with 10 s on its timer, not the few seconds left
+    b = await back(24);
+    res.over24 = b.r;
+    if (!(b.r.fight && !b.r.rest && b.r.mark && b.r.leftMs > 9000 && b.r.leftMs <= 10000 && b.r.fromBreakEndMs < 6000)) bad.push(`over 24 s: ${JSON.stringify(b.r)}`);
+    // 3. 40 s still to go: the break goes on with the end it had, also after closing and opening again
+    b = await back(-40);
+    const restLeft = g => (g.api.rest ? Math.round(g.api.rest.endsAt - g.w.performance.now()) : null);
+    res.on40 = { ...b.r, restLeftMs: restLeft(b.A), shouldBeMs: b.endsAt - Date.now() };
+    if (!(b.r.rest && !b.r.fight && b.r.run.breakEndsAt === b.endsAt && Math.abs(res.on40.restLeftMs - res.on40.shouldBeMs) < 700 && /rest of your break/i.test(b.r.status))) bad.push(`40 s to go: ${JSON.stringify(res.on40)}`);
+    await close("A");
+    const A = await open("A");
+    await A.continueRun();
+    res.again = { rest: !!A.api.rest, sameEnd: saved().run && saved().run.breakEndsAt === b.endsAt, restLeftMs: restLeft(A), shouldBeMs: b.endsAt - Date.now(), modal: A.modal().slice(0, 60) };
+    if (!(res.again.rest && res.again.sameEnd && Math.abs(res.again.restLeftMs - res.again.shouldBeMs) < 700)) bad.push(`closed and opened again: ${JSON.stringify(res.again)}`);
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Check 3 The game opened again right after it was closed isn't told a fight is active in another tab: a mine break goes on, a fight left after the first rep counts as given up at once", async () => {
+    await reset();
+    let A = await open("A");
+    await A.enterFloor();
+    await A.reps(A.fight.total);
+    await until(() => A.api.rest, 3000, "the break");
+    const endsAt = saved().run.breakEndsAt;
+    await close("A");
+    check(!localStorage.getItem(ALIVE), "the closed window left its 'fight running' signal on");
+    A = await open("A");
+    await A.continueRun();
+    check(!/another tab/i.test(A.modal()), `blocked: "${A.modal().slice(0, 80)}"`);
+    check(A.api.rest, "the break did not go on");
+    check(saved().run.breakEndsAt === endsAt, "the break got a new end");
+    // closed in a fight after the first rep, opened again at once
+    await reset();
+    A = await open("A");
+    await A.fightMonster("forest-goblin");
+    await A.reps(1);
+    await close("A");
+    const t0 = Date.now();
+    A = await open("A");
+    await until(() => /closed during the fight/i.test(A.modal()), 3000, "the loss for the closed fight");
+    check(saved().losses["forest-goblin"] === 1 && saved().restUntil > Date.now(), "the loss was not recorded");
+    return `break went on with the same end; closed fight lost ${Date.now() - t0} ms after opening again`;
+  }],
+  ["Check 4 A conquered mine shows no \"next\" room; a floor being replayed is marked on the Floors row", async () => {
+    await reset({ ...BASE, dungeonFloor: 11, stats: { ...BASE.stats, deepestFloor: 10 } });
+    let A = await open("A");
+    await A.goto("dungeon");
+    check(/conquered/i.test(A.text("#dgStatus")), "test setup: the mine is not conquered");
+    const rooms = [...A.d.querySelectorAll("#dgFloor .rooms li")].map(li => li.className || "-").join(" ");
+    check(rooms === "done done done safe", `rooms: ${rooms}`);
+    await reset({ ...BASE, dungeonFloor: 3, stats: { ...BASE.stats, deepestFloor: 2 }, run: { floor: 1, room: 1, replay: true } });
+    A = await open("A");
+    await A.goto("dungeon");
+    const here = [...A.d.querySelectorAll("#dgLadder .here")].map(el => el.textContent).join(",");
+    check(here === "1", `floors marked as "here": "${here}"`);
+    return `rooms: ${rooms}; replayed floor marked: ${here}`;
+  }],
+  ["Check 5 On a narrow phone the Restore button stays under the finger when it asks to tap again", async () => {
+    await reset();
+    const el = document.getElementById("A");
+    el.style.width = "360px";
+    try {
+      const A = await open("A");
+      await A.goto("settings");
+      const b = A.d.querySelector("#btnRestore"), scr = A.d.querySelector("#settings");
+      const at = () => { const r = b.getBoundingClientRect(); return `${Math.round(r.left)},${Math.round(r.top + scr.scrollTop)}`; };
+      A.d.querySelector("#restoreText").value = oldCode(GOOD);
+      const before = at(), w0 = Math.round(b.getBoundingClientRect().width);
+      b.click(); await wait(80);
+      check(b.dataset.armed, `test setup: Restore did not ask to tap again ("${A.text("#backupMsg")}")`);
+      const after = at(), w1 = Math.round(b.getBoundingClientRect().width);
+      check(w1 > w0 + 50, `test setup: the button did not grow (${w0} -> ${w1} px)`);
+      check(before === after, `Restore moved from ${before} to ${after}`);
+      return `at ${after}, ${w0} -> ${w1} px wide in a 360 px window`;
+    } finally { el.style.width = ""; }
+  }],
+  ["Check 6 Restoring a backup or starting over never cancels a penalty: a running rest and mine closure stay, a mine run on the line counts as left; a fresh game takes the backup as it is", async () => {
+    const bad = [], res = {}, H = 3600e3, D = 86400e3;
+    const now = () => { const s = saved(), t = Date.now(); return { restH: +Math.max(0, (s.restUntil - t) / H).toFixed(1), lockD: +Math.max(0, (s.dungeonLockedUntil - t) / D).toFixed(1), run: s.run, xp: s.xp, pushups: s.stats.pushups }; };
+    const PUNISHED = () => ({ ...BASE, restUntil: Date.now() + 5 * H, dungeonLockedUntil: Date.now() + 3 * D });
+    const restore = async (start, backup = GOOD) => {
+      await reset(start);
+      const A = await open("A");
+      const msg = flat(await A.restoreCode(oldCode(backup)));
+      return { msg: msg.slice(0, 120), ...now(), errors: A.errors.length };
+    };
+    // 1. resting (5 h left), the mine closed (3 days left): a clean backup is restored, both stay
+    let r = res.restore = await restore(PUNISHED());
+    if (!(/restored/i.test(r.msg) && /still runs/i.test(r.msg) && r.restH >= 4.9 && r.restH <= 5 && r.lockD >= 2.9 && r.lockD <= 3 && r.xp === GOOD.xp && !r.errors)) bad.push(`restore: ${JSON.stringify(r)}`);
+    // 2. the same, then Reset all progress
+    await reset(PUNISHED());
+    const A = await open("A");
+    await A.goto("settings");
+    const wipe = A.d.querySelector("#btnWipe"); wipe.click(); await wait(80); wipe.click(); await wait(300);
+    r = res.reset = now();
+    if (!(r.restH >= 4.9 && r.lockD >= 2.9 && r.xp === 0 && r.pushups === 0)) bad.push(`reset: ${JSON.stringify(r)}`);
+    // 3. a mine run in a break: restoring counts as leaving the mine (10 h rest, closed 7 days)
+    r = res.runInBreak = await restore({ ...BASE, run: { floor: 1, room: 1, breakEndsAt: Date.now() + 60000 } });
+    if (!(/restored/i.test(r.msg) && /counts as left/i.test(r.msg) && r.restH >= 9.9 && r.lockD >= 6.9 && !r.run)) bad.push(`run in a break: ${JSON.stringify(r)}`);
+    // 4. a replay in a break: only the rest, the mine stays open
+    r = res.replay = await restore({ ...BASE, dungeonFloor: 3, stats: { ...BASE.stats, deepestFloor: 2 }, run: { floor: 1, room: 1, replay: true } });
+    if (!(/restored/i.test(r.msg) && r.restH >= 9.9 && r.lockD === 0)) bad.push(`replay: ${JSON.stringify(r)}`);
+    // 5. a run still in its first room with no break on (leaving it is free): no penalty
+    r = res.firstRoom = await restore({ ...BASE, run: { floor: 1, room: 0 } });
+    if (!(/restored/i.test(r.msg) && /done\.$/.test(r.msg) && r.restH === 0 && r.lockD === 0)) bad.push(`first room: ${JSON.stringify(r)}`);
+    // 6. nothing running here: the backup comes back as it is, with its own rest
+    r = res.fresh = await restore(BASE, { ...GOOD, restUntil: Date.now() + 2 * H });
+    if (!(/restored/i.test(r.msg) && /done\.$/.test(r.msg) && r.restH >= 1.9 && r.restH <= 2 && r.lockD === 0)) bad.push(`fresh: ${JSON.stringify(r)}`);
+    check(!bad.length, `${bad.join(" || ")} || all: ${JSON.stringify(res)}`);
+    return JSON.stringify(res);
+  }],
+  ["Check 7 A backup made while a mine run was paused restores without its old break deadline: the run goes on with a fresh break", async () => {
+    await reset();
+    const A = await open("A");
+    const msg = await A.restoreCode(oldCode({ ...GOOD, run: { floor: 1, room: 1, breakEndsAt: Date.now() - 3600e3 } }));
+    check(/restored/i.test(msg), `refused: "${msg}"`);
+    check(JSON.stringify(saved().run) === JSON.stringify({ floor: 1, room: 1 }), `saved run: ${JSON.stringify(saved().run)}`);
+    await A.continueRun();
+    check(A.api.rest && !A.modal(), `no break: "${A.modal().slice(0, 80)}"`);
+    const s = saved();
+    check(s.run && !(s.restUntil > Date.now()) && !(s.dungeonLockedUntil > Date.now()), "the run was counted as left");
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+  }],
   // ------------------------------------------------------------ earlier fixes keep working
   ["Two windows still never save over each other", async () => {
     await reset();
