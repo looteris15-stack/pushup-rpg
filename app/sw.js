@@ -15,10 +15,11 @@
 // - Body tracking library, its model and the font: these links never change, so save once, reuse forever.
 //   Pictures and tracking files are kept across releases.
 // The save (/api/save on the PC server) is never touched.
-const SHELL_V = 7;
+const SHELL_V = 13;
 const SHELL = `rpg-shell-v${SHELL_V}`, IMG = "rpg-img-v1", LIB = "rpg-lib-v1";
 const KEEP = [SHELL, IMG, LIB];
-const SHELL_FILES = ["./", "index.html", "style.css", "game.js", "core.js", "data.js", "manifest.webmanifest", "icons/icon-192.png"];
+// "icons/icon-192.png" stays last: _tests\run.ps1 finds the end of this list by it
+const SHELL_FILES = ["./", "index.html", "style.css", "game.js", "core.js", "data.js", "ruck.js", "manifest.webmanifest", "icons/icon-192.png"];
 const LIB_HOSTS = ["cdn.jsdelivr.net", "storage.googleapis.com", "fonts.googleapis.com", "fonts.gstatic.com"];
 const BASE = new URL("./", self.location).pathname; // e.g. /pushup-rpg/app/
 const SHELL_URLS = SHELL_FILES.map(f => new URL(f, self.location).href);

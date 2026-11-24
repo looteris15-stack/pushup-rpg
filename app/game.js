@@ -1,13 +1,16 @@
 import { createTracker, initAudio, quietAudio, sfx, say, hush, audio, trackingFiles, downSecsOf, canKeepAwake, testHooks } from "./core.js";
-import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, wanderHpEver, slowSecs, pauseSecs, artUrl } from "./data.js";
+import { ART, RULES, ZONES, DUNGEON, WANDERERS, MAX_LEVEL, xpForLevel, levelFromXp, titleFor, xpReward, findMonster, startZoneFor, wanderHpEver, slowSecs, pauseSecs, artUrl, RUCK_FEATS, ruckGrade, bestRuckRank, ruckTestText, RUCK_TEST, RUCK_TESTS, RANKS, SYSTEM_LATER, HEART, systemStatus, systemChanges } from "./data.js";
+import { parseGpx, summarizeTrack, looksLikeCar, ruckProblem, ruckEntry, effortOf, ruckXp } from "./ruck.js";
 
 const DEBUG = new URLSearchParams(location.search).has("debug");
 const SAVE_KEY = "pushupRPG.save.v1";
-const SCREENS = ["camp", "map", "dungeon", "records", "settings", "fight"];
+const SCREENS = ["camp", "status", "map", "dungeon", "ruck", "records", "settings", "fight"];
 const TESTED_STRICTNESS = { depth: 63, top: 160, bend: 20, knee: 135 };
 // bump when TESTED_STRICTNESS changes: old saves then get the new strictness once
 const STRICT_V = 3;
-const DEFAULT_SETTINGS = { ...TESTED_STRICTNESS, strictV: STRICT_V, voice: true, sound: true, camera: "user", model: "full" };
+// ruckKg: your pack weight for rucks; bodyKg: your body weight (null = not given), for a ruck's rank.
+// They are settings, so Reset all progress keeps them
+const DEFAULT_SETTINGS = { ...TESTED_STRICTNESS, strictV: STRICT_V, voice: true, sound: true, camera: "user", model: "full", ruckKg: 15, bodyKg: null };
 // the strictness sliders' ranges (index.html); a save with values outside them gets the tested ones
 const SETTING_RANGES = { depth: [40, 120], top: [140, 178], bend: [8, 40], knee: [120, 175] };
 
@@ -20,6 +23,11 @@ const now = () => Date.now() + timeOffset;
 
 // ---------- save ----------
 
+// Rucking (ruck.js): all-time totals (km and kg·km may have decimals), records, and the last RULES.ruckLogMax
+// rucks, newest first. Only each ruck's summary is kept, never its map points. ruck.xp: the part of state.xp
+// that came from rucks (the backup check needs it). best.rank: your best ruck rank ever (0 = F ... 6 = S),
+// kept because old rucks fall out of the log.
+const freshRuck = () => ({ count: 0, km: 0, kgkm: 0, xp: 0, mins: 0, climb: 0, best: { km: 0, kgkm: 0, kg: 0, rank: 0 }, log: [] });
 function freshState(settings = DEFAULT_SETTINGS) {
   return {
     v: 1, rev: 0, savedAt: 0,
@@ -27,16 +35,22 @@ function freshState(settings = DEFAULT_SETTINGS) {
     tested: false, testResult: 0, wandererDone: "",
     wanderToday: null, // { key, hp }: today's wandering monster keeps the HP it had when first seen
     lastBackupAt: 0, backupFights: 0, // when the last backup was made, and stats.fights at that time
+    backupRucks: 0, // ruck.count at that time
     fightMark: null, // a fight that has started (see markFight), so closing the game still counts it
     kills: {}, losses: {}, history: [],
     stats: { pushups: 0, fights: 0, wins: 0, bestSet: 0, biggestKill: 0, deepestFloor: 0 },
+    ruck: freshRuck(),
     settings: { ...settings },
   };
 }
 let needsSave = false;
+const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
 function normalize(s) {
   const f = freshState();
   const out = { ...f, ...s, stats: { ...f.stats, ...(s.stats || {}) }, settings: { ...f.settings, ...(s.settings || {}) } };
+  // the ruck part is merged field by field, so a save with only some of it (a PC copy, another window) still works
+  const r = isObj(s.ruck) ? s.ruck : {};
+  out.ruck = { ...f.ruck, ...r, best: { ...f.ruck.best, ...(isObj(r.best) ? r.best : {}) }, log: Array.isArray(r.log) ? r.log : [] };
   if ((s.settings || {}).strictV !== STRICT_V) {
     Object.assign(out.settings, TESTED_STRICTNESS, { strictV: STRICT_V });
     needsSave = true;
@@ -261,7 +275,7 @@ function show(name) {
   renderCurrent();
 }
 function renderCurrent() {
-  const render = { camp: renderCamp, map: renderMap, dungeon: renderDungeon, records: renderRecords, settings: renderSettings }[current];
+  const render = { camp: renderCamp, status: renderStatus, map: renderMap, dungeon: renderDungeon, ruck: renderRuck, records: renderRecords, settings: renderSettings }[current];
   if (render) render();
 }
 
@@ -284,6 +298,8 @@ function levelInfo() {
   return { L, into: state.xp - base, need: next - base, title: titleFor(L) };
 }
 const num = n => n.toLocaleString("en-US"); // 30690 -> "30,690"
+const fmtKm = km => `${num(Math.round(km * 10) / 10)}${Number.isInteger(Math.round(km * 10) / 10) ? ".0" : ""} km`; // "7.0 km", "1,234.5 km"
+const fmtDur = mins => (mins >= 60 ? `${Math.floor(mins / 60)} h ${mins % 60} min` : `${mins} min`); // "1 h 12 min"
 const tile = ([label, value]) => `<div class="tile panel"><span class="label">${label}</span><b>${esc(value)}</b></div>`;
 // small picture for lists; an empty tile keeps rows lined up when a monster has no picture yet
 const thumb = id => {
@@ -335,12 +351,77 @@ function renderCamp() {
   if (b.overdue) {
     $("backupNag").innerHTML = `<span class="chip warn">Backup</span> ${b.days == null
       ? "Your progress has no backup yet."
-      : `Last backup: ${b.when}, with ${plural(b.fightsSince, "fight")} since then.`} If Chrome's data gets cleared, a backup is the only way back.
+      : `Last backup: ${b.when}, with ${b.sinceText} since then.`} If Chrome's data gets cleared, a backup is the only way back.
       <div class="row"><button type="button" class="primary" data-action="backupNow">Back up now</button></div>`;
   }
   if (!PC_SAVE) $("syncStatus").textContent = `Progress is saved on this phone. Last backup: ${b.when}.`;
   const s = state.stats;
   $("campTiles").innerHTML = [["Pushups done", s.pushups], ["Best set", s.bestSet], ["Monsters slain", s.wins], ["Deepest floor", s.deepestFloor]].map(tile).join("");
+  const R = RANKS[systemStatus(state).overall];
+  $("campRank").className = `hud-rank camp-rank rank-${R.toLowerCase()}`;
+  $("campRank").querySelector("b").textContent = R;
+}
+
+// ---------- status: the System's window (data.js SYSTEM; only shown, never in a fight) ----------
+
+const rankClass = r => `rank-${RANKS[r].toLowerCase()}`;
+const rankMini = r => `<span class="rank-mini ${rankClass(r)}">${RANKS[r]}</span>`;
+const statText = (id, v) => (id === "road" ? fmtKm(v).replace(" km", "") : id === "carry" ? RANKS[v] : num(v)); // ROAD: "14.0"; CARRY: a rank
+const signed = v => (v > 0 ? `+${v}` : `${v}`);
+function renderStatus() {
+  const st = systemStatus(state), { L, title } = levelInfo(), n = st.cats.length;
+  const lowest = st.cats.reduce((a, c) => (c.rank < a.rank ? c : a));
+  const short = (st.overall + 1) * n - st.cats.reduce((a, c) => a + c.rank, 0); // rank-ups still needed
+  const hint = st.overall >= RANKS.length - 1 ? "Top rank in everything. The System has nothing left to measure… for now."
+    : `To reach overall ${RANKS[st.overall + 1]}: ${plural(short, "more rank-up")} in your categories. Your weakest is ${esc(lowest.name)} (${RANKS[lowest.rank]}).`;
+  $("stHead").innerHTML = `<div class="hud-head">
+      <div class="hud-title"><p class="eyebrow">The System</p><h2 class="big">Level ${L} · ${esc(title)}</h2>
+        <p class="fine">${st.cats.map(c => `${esc(c.name)} ${RANKS[c.rank]}`).join(" · ")}</p></div>
+      <div class="hud-rank ${rankClass(st.overall)}" title="Overall rank: your categories averaged, rounded down"><span>Overall</span><b>${RANKS[st.overall]}</b></div>
+    </div>
+    <p class="fine">${hint}</p>`;
+  $("stCats").innerHTML = st.cats.map(c => `<section class="card-block panel sys-cat" data-cat="${c.id}">
+      <div class="hud-head"><h2>${esc(c.name)}</h2><div class="hud-rank small ${rankClass(c.rank)}" title="${esc(c.name)} rank: its stats averaged, rounded down"><span>Rank</span><b>${RANKS[c.rank]}</b></div></div>
+      ${c.stats.map(x => `<div class="sys-stat" data-stat="${x.id}">
+        <div class="sys-top"><span class="sys-name" title="${esc(x.long)}">${x.name}</span><b class="sys-val">${statText(x.id, x.value)}</b><span class="fine">${esc(x.what)}</span>${rankMini(x.rank)}</div>
+        <div class="sys-bar"><div style="width:${(x.share * 100).toFixed(1)}%"></div></div>
+        <p class="fine">${x.next ? `Rank ${RANKS[x.next.rank]}: ${esc(x.next.text)} · ${esc(x.next.togo)}` : "Top rank."}</p>
+      </div>`).join("")}
+    </section>`).join("");
+  const h = st.heart;
+  $("stHeart").innerHTML = `<div class="sys-top"><span class="sys-name">HEART</span><b class="sys-val">${h.locked || h.value == null ? "???" : signed(h.value)}</b><span class="fine">beats a minute, compared with your older rucks</span></div>
+    <p class="fine">${h.locked
+      ? `Not enough data. The System needs ${HEART.need} rucks with heart rate (from a watch's GPX file) to measure your heart. You have ${h.have}.`
+      : h.value == null
+      ? `No rucks alike yet. HEART only compares rucks with a similar pack (±${HEART.kg} kg), pace (±${HEART.paceSec / 60} min/km) and hills. Do a ruck like an earlier one.`
+      : h.value > 0 ? `On rucks like your older ones, your heart now beats ${h.value} a minute less. You got fitter.`
+      : h.value < 0 ? `On rucks like your older ones, your heart now beats ${-h.value} a minute more. Tired, hot, or a break from training?`
+      : "On rucks like your older ones, your heart beats the same as before."} HEART has no rank and can go down.</p>`;
+  $("stLater").innerHTML = `<div class="sys-top">${SYSTEM_LATER.map(x => `<span class="sys-name">${esc(x.toUpperCase())}</span><b class="sys-val">???</b>`).join("")}</div>
+    <p class="fine">Not in the game yet. They will count in the overall rank once they are.</p>`;
+}
+
+// The System's messages after a fight or a ruck: what went up since `before` (a systemStatus() from just
+// before). Adds lines to a result; returns words to say out loud for a rank up ("" = none).
+function systemLines(before, lines) {
+  const ch = systemChanges(before, systemStatus(state));
+  const v = (x, val) => `${statText(x.id, val)}${x.id === "road" ? " km" : ""}`;
+  for (const x of ch.stats) {
+    // CARRY's value is a rank already
+    if (x.id === "carry") { lines.push(`<span class="sys">[CARRY: best ruck rank ${RANKS[x.wasRank]} → ${RANKS[x.rank]}]</span>`); continue; }
+    lines.push(`<span class="sys">[${x.name} ${v(x, x.was)} → ${v(x, x.value)}${x.rank !== x.wasRank ? ` · rank ${RANKS[x.wasRank]} → ${RANKS[x.rank]}` : ""}]</span>`);
+  }
+  for (const c of ch.cats) lines.push(`<span class="sys up">[Rank up! ${esc(c.name.toUpperCase())} ${RANKS[c.was]} → ${RANKS[c.rank]}]</span>`);
+  if (ch.overall) lines.push(`<span class="sys up">[Overall rank ${RANKS[ch.overall.was]} → ${RANKS[ch.overall.rank]}]</span>`);
+  if (ch.heart) {
+    const { was, now: h } = ch.heart;
+    lines.push(`<span class="sys">[${h.locked ? `HEART: ${h.have} of ${HEART.need} rucks with heart rate`
+      : was.locked ? `HEART unlocked${h.value == null ? ". No rucks alike yet" : `: ${signed(h.value)}`}`
+      : h.value == null ? "HEART: no rucks alike yet"
+      : `HEART ${was.value == null ? "???" : signed(was.value)} → ${signed(h.value)}`}]</span>`);
+  }
+  return ch.overall ? ` Overall rank ${RANKS[ch.overall.rank]}!`
+    : ch.cats.length ? ` ${ch.cats.map(c => `${c.name} rank ${RANKS[c.rank]}`).join(", ")}!` : "";
 }
 
 function renderMap() {
@@ -523,6 +604,8 @@ function renderRecords() {
   $("recTiles").innerHTML = [
     ["Level", L], ["Pushups done", s.pushups], ["Best set", s.bestSet], ["Strength test", state.tested ? state.testResult : "–"],
     ["Biggest kill", s.biggestKill ? `${s.biggestKill} HP` : "–"], ["Fights won", `${s.wins} / ${s.fights}`], ["Deepest floor", s.deepestFloor],
+    ["Km rucked", fmtKm(state.ruck.km).replace(" km", "")], ["Load carried", `${num(Math.round(state.ruck.kgkm))} kg·km`],
+    ["Longest ruck", state.ruck.best.km ? fmtKm(state.ruck.best.km) : "–"],
   ].map(tile).join("");
   const ids = [...new Set([...Object.keys(state.kills), ...Object.keys(state.losses)])];
   const rows = ids.map(id => ({ id, d: describeMonster(id) })).filter(r => r.d)
@@ -538,6 +621,341 @@ function renderRecords() {
     : `<li class="fine">No fights yet.</li>`;
 }
 
+// ---------- rucking ----------
+// Walk with a heavy pack, record it on your watch, then open its GPX file here (or type the ruck in by hand).
+// Effort = pack kg × km (kg·km) gives XP for your level. Reading files and the rules: ruck.js; numbers: RULES.
+
+function renderRuck() {
+  const r = state.ruck;
+  // the pack weight box isn't overwritten while you type in it
+  if (document.activeElement !== $("ruckKg")) $("ruckKg").value = state.settings.ruckKg;
+  if (document.activeElement !== $("ruckBody")) $("ruckBody").value = state.settings.bodyKg ?? "";
+  const ex = effortOf(15, 6);
+  $("ruckIntro").textContent = `Pack weight × distance = effort, in kg·km. Every ${num(1 / RULES.ruckXpPerKgKm)} kg·km is 1 XP for your level: 15 kg for 6 km = ${num(ex)} kg·km = +${ruckXp(ex)} XP. Rucks never hit monsters: fights stay pushups.`;
+  $("ruckTests").innerHTML = RUCK_TESTS.map(t => `<li><span class="rank-mini rank-${t.rank.toLowerCase()}">${t.rank}</span> ${esc(ruckTestText(t, state.settings.bodyKg))} <span class="fine">· ${esc(t.like)}</span></li>`).join("");
+  $("ruckTiles").innerHTML = [["Rucks", num(r.count)], ["Km rucked", fmtKm(r.km).replace(" km", "")], ["Load carried", `${num(Math.round(r.kgkm))} kg·km`], ["XP from rucks", num(r.xp)]].map(tile).join("");
+  const b = r.best;
+  $("ruckBest").textContent = r.count ? `Your records: longest ${fmtKm(b.km)}, heaviest pack ${b.kg} kg, biggest load ${num(b.kgkm)} kg·km.` : "";
+  // each ruck opens its report
+  $("ruckLog").innerHTML = r.log.length
+    ? r.log.map(x => `<li class="won"><button type="button" class="ruck-row" data-action="ruckReport" data-t="${esc(x.t)}">
+        <span>${(g => `<span class="rank-mini rank-${g.rank.toLowerCase()}">${g.rank}</span>`)(ruckGrade(x, state.settings.bodyKg))} <b>${esc(fmtKm(x.km))}</b> × ${esc(x.kg)} kg = ${esc(num(x.kgkm))} kg·km · +${esc(x.xp)} XP</span>
+        <span class="fine">${esc(fmtAt(x.t))} · ${esc(fmtDur(x.mins))}${x.climb ? ` · ${esc(x.climb)} m up` : ""}${x.hrAvg ? ` · ♥ ${esc(x.hrAvg)}` : ""} · ${x.src === "gpx" ? "GPX file" : "by hand"}</span></button></li>`).join("")
+    : `<li class="fine">No rucks yet.</li>`;
+}
+
+// ----- the ruck report: a game-style status window for one ruck -----
+// e: a log entry (ruck.js ruckEntry). Everything in it is a measurement; the rank and feats are worked out
+// here (data.js), so they can be changed any time. Heart rate, steps, splits and the lines only show when the
+// watch recorded them (a ruck typed in by hand has none; older rucks keep their numbers but not their lines).
+const fmtPace = secs => { const s = Math.round(secs); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; }; // "11:32"
+const fmtTimeOfDay = ts => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+// notes: plain-text warnings about the file (a hole in the recording, too little heart rate), check card only
+function ruckReport(e, { eyebrow = "Ruck report", tone = "", lines = [], fastKm = 0, notes = [] } = {}) {
+  const g = ruckGrade(e, state.settings.bodyKg), rank = g.rank, c = e.chart || {};
+  // the rank test: what this ruck did, and what the next rank still needs
+  const n = g.next, miss = n ? [
+    e.km < n.km ? `${num(Math.round((n.km - e.km) * 10) / 10)} km more` : "",
+    g.pct < n.pct ? `a pack of ${n.pct}% (${num(Math.round((g.bw * n.pct) / 10) / 10)} kg)` : "",
+    g.pace > n.pace ? `${fmtPace(n.pace)} min/km or faster` : "",
+  ].filter(Boolean) : [];
+  const pace = e.mins && e.km ? (e.mins * 60) / e.km : null;
+  const known = (c.splits || []).filter(s => s != null), best = known.length ? Math.min(...known) : null;
+  // the test pace: start to end (breaks too) over the km, plus 1 km for every RUCK_TEST.climbM up
+  const upKm = Math.round(((e.climb || 0) / RUCK_TEST.climbM) * 10) / 10;
+  const rows = [
+    ["Rank test", `pack <b>${esc(g.pct)}%</b> of ${g.guessed ? `${RUCK_TEST.refKg} kg <small>(set your body weight on the Rucking screen)</small>` : `your ${esc(g.bw)} kg`} · test pace <b>${fmtPace(Math.min(g.pace, 5999))}</b> <small>min/km</small>`
+      + `<br><small>${esc(fmtDur(g.mins))} from start to end (breaks too) for ${esc(num(e.km))} km${upKm ? ` + ${esc(num(upKm))} km for ${esc(num(e.climb))} m up` : ""}</small>`
+      + `<br>${n ? `Rank ${n.rank} needs ${esc(miss.join(", "))}.` : "Top rank."}`],
+    e.hrAvg ? ["Heart", `<b>${esc(e.hrAvg)}</b> avg · <b>${esc(e.hrMax || "–")}</b> max <small>bpm</small>`] : null,
+    ["Climb", `<b>${esc(num(e.climb || 0))}</b> <small>m up</small>`],
+    pace ? ["Pace", `<b>${fmtPace(pace)}</b> <small>min/km</small>${best ? ` · best km <b>${fmtPace(best)}</b>` : ""}`] : null,
+    e.steps ? ["Steps", `about <b>${esc(num(e.steps))}</b> · ${esc(e.spm)} <small>a minute</small>`] : null,
+    ["Time", `<b>${esc(fmtDur(e.mins))}</b> moving · ${esc(fmtTimeOfDay(e.t))}–${esc(fmtTimeOfDay(e.end))}`],
+  ].filter(Boolean);
+  const feats = RUCK_FEATS.filter(([, , test]) => test(e));
+  return `<div class="hud ${tone}">
+    <div class="hud-head">
+      <div class="hud-title"><p class="eyebrow">${esc(eyebrow)}</p><h2 class="big">${esc(fmtKm(e.km))} with ${esc(e.kg)} kg</h2>
+        <p class="fine">${esc(fmtAt(e.t))} · ${e.src === "gpx" ? "from a GPX file" : "typed in by hand"}</p></div>
+      <div class="hud-rank rank-${rank.toLowerCase()}" title="Rank: the hardest march test this ruck passed (distance, pack, pace)"><span>Rank</span><b>${rank}</b></div>
+    </div>
+    <div class="hud-main">
+      <div><span class="label">Load</span><b>${esc(e.kg)}</b><small>kg</small></div>
+      <div><span class="label">Distance</span><b>${esc(e.km)}</b><small>km</small></div>
+      <div><span class="label">Effort</span><b>${esc(num(e.kgkm))}</b><small>kg·km</small></div>
+    </div>
+    <p class="hud-xp">+${esc(e.xp)} XP</p>
+    ${lines.length ? `<ul class="lines">${lines.map(l => `<li>${l}</li>`).join("")}</ul>` : ""}
+    <dl class="hud-rows">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("")}</dl>
+    ${ruckLines(c)}
+    ${ruckSplits(c.splits)}
+    ${feats.length ? `<div class="hud-feats"><span class="label">Feats</span>${feats.map(([n, hint]) => `<span class="chip feat" title="${esc(hint)}">${esc(n)}</span>`).join("")}</div>` : ""}
+    ${fastKm >= 0.05 ? `<p class="fine">${esc(fmtKm(fastKm))} faster than ${RULES.ruckMaxKmh} km/h didn't count (a car, or a GPS jump).</p>` : ""}
+    ${notes.map(n => `<p class="fine warn">${esc(n)}</p>`).join("")}
+  </div>`;
+}
+// heart rate (line) and height (shaded) over the whole ruck, left to right in time; gaps stay gaps
+function ruckLines(c) {
+  const has = v => Array.isArray(v) && v.length > 1 && v.some(x => x != null);
+  if (!has(c.hr) && !has(c.ele)) return "";
+  const W = 320, H = 96, pad = 6;
+  const range = v => { const ok = v.filter(x => x != null); return [Math.min(...ok), Math.max(...ok)]; };
+  const draw = (v, area) => {
+    const [lo, hi] = range(v), n = v.length, runs = [];
+    let run = [];
+    v.forEach((x, i) => {
+      if (x == null) { if (run.length) runs.push(run); run = []; return; }
+      run.push([+((i / (n - 1)) * W).toFixed(1), +(H - pad - ((x - lo) / (hi - lo || 1)) * (H - 2 * pad)).toFixed(1)]);
+    });
+    if (run.length) runs.push(run);
+    return runs.map(r => {
+      const d = r.map((p, i) => `${i ? "L" : "M"}${p[0]} ${p[1]}`).join(" ");
+      return area ? `<path class="hud-area" d="${d} L${r[r.length - 1][0]} ${H} L${r[0][0]} ${H} Z"/>` : `<path class="hud-line" d="${d}"/>`;
+    }).join("");
+  };
+  return `<figure class="hud-chart">
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Heart rate and height during the ruck">${has(c.ele) ? draw(c.ele, true) : ""}${has(c.hr) ? draw(c.hr, false) : ""}</svg>
+    <figcaption>${has(c.hr) ? `<span class="k-hr">Heart rate</span>` : ""}${has(c.ele) ? `<span class="k-ele">Height ${range(c.ele).join("–")} m</span>` : ""}</figcaption>
+  </figure>`;
+}
+// one bar a km: taller is faster, the fastest km is lit; a km with a hole in the recording (null) is a low
+// empty bar
+function ruckSplits(sp) {
+  if (!Array.isArray(sp)) return "";
+  const known = sp.filter(s => s != null);
+  if (known.length < 2) return "";
+  const W = 320, H = 48, n = sp.length, gap = n > 25 ? 1 : 2, bw = (W - gap * (n - 1)) / n;
+  const fast = Math.min(...known), slow = Math.max(...known);
+  const height = s => 8 + (slow === fast ? 1 : (1 / s - 1 / slow) / (1 / fast - 1 / slow)) * (H - 8);
+  return `<figure class="hud-splits">
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Time for each km">${sp.map((s, i) => {
+      const x = (i * (bw + gap)).toFixed(1);
+      if (s == null) return `<rect x="${x}" y="${H - 4}" width="${bw.toFixed(1)}" height="4" class="none"><title>km ${i + 1}: the watch lost the GPS here</title></rect>`;
+      const h = height(s);
+      return `<rect x="${x}" y="${(H - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}"${s === fast ? ' class="best"' : ""}><title>km ${i + 1}: ${fmtPace(s)}</title></rect>`;
+    }).join("")}</svg>
+    <figcaption><span>Each km: fastest ${fmtPace(fast)}, slowest ${fmtPace(slow)}</span><span>${n} km</span></figcaption>
+  </figure>`;
+}
+function openRuckReport(t) {
+  const e = state.ruck.log.find(x => String(x.t) === String(t));
+  if (!e) { renderCurrent(); return; }
+  openModal(`${ruckReport(e)}<div class="row actions"><button type="button" class="primary" data-action="closeModal">OK</button>
+    <button type="button" class="danger-btn" data-action="ruckDelete" data-t="${esc(e.t)}">Delete ruck</button></div>`);
+}
+
+// ----- deleting a ruck: for a mistake (a wrong pack weight, a bad file). Everything it added comes off
+// again: its XP (your level can go down), km, kg·km, time and climb. Then you can log it again the right way.
+function askDeleteRuck(t) {
+  const e = state.ruck.log.find(x => String(x.t) === String(t));
+  if (!e) { closeModal(); renderCurrent(); return; }
+  const L = levelFromXp(state.xp), L2 = levelFromXp(Math.max(0, state.xp - e.xp));
+  openModal(`<p class="eyebrow">Delete this ruck?</p><h2 class="big">${esc(fmtKm(e.km))} with ${esc(e.kg)} kg</h2>
+    <p class="fine">${esc(fmtAt(e.t))} · ${e.src === "gpx" ? "from a GPX file" : "typed in by hand"}</p>
+    <p>Its <b>${esc(num(e.xp))} XP</b>${L2 < L ? ` (level ${L} → ${L2})` : ""}, ${esc(fmtKm(e.km))} and ${esc(num(e.kgkm))} kg·km come off your totals. This can't be undone, but you can log the ruck again: open its file or type it in.</p>
+    <div class="row actions"><button type="button" class="primary danger" data-action="ruckDeleteYes" data-t="${esc(e.t)}">Delete ruck</button>
+      <button type="button" data-action="ruckReport" data-t="${esc(e.t)}">Keep it</button></div>`);
+}
+function deleteRuck(t) {
+  adoptIfNewer(); // another window may have changed the log since the report opened
+  const r = state.ruck, e = r.log.find(x => String(x.t) === String(t));
+  closeModal();
+  if (!e) { renderCurrent(); return; }
+  const allInLog = r.count <= r.log.length; // no older rucks have fallen out of the log yet
+  r.log = r.log.filter(x => x !== e);
+  r.count = Math.max(0, r.count - 1);
+  r.km = Math.max(0, Math.round((r.km - e.km) * 100) / 100);
+  r.kgkm = Math.max(0, Math.round((r.kgkm - e.kgkm) * 10) / 10);
+  r.mins = Math.max(0, r.mins - e.mins);
+  r.climb = Math.max(0, r.climb - e.climb);
+  r.xp = Math.max(0, r.xp - e.xp);
+  state.xp = Math.max(0, state.xp - e.xp);
+  // records: worked out again from the log when this ruck held one (or when every ruck is still in the log);
+  // a record from a ruck that already fell out of the log stays
+  const b = r.best, most = k => Math.max(0, ...r.log.map(x => x[k] || 0));
+  for (const k of ["km", "kgkm", "kg"]) if (allInLog || e[k] >= b[k]) b[k] = most(k);
+  if (allInLog || ruckGrade(e, state.settings.bodyKg).idx >= (b.rank || 0)) b.rank = bestRuckRank(r.log, state.settings.bodyKg);
+  state.backupRucks = Math.min(state.backupRucks || 0, r.count);
+  const ok = save();
+  renderCurrent();
+  ruckMsg(ok ? `Ruck deleted: ${fmtKm(e.km)} with ${e.kg} kg, ${num(e.xp)} XP taken off.`
+    : "The ruck is deleted here, but saving failed (the phone's storage is full or blocked). Make a backup before you close the game.");
+}
+const ruckMsg = text => { $("ruckMsg").textContent = text; };
+const readNumber = v => parseFloat(String(v).replace(",", ".")); // "12,5" (a phone in another language) works too
+
+$("ruckKg").addEventListener("change", e => {
+  const kg = Math.round(readNumber(e.target.value) * 10) / 10, [lo, hi] = RULES.ruckKg;
+  if (!(kg >= lo && kg <= hi)) { ruckMsg(`Pack weight must be ${lo} to ${hi} kg.`); e.target.value = state.settings.ruckKg; return; }
+  state.settings.ruckKg = kg;
+  e.target.value = kg;
+  ruckMsg("");
+  if (!$("ruckHand").hidden && !/no times/.test($("ruckHandNote").textContent)) $("ruckHandNote").textContent = handNote();
+  saveSoon();
+});
+// body weight: empty = not given (ranks then use RUCK_TEST.refKg). Each new ruck keeps the one it was done with.
+$("ruckBody").addEventListener("change", e => {
+  const raw = String(e.target.value).trim(), kg = Math.round(readNumber(raw) * 10) / 10, [lo, hi] = RUCK_TEST.bodyKg;
+  if (raw && !(kg >= lo && kg <= hi)) { ruckMsg(`Body weight must be ${lo} to ${hi} kg.`); e.target.value = state.settings.bodyKg ?? ""; return; }
+  state.settings.bodyKg = raw ? kg : null;
+  e.target.value = raw ? kg : "";
+  // Rucks saved without a body weight are ranked with this one now, so the best rank is worked out again:
+  // one earned with the guessed RUCK_TEST.refKg must not stay. Only while every ruck is still in the log
+  // (once old rucks have fallen out, their rank can't be checked again, so the best can only go up).
+  const r = state.ruck;
+  if (r.count <= r.log.length) r.best.rank = bestRuckRank(r.log, state.settings.bodyKg);
+  ruckMsg("");
+  saveSoon();
+  renderRuck(); // the tests' kg follow your weight
+});
+
+// No accept=".gpx" on the file input: some phones don't know the .gpx type and would grey the file out.
+// Whatever is opened is checked by what is in it.
+$("ruckFile").addEventListener("change", async e => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = "";
+  if (!f) return;
+  hideHandForm();
+  // checked before reading, so a wrong (huge) file is never loaded into memory
+  if (f.size > RULES.ruckFileMaxMB * 1048576) { ruckMsg(`That file is over ${RULES.ruckFileMaxMB} MB, too big to be one ruck.`); return; }
+  ruckMsg("Reading the file…");
+  let s;
+  try { s = summarizeTrack(parseGpx(await f.text())); } catch (err) { ruckMsg(err.friendly || "That file couldn't be read."); return; }
+  ruckMsg("");
+  if (!s.timed) {
+    showHandForm({ km: s.km, climb: s.climb, src: "gpx", note: "This file has no times in it. Fill in when you started and how long it took, then tap Check ruck." });
+    return;
+  }
+  if (looksLikeCar(s)) {
+    ruckMsg(`Most of this file is faster than ${RULES.ruckMaxKmh} km/h (${fmtKm(s.fastKm)} of it), like a car ride, so it can't count as a ruck.`);
+    return;
+  }
+  const r = { t: s.start, end: s.end, km: s.km, mins: s.mins, climb: s.climb, kg: state.settings.ruckKg,
+    hrAvg: s.hrAvg, hrMax: s.hrMax, spm: s.spm, steps: s.steps, splits: s.splits, chart: s.chart };
+  // a hole in the recording: its km can be fixed on the check card, from the file's km up to the hole's time
+  // at the top speed allowed
+  const holeMins = s.holes.reduce((a, h) => a + h.mins, 0);
+  const fix = s.holes.length ? { lo: s.km, hi: Math.round((s.km + (holeMins / 60) * RULES.ruckMaxKmh) * 100) / 100 } : null;
+  pendingFile = { r, fileKm: s.km, fastKm: s.fastKm, notes: fileNotes(s), fix };
+  previewRuck(r, "gpx", pendingFile);
+});
+// what was wrong with a file, in words for the check card (not saved)
+function fileNotes(s) {
+  const notes = s.holes.map(h => `Your watch recorded nothing for ${fmtDur(h.mins)} (from ${fmtTimeOfDay(s.start + h.at)}), but you walked on. The game joined that part with a straight line of ${fmtKm(h.km)}, so the distance is probably a little short. If your watch app shows a longer distance, type it below.`);
+  if (s.hrOnlyMins != null) notes.push(`Heart rate was recorded for only ${fmtDur(s.hrOnlyMins)} of ${fmtDur(s.mins)} moving: too little for this ruck's heart rate, so it is left out.`);
+  if (s.cadOnlyMins != null) notes.push(`Steps were recorded for only ${fmtDur(s.cadOnlyMins)} of ${fmtDur(s.mins)} moving: too little to count them, so they are left out.`);
+  return notes;
+}
+// "Use this km" on the check card of a file with a hole
+let pendingFile = null; // the file being checked: { r, fileKm, fastKm, notes, fix }
+function fixRuckKm() {
+  const f = pendingFile;
+  if (!f || !f.fix || !$("ruckFixKm")) return;
+  const km = Math.round(readNumber($("ruckFixKm").value) * 100) / 100;
+  if (!(km >= f.fix.lo && km <= f.fix.hi)) {
+    $("ruckFixMsg").textContent = `The distance must be ${num(f.fix.lo)} to ${num(f.fix.hi)} km: at least what the file shows, and at most the missing part at ${RULES.ruckMaxKmh} km/h.`;
+    return;
+  }
+  f.r = { ...f.r, km };
+  previewRuck(f.r, "gpx", f);
+}
+
+// "Enter by hand", also used for a GPX file with no times (its km and climb are filled in already)
+let handSrc = "hand", handFileKm = null;
+const handNote = () => `Pack weight: ${state.settings.ruckKg} kg (change it above).`;
+function showHandForm({ km = null, climb = null, src = "hand", note = "" } = {}) {
+  handSrc = src;
+  handFileKm = src === "gpx" ? km : null;
+  const d = new Date(now()), p = n => String(n).padStart(2, "0");
+  $("rhDate").value = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  $("rhStart").value = "";
+  $("rhKm").value = km == null ? "" : String(km);
+  $("rhClimb").value = climb == null ? "" : String(climb);
+  $("rhH").value = $("rhMin").value = "";
+  $("ruckHandNote").textContent = note || handNote();
+  $("ruckHand").hidden = false;
+  ruckMsg("");
+}
+function hideHandForm() { $("ruckHand").hidden = true; }
+$("btnRuckHand").addEventListener("click", () => showHandForm());
+$("btnRuckHandCancel").addEventListener("click", () => { hideHandForm(); ruckMsg(""); });
+$("ruckHand").addEventListener("submit", e => {
+  e.preventDefault();
+  const date = $("rhDate").value, start = $("rhStart").value;
+  const t = date && start ? new Date(`${date}T${start}`).getTime() : NaN; // local time
+  if (!Number.isFinite(t)) { ruckMsg("Fill in the date and the time you started."); return; }
+  const km = readNumber($("rhKm").value), climb = readNumber($("rhClimb").value);
+  const mins = Math.round((readNumber($("rhH").value) || 0) * 60 + (readNumber($("rhMin").value) || 0));
+  // km from a file stays "from a GPX file" unless it was changed
+  const src = handSrc === "gpx" && km === handFileKm ? "gpx" : "hand";
+  pendingFile = null;
+  previewRuck({ t, end: t + mins * 60000, km, mins, climb, kg: state.settings.ruckKg }, src);
+});
+
+// the check card before a ruck is saved. fastKm: the part of a file that was too fast and didn't count;
+// notes: what was wrong with the file; fix: { lo, hi } when its km can be fixed here (a hole in the recording)
+let pendingRuck = null;
+function previewRuck(r, src, { fastKm = 0, notes = [], fix = null, fileKm = null } = {}) {
+  adoptIfNewer(); // another window may have logged rucks: check against those too
+  const problem = ruckProblem(r, state.ruck.log, now());
+  pendingRuck = null;
+  if (problem) { closeModal(); ruckMsg(problem); return; }
+  const e = ruckEntry({ ...r, bw: state.settings.bodyKg }, src); // the ruck keeps the body weight it was done with
+  pendingRuck = e;
+  ruckMsg("");
+  const fixed = fix && fileKm != null && e.km !== fileKm ? [`Distance fixed by you: ${num(e.km)} km (the file read ${num(fileKm)} km).`] : [];
+  openModal(`${ruckReport(e, { eyebrow: "Check your ruck", fastKm, notes: [...notes, ...fixed] })}
+    ${fix ? `<div class="ruck-fix"><label for="ruckFixKm">Distance (km)</label><input type="number" id="ruckFixKm" min="${fix.lo}" max="${fix.hi}" step="0.01" inputmode="decimal" value="${esc(e.km)}"><button type="button" data-action="ruckFixKm">Use this km</button></div>
+    <p class="fine warn" id="ruckFixMsg" role="status"></p>` : ""}
+    <p class="fine">${esc(e.kg)} kg × ${esc(e.km)} km = ${esc(num(e.kgkm))} kg·km. Wrong pack or body weight? Tap Back, change it on the Rucking screen, and check the ruck again.</p>
+    <div class="row actions"><button type="button" class="primary" data-action="saveRuck">Save ruck</button><button type="button" data-action="closeModal">Back</button></div>`);
+}
+function saveRuck() {
+  const e = pendingRuck;
+  pendingRuck = null;
+  pendingFile = null;
+  closeModal();
+  if (!e) return;
+  adoptIfNewer(); // checked again: another window may have logged the same ruck since the check card opened
+  const problem = ruckProblem(e, state.ruck.log, now());
+  if (problem) { ruckMsg(problem); renderCurrent(); return; }
+  const r = state.ruck, prev = { ...r.best }, levelBefore = levelFromXp(state.xp), sysBefore = systemStatus(state);
+  // only the newest rucks keep their lines and splits (the save, and so a backup, stays small)
+  r.log = [...r.log, e].sort((a, b) => b.t - a.t).slice(0, RULES.ruckLogMax)
+    .map((x, i) => { if (i < RULES.ruckChartsKept || !x.chart) return x; const { chart, ...rest } = x; return rest; });
+  r.count++;
+  r.km = Math.round((r.km + e.km) * 100) / 100;
+  r.kgkm = Math.round((r.kgkm + e.kgkm) * 10) / 10;
+  r.mins += e.mins;
+  r.climb += e.climb;
+  r.xp += e.xp;
+  r.best = { km: Math.max(prev.km, e.km), kgkm: Math.max(prev.kgkm, e.kgkm), kg: Math.max(prev.kg, e.kg),
+    rank: Math.max(prev.rank || 0, ...r.log.map(x => ruckGrade(x, state.settings.bodyKg).idx)) };
+  state.xp += e.xp;
+  const lines = [];
+  if (prev.km && e.km > prev.km) lines.push(`New longest ruck: ${esc(fmtKm(e.km))}!`);
+  if (prev.kgkm && e.kgkm > prev.kgkm) lines.push(`New biggest load: ${esc(num(e.kgkm))} kg·km!`);
+  if (prev.kg && e.kg > prev.kg) lines.push(`New heaviest pack: ${esc(e.kg)} kg!`);
+  lines.push(`All your rucks: ${esc(fmtKm(r.km))}, ${esc(num(Math.round(r.kgkm)))} kg·km carried.`);
+  applySettings();
+  initAudio(); // the Save tap wakes the sound, like a fight start does
+  sfx.win();
+  const sysSay = systemLines(sysBefore, lines);
+  levelUpLine(levelBefore, lines);
+  if (sysSay) say(sysSay.trim());
+  quietAudio(1500);
+  const ok = save();
+  if (!ok) lines.push(NOT_SAVED);
+  hideHandForm();
+  ruckMsg("");
+  renderCurrent();
+  // the report again, now with what the ruck did: records, level up (the lines and splits from the file
+  // show here even when this ruck is too old to keep them)
+  openModal(`${ruckReport(e, { eyebrow: "Ruck logged", tone: "won", lines })}
+    <div class="row actions">${ok ? "" : BACKUP_NOW_BTN}<button type="button"${ok ? ' class="primary"' : ""} data-action="closeModal">OK</button></div>`);
+}
+
 const SLIDERS = [["sDepth", "oDepth", "depth"], ["sTop", "oTop", "top"], ["sBend", "oBend", "bend"], ["sKnee", "oKnee", "knee"]];
 function renderSettings() {
   for (const [s, o, k] of SLIDERS) { $(s).value = state.settings[k]; $(o).textContent = state.settings[k] + "°"; }
@@ -545,7 +963,7 @@ function renderSettings() {
   $("sCamera").value = state.settings.camera;
   $("sModel").value = state.settings.model;
   const b = backupInfo();
-  $("backupWhen").innerHTML = `Last backup: <b>${b.when}</b>${b.days != null && b.fightsSince > 0 ? ` (${plural(b.fightsSince, "fight")} since)` : ""}`;
+  $("backupWhen").innerHTML = `Last backup: <b>${b.when}</b>${b.days != null && b.since > 0 ? ` (${b.sinceText} since)` : ""}`;
   $("storageNote").textContent = storageSafe == null ? ""
     : storageSafe ? "Chrome protects this game's storage from automatic cleanup. Clearing Chrome's data by hand still deletes it."
     : "Chrome may clean this game's storage if the phone runs low on space. Keep backups.";
@@ -598,12 +1016,12 @@ const backupName = () => {
   return `pushup-rpg-backup-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.txt`; // local date, not UTC
 };
 const backupText = () =>
-  `Pushup RPG backup · level ${levelFromXp(state.xp)} · ${plural(state.stats.pushups, "pushup")} · ${fmtAt(now())}\n` +
+  `Pushup RPG backup · level ${levelFromXp(state.xp)} · ${plural(state.stats.pushups, "pushup")}${state.ruck.count ? ` · ${fmtKm(state.ruck.km)} rucked` : ""} · ${fmtAt(now())}\n` +
   `To restore: open the game, Settings → Backup → Open backup file, or paste this whole text there.\n\n${backupCode()}\n`;
 
 // Read a backup out of any text: a pasted code, a whole message, or a backup file.
 // Returns null (no code in it) or { save, problem }, where problem says why it can't be used.
-// The biggest save the game can make gives a backup of about 17,000 characters (test Item 1c), so
+// The biggest save the game can make gives a backup of about 29,000 characters (test Item 1c), so
 // anything much longer is refused before any decoding: a huge paste can't freeze the phone.
 const BACKUP_MAX_CHARS = 32768, BACKUP_MAX_FILE = 65536;
 function readBackup(text) {
@@ -695,9 +1113,24 @@ function checkSave(s) {
     const f = findMonster(id);
     return xpReward(biggest(f.m), f.zone ? "world" : "dungeon");
   };
+  // Rucks (ruck.js). The pack weight is on your honor, but the numbers must fit each other: no more kg·km
+  // than the km allow with the heaviest pack, and no more ruck XP than the kg·km give (each ruck's XP is
+  // rounded on its own: up to half an XP more each). Saves from before rucking have no ruck part.
+  const rk = s.ruck ?? {};
+  if (!isObj(rk) || (rk.best != null && !isObj(rk.best))) return "its rucks are broken";
+  if (rk.log != null && !Array.isArray(rk.log)) return "its ruck list is broken";
+  const amount = v => v == null || (Number.isFinite(v) && v >= 0);
+  if (![rk.count ?? 0, rk.xp ?? 0].every(whole) || ![rk.km, rk.kgkm, rk.mins, rk.climb].every(amount)) return "a ruck number in it is not a normal number";
+  const rucks = rk.count || 0, ruckKm = rk.km || 0, ruckKgkm = rk.kgkm || 0, ruckXpAll = rk.xp || 0;
+  if ((rk.log || []).length > Math.min(rucks, RULES.ruckLogMax)) return `${num(rucks)} rucks, but ${num(rk.log.length)} in its ruck list`;
+  if (ruckKm > rucks * RULES.ruckKm[1] + 0.01) return `${num(ruckKm)} km doesn't fit ${num(rucks)} rucks`;
+  if (ruckKgkm > ruckKm * RULES.ruckKg[1] + 0.1 * rucks + 0.01) return `${num(ruckKgkm)} kg·km doesn't fit ${num(ruckKm)} km of rucks`;
+  const ruckXpMax = Math.floor(ruckKgkm * RULES.ruckXpPerKgKm + rucks / 2 + 1e-9);
+  if (ruckXpAll > ruckXpMax) return `${num(ruckXpAll)} XP from rucks, but its rucks could give at most ${num(ruckXpMax)}`;
+
   const deepest = st.deepestFloor || 0;
-  const maxXp = test + Object.entries(kills).reduce((a, [id, k]) => a + k * xpCap(id), 0) + RULES.floorBonusXp * deepest * (deepest + 1) / 2;
-  if (s.xp > maxXp) return `${num(s.xp)} XP, but its wins could give at most ${num(maxXp)}`;
+  const maxXp = test + Object.entries(kills).reduce((a, [id, k]) => a + k * xpCap(id), 0) + RULES.floorBonusXp * deepest * (deepest + 1) / 2 + ruckXpAll;
+  if (s.xp > maxXp) return `${num(s.xp)} XP, but its wins and rucks could give at most ${num(maxXp)}`;
 
   // areas open only through the strength test and then each area's boss in turn
   // (the test may be from before the Ashlands changed to rounds, when a big result could open them)
@@ -750,16 +1183,40 @@ function cleanSave(s, keepMark = false) {
     t: numOr(h && h.t, 0), id: str(h && h.id, 40) || undefined, name: str(h && h.name, 60),
     hp: numOr(h && h.hp, 0), reps: numOr(h && h.reps, 0), won: !!(h && h.won), where: str(h && h.where, 60),
   }));
+  // rucks: only numbers (km, kg and kg·km may have decimals), and each logged ruck must have its times
+  const amount = v => (Number.isFinite(v) && v >= 0 ? v : 0);
+  const rk = isObj(s.ruck) ? s.ruck : {}, rb = isObj(rk.best) ? rk.best : {};
+  out.ruck = {
+    count: count(rk.count, 0), km: amount(rk.km), kgkm: amount(rk.kgkm), xp: count(rk.xp, 0), mins: count(rk.mins, 0), climb: count(rk.climb, 0),
+    best: { km: amount(rb.km), kgkm: amount(rb.kgkm), kg: amount(rb.kg), rank: Math.min(RANKS.length - 1, count(rb.rank, 0)) },
+    log: (Array.isArray(rk.log) ? rk.log : []).filter(x => isObj(x) && Number.isFinite(x.t) && Number.isFinite(x.end)).slice(0, RULES.ruckLogMax)
+      .map(x => {
+        const e = { t: x.t, end: x.end, km: amount(x.km), kg: amount(x.kg), kgkm: amount(x.kgkm), mins: count(x.mins, 0), climb: count(x.climb, 0), xp: count(x.xp, 0), src: x.src === "gpx" ? "gpx" : "hand" };
+        // the report's numbers, when the watch recorded them (whole numbers, within what a body can do)
+        for (const [k, hi] of [["hrAvg", 250], ["hrMax", 250], ["spm", 300], ["steps", 1e6]]) if (Number.isFinite(x[k]) && x[k] > 0 && x[k] <= hi) e[k] = Math.round(x[k]);
+        if (Number.isFinite(x.bw) && x.bw >= RUCK_TEST.bodyKg[0] && x.bw <= RUCK_TEST.bodyKg[1]) e.bw = Math.round(x.bw * 10) / 10; // body weight, for its rank
+        // its lines and splits: short lists of numbers (or gaps) only
+        const list = (v, n, lo, hi, gaps) => (Array.isArray(v) && v.length <= n && v.length > 0 && v.every(y => (gaps && y === null) || (Number.isFinite(y) && y >= lo && y <= hi)) ? v.map(y => (y === null ? null : Math.round(y))) : null);
+        if (isObj(x.chart)) {
+          // (a split is null for a km with a hole in the recording)
+          const c = { hr: list(x.chart.hr, RULES.ruckChartPoints, 0, 250, true), ele: list(x.chart.ele, RULES.ruckChartPoints, -500, 9000, true), splits: list(x.chart.splits, RULES.ruckSplitsMax, 1, 36000, true) };
+          if (c.hr || c.ele || c.splits) e.chart = c;
+        }
+        return e;
+      }),
+  };
   const set = { ...DEFAULT_SETTINGS, ...(s.settings && typeof s.settings === "object" ? s.settings : {}) };
   for (const [k, [lo, hi]] of Object.entries(SETTING_RANGES)) {
     if (!(Number.isFinite(set[k]) && set[k] >= lo && set[k] <= hi)) set[k] = TESTED_STRICTNESS[k];
   }
+  if (!(Number.isFinite(set.ruckKg) && set.ruckKg >= RULES.ruckKg[0] && set.ruckKg <= RULES.ruckKg[1])) set.ruckKg = DEFAULT_SETTINGS.ruckKg;
+  if (!(Number.isFinite(set.bodyKg) && set.bodyKg >= RUCK_TEST.bodyKg[0] && set.bodyKg <= RUCK_TEST.bodyKg[1])) set.bodyKg = null;
   if (!["user", "environment"].includes(set.camera)) set.camera = DEFAULT_SETTINGS.camera;
   if (!["full", "lite"].includes(set.model)) set.model = DEFAULT_SETTINGS.model;
   set.voice = set.voice !== false;
   set.sound = set.sound !== false;
   out.settings = set;
-  for (const k of ["restUntil", "dungeonLockedUntil", "lastBackupAt", "backupFights", "savedAt", "rev"]) out[k] = numOr(s[k], 0);
+  for (const k of ["restUntil", "dungeonLockedUntil", "lastBackupAt", "backupFights", "backupRucks", "savedAt", "rev"]) out[k] = numOr(s[k], 0);
   out.wandererDone = str(s.wandererDone, 20);
   const w = s.wanderToday;
   out.wanderToday = w && typeof w === "object" && typeof w.key === "string" && Number.isFinite(w.hp) ? { key: w.key.slice(0, 20), hp: w.hp } : null;
@@ -794,15 +1251,20 @@ function penaltiesToKeep() {
 
 function backupInfo() {
   const fightsSince = state.stats.fights - (state.backupFights || 0);
+  const rucksSince = state.ruck.count - (state.backupRucks || 0);
   const days = state.lastBackupAt ? Math.floor((now() - state.lastBackupAt) / 86400000) : null;
   const when = days == null ? "never" : days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
-  // nag only when there is something new to lose: never backed up, a week old, or many fights since
-  const overdue = state.stats.fights > 0 && fightsSince > 0 && (days == null || days >= 7 || fightsSince >= 20);
-  return { fightsSince, days, when, overdue };
+  // nag only when there is something new to lose: never backed up, a week old, or many fights (or rucks) since
+  const since = Math.max(0, fightsSince) + Math.max(0, rucksSince);
+  const overdue = state.stats.fights + state.ruck.count > 0 && since > 0 && (days == null || days >= 7 || since >= 20);
+  // "3 fights", "1 ruck", "3 fights and 1 ruck"
+  const sinceText = [fightsSince > 0 ? plural(fightsSince, "fight") : "", rucksSince > 0 ? plural(rucksSince, "ruck") : ""].filter(Boolean).join(" and ");
+  return { fightsSince, rucksSince, since, sinceText, days, when, overdue };
 }
 function markBackedUp(msg) {
   state.lastBackupAt = now();
   state.backupFights = state.stats.fights;
+  state.backupRucks = state.ruck.count;
   save();
   $("backupMsg").textContent = msg;
   renderCurrent();
@@ -1407,7 +1869,7 @@ function win() {
   f.over = true;
   state.fightMark = null;
   updateThreat(null);
-  const levelBefore = levelFromXp(state.xp);
+  const levelBefore = levelFromXp(state.xp), sysBefore = systemStatus(state);
   const prevBest = state.stats.bestSet;
   // a replayed mine floor: 1 XP per counted rep
   const gain = f.where === "champion" ? f.reps * RULES.championXpPerRep
@@ -1429,10 +1891,11 @@ function win() {
     }
     if (f.where === "wander") { state.wandererDone = f.m.key; lines.push("It wanders off. Another one may come tomorrow."); }
     if (f.where === "champion") lines.push(`The next Champion will have ${state.stats.bestSet + 1} HP.`);
+    const sysSay = systemLines(sysBefore, lines);
     levelUpLine(levelBefore, lines);
     const ok = save();
     if (!ok) lines.push(NOT_SAVED);
-    say(f.where === "champion" ? `New record. ${f.reps}!` : `${f.m.name} defeated!`);
+    say((f.where === "champion" ? `New record. ${f.reps}!` : `${f.m.name} defeated!`) + sysSay);
     endFight("map");
     resultModal({ tone: "won", eyebrow: "Victory", title: `${f.m.name} defeated`, lines,
       buttons: (ok ? "" : BACKUP_NOW_BTN) + `<button type="button"${ok ? ' class="primary"' : ""} data-action="closeModal">Back to the map</button>` });
@@ -1443,9 +1906,10 @@ function win() {
   run.room++;
   const rooms = DUNGEON.floors[run.floor - 1];
   if (run.room < rooms.length) {
+    const sysSay = systemLines(sysBefore, lines);
     levelUpLine(levelBefore, lines);
     save();
-    say(`${f.m.name} defeated! Rest.`);
+    say(`${f.m.name} defeated!${sysSay} Rest.`);
     mineBreak(RULES.restBetweenRoomsSec, `Room ${run.room} cleared`, lines);
     return;
   }
@@ -1453,11 +1917,12 @@ function win() {
   // last room of a replay: no floor bonus, and the mine progress stays (both are for first clears)
   if (run.replay) {
     state.run = null;
+    const sysSay = systemLines(sysBefore, lines);
     levelUpLine(levelBefore, lines);
     lines.push(`Floor ${run.floor} replayed. The floor bonus and mine progress are only for first clears.`);
     const ok = save();
     if (!ok) lines.push(NOT_SAVED);
-    say(`Floor ${run.floor} replayed!`);
+    say(`Floor ${run.floor} replayed!${sysSay}`);
     endFight("dungeon");
     resultModal({ tone: "won", eyebrow: "Replay", title: `Floor ${run.floor} replayed`, lines,
       buttons: (ok ? "" : BACKUP_NOW_BTN) + `<button type="button"${ok ? ' class="primary"' : ""} data-action="closeModal">Leave the mine</button>` });
@@ -1472,6 +1937,7 @@ function win() {
   state.dungeonFloor = cleared + 1;
   state.run = null;
   const safeAt = lines.length;
+  const sysSay = systemLines(sysBefore, lines);
   levelUpLine(levelBefore, lines);
   // only say the floor is saved when it really is; the progress stays in this session either way
   const ok = save();
@@ -1479,7 +1945,7 @@ function win() {
     ? `Safe room reached! Floor ${cleared} is saved. +${bonus} XP.`
     : `Safe room reached! Floor ${cleared} cleared, +${bonus} XP.`);
   if (!ok) lines.push(NOT_SAVED);
-  say("Safe room reached!");
+  say(`Safe room reached!${sysSay}`);
   endFight("dungeon");
   const more = state.dungeonFloor <= DUNGEON.floors.length;
   resultModal({ tone: "won", eyebrow: "Victory", title: `Floor ${cleared} cleared`, lines,
@@ -1491,7 +1957,7 @@ function win() {
 function lose(reason) {
   const f = fight;
   const where = f ? f.where : "dungeon";
-  const prevBest = state.stats.bestSet;
+  const prevBest = state.stats.bestSet, sysBefore = systemStatus(state);
   state.fightMark = null;
   let prev = null;
   if (f) {
@@ -1515,6 +1981,7 @@ function lose(reason) {
     else if (f.total - f.reps <= 3) lines.push(`Only ${f.total - f.reps} short. Next time.`);
     if (where === "champion") lines.push(`Your record stays at ${state.stats.bestSet}.`);
   }
+  const sysSay = systemLines(sysBefore, lines); // a loss can still bring a new best set
   if (where === "dungeon") {
     // a lost replay: only the normal rest (the mine stays open, the progress is kept)
     if (state.run && state.run.replay) lines.push(`It was a replay of floor ${state.run.floor}, so the mine stays open and your progress is kept.`);
@@ -1527,7 +1994,7 @@ function lose(reason) {
   lines.push(`Your muscles need rest. Fights open again in ${RULES.restHoursAfterLoss} hours (${fmtAt(state.restUntil)}).`);
   save();
   sfx.lose();
-  say("Time to recover.");
+  say(`Time to recover.${sysSay}`);
   endFight(where === "dungeon" ? "dungeon" : "map");
   resultModal({ tone: "lost", eyebrow: "Recovering", title: f ? `${f.m.name} won this time` : "You left the mine", lines,
     buttons: `<button type="button" class="primary" data-action="goto" data-to="camp">Back to camp</button>` });
@@ -1546,7 +2013,7 @@ function finishTest() {
       buttons: `<button type="button" class="primary" data-action="closeModal">OK</button>` });
     return;
   }
-  const levelBefore = levelFromXp(state.xp);
+  const levelBefore = levelFromXp(state.xp), sysBefore = systemStatus(state);
   const s = state.stats;
   s.pushups += reps;
   s.bestSet = Math.max(s.bestSet, reps);
@@ -1564,10 +2031,11 @@ function finishTest() {
     zi > 0 ? "The areas before it stay open for warm-ups and easy XP." : "Beat the monsters here, then the boss, to open the next area.",
     `The Champion on the map now has your best set + 1: ${s.bestSet + 1} HP.`,
   ];
+  const sysSay = systemLines(sysBefore, lines);
   levelUpLine(levelBefore, lines);
   save();
   sfx.win();
-  say(`${plural(reps, "pushup")}. Well done.`);
+  say(`${plural(reps, "pushup")}. Well done.${sysSay}`);
   endFight("map");
   resultModal({ tone: "won", eyebrow: "Strength test", title: `${reps} pushup${reps === 1 ? "" : "s"}`, lines,
     buttons: `<button type="button" class="primary" data-action="closeModal">See the map</button>` });
@@ -1774,6 +2242,11 @@ document.addEventListener("click", e => {
   else if (action === "replayFloor") replayFloor(Number(b.dataset.floor));
   else if (action === "continueRun") continueRun();
   else if (action === "backupNow") shareBackup();
+  else if (action === "saveRuck") saveRuck();
+  else if (action === "ruckFixKm") fixRuckKm();
+  else if (action === "ruckDelete") askDeleteRuck(b.dataset.t);
+  else if (action === "ruckDeleteYes") deleteRuck(b.dataset.t);
+  else if (action === "ruckReport") openRuckReport(b.dataset.t);
 });
 
 $("btnFlee").addEventListener("click", e => {

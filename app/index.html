@@ -16,9 +16,10 @@
 <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700;800&display=swap" onload="this.onload=null;this.rel='stylesheet'">
 <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700;800&display=swap"></noscript>
 <link rel="stylesheet" href="style.css">
-<!-- game.js imports these two: fetch them at the same time as game.js instead of after it -->
+<!-- game.js imports these: fetch them at the same time as game.js instead of after it -->
 <link rel="modulepreload" href="core.js">
 <link rel="modulepreload" href="data.js">
+<link rel="modulepreload" href="ruck.js">
 </head>
 <body>
 
@@ -33,19 +34,34 @@
         <div class="xpbar"><div id="campXpFill"></div></div>
         <p class="fine" id="campXpText"></p>
       </div>
+      <button type="button" class="hud-rank camp-rank" id="campRank" data-action="goto" data-to="status" title="Your overall rank: open your status"><span>Rank</span><b>F</b></button>
     </header>
     <p id="saveWarn" class="status panel" hidden></p>
     <p id="campStatus" class="status panel"></p>
     <div id="backupNag" class="status panel" hidden></div>
     <nav class="menu">
+      <button type="button" data-action="goto" data-to="status"><b>Status</b><span>Your stats and ranks, measured by the System</span></button>
       <button type="button" data-action="goto" data-to="map"><b>World map</b><span>Fight monsters one at a time</span></button>
       <button type="button" data-action="goto" data-to="dungeon"><b>The Old Mine</b><span>Rooms in a row. Reach the safe room.</span></button>
+      <button type="button" data-action="goto" data-to="ruck"><b>Rucking</b><span>Log a ruck: pack weight × distance</span></button>
       <button type="button" data-action="goto" data-to="records"><b>Records</b><span>Your stats, monsters and last fights</span></button>
       <button type="button" data-action="goto" data-to="settings"><b>Settings</b><span>Strictness, camera, sound</span></button>
     </nav>
     <div class="row" id="installRow" hidden><button type="button" id="btnInstallCamp">Install Pushup RPG as an app</button></div>
     <div class="tiles" id="campTiles"></div>
     <p class="fine" id="syncStatus">Checking where your progress is saved…</p>
+  </div>
+</section>
+
+<!-- ===== status: the System's window (stats and ranks, only shown) ===== -->
+<section id="status" class="screen" hidden>
+  <div class="wrap">
+    <div class="topbar"><button class="back" type="button" data-action="goto" data-to="camp">← Camp</button><h1>Status</h1></div>
+    <div class="card-block panel sys-head" id="stHead"></div>
+    <div id="stCats" class="sys-cats"></div>
+    <div class="card-block panel" id="stHeart"></div>
+    <div class="card-block panel sys-later" id="stLater"></div>
+    <p class="fine">The System only measures. Every stat is a real number from your training, and stats never change a fight. Ranks come from your bests, so they never go down (HEART can).</p>
   </div>
 </section>
 
@@ -72,6 +88,57 @@
     <div class="card-block panel">
       <h2>Floors</h2>
       <div class="ladder" id="dgLadder"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== rucking ===== -->
+<section id="ruck" class="screen" hidden>
+  <div class="wrap">
+    <div class="topbar"><button class="back" type="button" data-action="goto" data-to="camp">← Camp</button><h1>Rucking</h1></div>
+    <p id="ruckIntro" class="status panel"></p>
+    <div class="tiles" id="ruckTiles"></div>
+    <div class="card-block panel">
+      <h2>Log a ruck</h2>
+      <div class="grid2">
+        <div class="field">
+          <label for="ruckKg">Pack weight (kg)</label>
+          <input type="number" id="ruckKg" min="1" max="60" step="0.1" inputmode="decimal">
+        </div>
+        <div class="field">
+          <label for="ruckBody">Your body weight (kg)</label>
+          <input type="number" id="ruckBody" min="30" max="250" step="0.1" inputmode="decimal" placeholder="for your rank">
+        </div>
+      </div>
+      <p class="fine">Weigh your packed pack once. Both are kept for your next rucks. Your rank counts the pack as a share of your body weight (80 kg is used until you give yours).</p>
+      <div class="row">
+        <label class="btn file-btn primary"><input type="file" id="ruckFile">Open GPX file</label>
+        <button type="button" id="btnRuckHand">Enter by hand</button>
+      </div>
+      <form id="ruckHand" class="ruck-form" novalidate hidden>
+        <p class="fine" id="ruckHandNote"></p>
+        <div class="grid2">
+          <div class="field"><label for="rhDate">Date</label><input type="date" id="rhDate"></div>
+          <div class="field"><label for="rhStart">Start time</label><input type="time" id="rhStart"></div>
+          <div class="field"><label for="rhKm">Distance (km)</label><input type="number" id="rhKm" min="0.5" max="80" step="0.01" inputmode="decimal"></div>
+          <div class="field"><label for="rhClimb">Climb (m)</label><input type="number" id="rhClimb" min="0" step="1" inputmode="numeric" placeholder="if you know it"></div>
+          <div class="field"><label for="rhH">Start to end, breaks in: hours</label><input type="number" id="rhH" min="0" max="24" step="1" inputmode="numeric"></div>
+          <div class="field"><label for="rhMin">and minutes</label><input type="number" id="rhMin" min="0" max="59" step="1" inputmode="numeric"></div>
+        </div>
+        <div class="row"><button type="submit" class="primary">Check ruck</button><button type="button" id="btnRuckHandCancel">Cancel</button></div>
+      </form>
+      <p class="fine" id="ruckMsg" role="status"></p>
+      <p class="fine">A GPX file: in the Zepp app, open the workout and export it as GPX. From Strava: open the ruck on strava.com (on a phone: Chrome menu ⋮ → Desktop site), then ··· → Export GPX. The game keeps the numbers (km, time, climb, heart rate, steps), never the map of where you walked.</p>
+    </div>
+    <div class="card-block panel">
+      <h2>Ruck ranks</h2>
+      <p class="fine">A ruck's rank is the hardest march test it passes. Time runs from start to end, breaks included. Every 100 m up counts as 1 km more for your pace. XP doesn't change: it stays pack kg × km.</p>
+      <ul class="ruck-tests" id="ruckTests"></ul>
+    </div>
+    <div class="card-block panel">
+      <h2>Last rucks</h2>
+      <p class="fine" id="ruckBest"></p>
+      <ul class="history" id="ruckLog"></ul>
     </div>
   </div>
 </section>

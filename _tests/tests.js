@@ -75,7 +75,7 @@ async function open(id) {
       await wait(300);
     },
     // which screen is showing
-    screen: () => ["camp", "map", "dungeon", "records", "settings", "fight"].find(s => !d.getElementById(s).hidden),
+    screen: () => ["camp", "status", "map", "dungeon", "ruck", "records", "settings", "fight"].find(s => !d.getElementById(s).hidden),
     // tap Fight / Enter floor / Continue without waiting for the start (for startup tests)
     async tapFight(monsterId) {
       await g.goto("map");
@@ -281,6 +281,36 @@ async function open(id) {
       input.dispatchEvent(new w.Event("change", { bubbles: true }));
       await wait(300);
       return g.text("#backupMsg");
+    },
+    // Rucking: opens a GPX file with the "Open GPX file" button; returns once the check card (modal), a
+    // message, or the form (a file with no times) shows
+    async ruckFile(text, name = "ruck.gpx") {
+      const input = d.querySelector("#ruckFile");
+      const dt = new w.DataTransfer();
+      dt.items.add(new w.File([text], name, { type: "application/gpx+xml" }));
+      input.files = dt.files;
+      input.dispatchEvent(new w.Event("change", { bubbles: true }));
+      await until(() => g.modal() || !d.querySelector("#ruckHand").hidden || (g.text("#ruckMsg") && !/^Reading/.test(g.text("#ruckMsg"))), 8000, "the ruck file to be read");
+      await wait(100);
+    },
+    // Rucking: types a ruck into the "Enter by hand" form and taps Check ruck. start: a Date (local time)
+    async ruckHand({ start, km, h = 0, min = 0, climb = "" }) {
+      if (d.querySelector("#ruckHand").hidden) { d.querySelector("#btnRuckHand").click(); await wait(100); }
+      const p = n => String(n).padStart(2, "0");
+      d.querySelector("#rhDate").value = `${start.getFullYear()}-${p(start.getMonth() + 1)}-${p(start.getDate())}`;
+      d.querySelector("#rhStart").value = `${p(start.getHours())}:${p(start.getMinutes())}`;
+      d.querySelector("#rhKm").value = String(km);
+      d.querySelector("#rhH").value = String(h);
+      d.querySelector("#rhMin").value = String(min);
+      d.querySelector("#rhClimb").value = String(climb);
+      d.querySelector("#ruckHand").requestSubmit();
+      await wait(200);
+    },
+    // Rucking: taps "Save ruck" on the check card
+    async saveRuck() {
+      const b = d.querySelector('#modal:not([hidden]) [data-action="saveRuck"]');
+      check(b, `no Save ruck button: "${g.modal().slice(0, 120)}" / "${g.text("#ruckMsg")}"`);
+      b.click(); await wait(300);
     },
     // taps a backup button and returns the backup text the share menu would get (no real share sheet)
     async backupText(selector) {
@@ -687,6 +717,36 @@ function noPenalty(g, { run = false } = {}) {
   check(g.errors.length === 0, "errors: " + g.errors.join(" | "));
 }
 
+// ---------------------------------------------------------------- rucking helpers
+// A made-up GPX track: one point a second, walking north from a made-up place, with a little GPS wobble.
+// Never a real place: a real GPX file shows where someone walks. legs: [seconds, km/h, meters up] or
+// { pause: seconds } (standing still). route: a planned route (rte) instead of a recorded track.
+// hr / cad: heart rate and cadence (one foot) written into every point's extensions, under the gpxtpx prefix
+// (Zepp writes ns3: the game must find them by name, whatever the prefix).
+// legs: [secs, kmh, climb] walking, { pause: secs } standing still, { hole: secs, kmh } moving with nothing
+// recorded (GPS lost). sensorSecs: heart rate and cadence only for the first that many seconds; sensorEvery:
+// only on every n-th point; eleNoise: GPS height wobbles up to that many meters each way.
+function makeGpx(legs, { start = Date.now() - 3 * 86400e3, times = true, ele = true, wobble = 2, route = false, hr = null, cad = null, sensorSecs = Infinity, sensorEvery = 1, eleNoise = 0 } = {}) {
+  let lat = 61.5, lon = 9.5, t = start, h = 300, seed = 7, n = 0;
+  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 - 0.5; };
+  const tag = route ? "rtept" : "trkpt", pts = [];
+  const ext = hr == null && cad == null ? "" : `<extensions><gpxtpx:TrackPointExtension>${hr != null ? `<gpxtpx:hr>${hr}</gpxtpx:hr>` : ""}${cad != null ? `<gpxtpx:cad>${cad}</gpxtpx:cad>` : ""}</gpxtpx:TrackPointExtension></extensions>`;
+  const push = () => {
+    const m = wobble / 111320; // meters to degrees
+    const sensors = (t - start) / 1000 <= sensorSecs && n++ % sensorEvery === 0;
+    const hh = eleNoise ? h + rnd() * 2 * eleNoise : h;
+    pts.push(`<${tag} lat="${(lat + rnd() * m).toFixed(7)}" lon="${(lon + rnd() * m * 2).toFixed(7)}">${ele ? `<ele>${hh.toFixed(1)}</ele>` : ""}${times ? `<time>${new Date(t).toISOString()}</time>` : ""}${sensors ? ext : ""}</${tag}>`);
+  };
+  push();
+  for (const leg of legs) {
+    if (leg.hole != null) { lat += (leg.kmh / 3.6 / 111320) * leg.hole; t += leg.hole * 1000; continue; }
+    const [secs, kmh, climb = 0] = leg.pause != null ? [leg.pause, 0, 0] : leg;
+    for (let i = 0; i < secs; i++) { lat += kmh / 3.6 / 111320; h += climb / secs; t += 1000; push(); }
+  }
+  const body = route ? `<rte>${pts.join("")}</rte>` : `<trk><name>Test ruck</name><trkseg>${pts.join("")}</trkseg></trk>`;
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="tests" xmlns="http://www.topografix.com/GPX/1/1" xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">${body}</gpx>`;
+}
+
 // ---------------------------------------------------------------- Bug #1: a second window
 const tests = [
   ["#1a A second window can't end a mine fight that is still going", async () => {
@@ -1074,9 +1134,18 @@ const tests = [
     st.history = Array.from({ length: 40 }, (_, i) => ({ t: Date.now(), id: "m".repeat(40), name: "N".repeat(60), hp: 999, reps: 999, won: i % 2 === 0, where: "W".repeat(60) }));
     st.kills = Object.fromEntries([...ids, "champion"].map(id => [id, 99999]));
     st.losses = { ...st.kills };
+    // and a full ruck log (the longest numbers a ruck can have), with big totals
+    const t0 = Date.now() - 400 * 86400e3;
+    st.ruck = { count: 99999, km: 7999919.99, kgkm: 479995233.3, xp: 239997617, mins: 143998560, climb: 99999999, best: { km: 79.99, kgkm: 4799.4, kg: 59.9, rank: 6 },
+      log: Array.from({ length: 40 }, (_, i) => ({ t: t0 + i * 86400e3 + 0.5, end: t0 + i * 86400e3 + 86399999.5, km: 79.99, kg: 59.9, kgkm: 4791.4, mins: 1439, climb: 99999, xp: 2396, src: "gpx", bw: 249.9,
+        hrAvg: 250, hrMax: 250, spm: 300, steps: 1000000,
+        // the newest rucks keep their report lines and km bars, as long as they can be
+        ...(i < 3 ? { chart: { hr: Array(32).fill(250), ele: Array(32).fill(-499), splits: Array(50).fill(35999) } } : {}) })) };
+    st.settings.ruckKg = 59.9;
+    st.settings.bodyKg = 249.9;
     const text = await A.backupText("#btnShareBackup");
     check(text.length < 32768, `the biggest backup is ${text.length} characters, over the 32,768 limit`);
-    notes.push(`biggest backup ${text.length} chars (${ids.length + 1} monsters)`);
+    notes.push(`biggest backup ${text.length} chars (${ids.length + 1} monsters, 40 rucks)`);
     check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
     return notes.join("; ");
   }],
@@ -1151,7 +1220,7 @@ const tests = [
       await until(() => g.d.readyState === "complete", 3000, "the page to finish loading");
       for (const to of ["settings", "map", "records", "dungeon"]) check(campTrip(g.d, to), `Camp → ${to} → Back didn't work`);
       const menu = [...g.d.querySelectorAll("#camp .menu button")];
-      check(menu.length === 4 && menu.every(b => b.getBoundingClientRect().height >= 42), "the Camp buttons lost their size");
+      check(menu.length === 6 && menu.every(b => b.getBoundingClientRect().height >= 42), "the Camp buttons lost their size");
       await wait(300);
       const st = await fontStatus();
       check(st.seen.some(u => /fonts\.googleapis\.com/.test(u)), "test setup: the font was never asked for");
@@ -2571,7 +2640,9 @@ const tests = [
       const o = res.openWindow, h = res.hung, r = res.repaired;
       if (!(o.status === 504 && o.ms <= 500 && o.asked === 0)) bad.push(`open window: ${JSON.stringify(o)}`);
       if (!(h.tryAgainAfterMs !== null && h.tryAgainAfterMs <= 8000 && !h.game)) bad.push(`no signal: ${JSON.stringify(h)}`);
-      if (!(r.readyMs !== null && allFrom(r.release, "a") && r.savedFiles === 8 && r.saveKept)) bad.push(`repaired: ${JSON.stringify(r)}`);
+      // every file of the release is saved again: as many as sw.js lists
+      const listed = JSON.parse((await (await fetch("../app/sw.js")).text()).match(/SHELL_FILES\s*=\s*(\[[^\]]*\])/)[1]).length;
+      if (!(r.readyMs !== null && allFrom(r.release, "a") && r.savedFiles === listed && r.saveKept)) bad.push(`repaired (${listed} files listed): ${JSON.stringify(r)}`);
     } finally { await shellNet("mode=pass&release=a"); await reset(); await clearHelper(); }
     check(!bad.length, bad.join(" || "));
     return JSON.stringify(res);
@@ -3572,6 +3643,479 @@ const tests = [
     check(A.api.rest && !A.modal(), `no break: "${A.modal().slice(0, 80)}"`);
     const s = saved();
     check(s.run && !(s.restUntil > Date.now()) && !(s.dungeonLockedUntil > Date.now()), "the run was counted as left");
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+  }],
+  // ------------------------------------------------------------ rucking (ruck.js, the Rucking screen)
+  ["Ruck 1 A GPX walk is read right: km within 3% (GPS wobble filtered), breaks and a car piece don't count, climb", async () => {
+    const R = await import("../app/ruck.js");
+    // 5 km in an hour with 200 m up, a 10-minute break, 2 km more, then 1 km by car (60 km/h)
+    const s = R.summarizeTrack(R.parseGpx(makeGpx([[3600, 5, 200], { pause: 600 }, [1200, 6], [60, 60]])));
+    check(s.timed, "the times weren't read");
+    check(Math.abs(s.km - 7) / 7 <= 0.03, `km ${s.km}, expected 7 (within 3%)`);
+    check(Math.abs(s.mins - 80) <= 2, `moving time ${s.mins} min, expected about 80 (the break doesn't count)`);
+    check(Math.abs(s.fastKm - 1) <= 0.15, `too-fast km ${s.fastKm}, expected about 1`);
+    check(!R.looksLikeCar(s), "a walk with a short car piece was taken for a car ride");
+    check(Math.abs(s.climb - 200) <= 10, `climb ${s.climb} m, expected about 200`);
+    check(s.end - s.start === (3600 + 600 + 1200 + 60) * 1000, `start to end: ${s.end - s.start} ms`);
+    // standing still for an hour (only GPS wobble) is no walk at all
+    const still = R.summarizeTrack(R.parseGpx(makeGpx([{ pause: 3600 }], { wobble: 3 })));
+    check(still.km < 0.05 && still.mins <= 1, `standing still counted as ${still.km} km, ${still.mins} min`);
+    // mostly by car
+    check(R.looksLikeCar(R.summarizeTrack(R.parseGpx(makeGpx([[600, 5], [600, 70]])))), "a car ride wasn't noticed");
+    // no heart rate or cadence in the file: the report's numbers are simply missing
+    check(s.hrAvg === null && s.spm === null && s.steps === null && s.chart && s.chart.hr === null && s.chart.ele.length === 32, `no heart rate: ${JSON.stringify({ hr: s.hrAvg, spm: s.spm, chart: s.chart && s.chart.hr })}`);
+    // the ruck report: heart rate, steps (cadence is one foot: doubled), km splits, lines
+    const f = R.summarizeTrack(R.parseGpx(makeGpx([[3600, 5, 200], { pause: 600 }, [1200, 6]], { hr: 112, cad: 61 })));
+    check(f.hrAvg === 112 && f.hrMax === 112, `heart rate ${f.hrAvg} avg, ${f.hrMax} max, expected 112`);
+    check(f.spm === 122 && Math.abs(f.steps - 122 * f.mins) <= 122, `steps: ${f.steps} at ${f.spm} a minute over ${f.mins} min`);
+    check(f.splits && f.splits.length === Math.floor(f.km), `km splits for ${f.km} km: ${JSON.stringify(f.splits)}`);
+    check(Math.abs(f.splits[0] - 720) <= 25 && Math.abs(f.splits[5] - 600) <= 25, `km 1 took ${f.splits[0]} s (5 km/h = 720), km 6 ${f.splits[5]} s (6 km/h = 600)`);
+    check(f.chart.hr.length === 32 && f.chart.ele.length === 32 && f.chart.hr.every(v => v === 112), `lines: ${JSON.stringify(f.chart)}`);
+    return `a 7 km walk read as ${s.km} km, ${s.mins} min, ${s.climb} m up, ${s.fastKm} km too fast; with heart rate: ${f.hrAvg} bpm, ${f.steps} steps, splits ${f.splits.join("/")} s`;
+  }],
+  ["Ruck 2 GPX files without times, routes, broken files, and the ruck rules (effort, XP, limits, the same walk twice)", async () => {
+    const R = await import("../app/ruck.js");
+    const { RULES } = await import("../app/data.js");
+    const untimed = R.summarizeTrack(R.parseGpx(makeGpx([[3600, 5]], { times: false, ele: false })));
+    check(!untimed.timed && untimed.mins === null && untimed.start === null && untimed.climb === null && Math.abs(untimed.km - 5) <= 0.15, `no times: ${JSON.stringify(untimed)}`);
+    check(R.parseGpx(makeGpx([[600, 5]], { route: true })).length === 601, "a route's points weren't read");
+    const friendly = fn => { try { fn(); return "(no error)"; } catch (e) { return e.friendly || "(not friendly) " + e.message; } };
+    for (const [what, text] of [["not XML", "hello"], ["cut off", makeGpx([[60, 5]]).slice(0, 500)], ["a backup file", "Pushup RPG backup PRPG2.abc.def"], ["empty", ""]]) {
+      const m = friendly(() => R.summarizeTrack(R.parseGpx(text)));
+      check(/GPX/.test(m), `${what}: "${m}"`);
+    }
+    check(/fewer than 2/.test(friendly(() => R.summarizeTrack(R.parseGpx(makeGpx([]))))), "a file with one point wasn't refused");
+    // the rules
+    check(R.effortOf(15, 6) === 90 && R.ruckXp(90) === 45, "15 kg × 6 km should be 90 kg·km = 45 XP");
+    const now = Date.now(), H = 3600e3;
+    const ok = { t: now - 5 * H, end: now - 4 * H, km: 5, kg: 15, mins: 60 };
+    check(R.ruckProblem(ok, [], now) === null, `a normal ruck was refused: ${R.ruckProblem(ok, [], now)}`);
+    for (const [r, re] of [
+      [{ ...ok, kg: 61 }, /Pack weight/], [{ ...ok, kg: 0.5 }, /Pack weight/], [{ ...ok, km: 0.3 }, /at least/], [{ ...ok, km: 81 }, /at most/],
+      [{ ...ok, mins: 0 }, /How long/], [{ ...ok, km: 13 }, /too fast/], [{ ...ok, t: now + H, end: now + 2 * H }, /future/], [{ ...ok, t: NaN }, /start and end/],
+      [{ ...ok, t: now - 10 * 60000, end: now + 50 * 60000 }, /ends in the future/],
+    ]) {
+      const p = R.ruckProblem(r, [], now);
+      check(p && re.test(p), `${JSON.stringify(r)}: "${p}"`);
+    }
+    // the same walk twice: any overlap in time
+    const logged = R.ruckEntry(ok, "gpx");
+    check(/already logged/.test(R.ruckProblem({ ...ok, t: ok.t + 30 * 60000, end: ok.end + 30 * 60000 }, [logged], now) || ""), "an overlapping ruck wasn't refused");
+    check(R.ruckProblem({ ...ok, t: ok.end, end: ok.end + H }, [logged], now) === null, "a ruck right after another one was refused");
+    // a full log: a ruck older than all of it is refused, a newer one is fine
+    const full = Array.from({ length: RULES.ruckLogMax }, (_, i) => R.ruckEntry({ ...ok, t: now - (i + 10) * 24 * H, end: now - (i + 10) * 24 * H + H }, "hand"));
+    check(/older than all/.test(R.ruckProblem({ ...ok, t: now - 100 * 24 * H, end: now - 100 * 24 * H + H }, full, now) || ""), "an old ruck with a full log wasn't refused");
+    check(R.ruckProblem(ok, full, now) === null, "a new ruck with a full log was refused");
+    // only the summary goes in the log, never map points (a ruck from a file may add the report's numbers)
+    check(Object.keys(logged).sort().join() === "climb,end,kg,kgkm,km,mins,src,t,xp", `log entry fields: ${Object.keys(logged)}`);
+    const fromFile = R.summarizeTrack(R.parseGpx(makeGpx([[1800, 5]], { hr: 120, cad: 60 })));
+    const rich = R.ruckEntry({ ...ok, ...fromFile, kg: 15, t: ok.t, end: ok.end }, "gpx");
+    check(Object.keys(rich).sort().join() === "chart,climb,end,hrAvg,hrMax,kg,kgkm,km,mins,spm,src,steps,t,xp", `log entry from a file: ${Object.keys(rich)}`);
+    check(Object.keys(rich.chart).sort().join() === "ele,hr,splits" && !/lat|lon|\d\.\d{4}/.test(JSON.stringify(rich)), `no map points: ${JSON.stringify(rich).slice(0, 200)}`);
+    // the effort shown is the kg × km shown (both rounded first)
+    const odd = R.ruckEntry({ ...ok, km: 5.129, kg: 15.04 }, "hand");
+    check(odd.km === 5.13 && odd.kg === 15 && odd.kgkm === R.effortOf(15, 5.13), `5.129 km × 15.04 kg: ${JSON.stringify(odd)}`);
+  }],
+  ["Ruck 3 Logging a ruck from a GPX file: check card, XP into the level, totals, the log and Records; the same file again is refused", async () => {
+    await reset();
+    const A = await open("A");
+    await A.goto("ruck");
+    check(A.screen() === "ruck", `the Rucking screen didn't open (${A.screen()})`);
+    const kg = A.d.querySelector("#ruckKg");
+    kg.value = "12.5"; kg.dispatchEvent(new A.w.Event("change", { bubbles: true })); await wait(800);
+    check(saved().settings.ruckKg === 12.5, `pack weight saved as ${saved().settings.ruckKg}`);
+    // body weight: a wrong one is refused, a good one is saved
+    const body = A.d.querySelector("#ruckBody");
+    body.value = "12"; body.dispatchEvent(new A.w.Event("change", { bubbles: true })); await wait(300);
+    check(/Body weight must be 30 to 250 kg/.test(A.text("#ruckMsg")) && body.value === "", `12 kg body weight: "${A.text("#ruckMsg")}", box "${body.value}"`);
+    body.value = "70"; body.dispatchEvent(new A.w.Event("change", { bubbles: true })); await wait(800);
+    check(saved().settings.bodyKg === 70 && /12 km\+, pack 18% of your body weight \(12\.6 kg\), 10:00 min\/km/.test(A.text("#ruckTests")), `body weight saved as ${saved().settings.bodyKg}; tests: "${A.text("#ruckTests")}"`);
+    const gpx = makeGpx([[3600, 5, 120], { pause: 300 }, [1440, 5]], { hr: 115, cad: 62 }); // 7 km
+    await A.ruckFile(gpx);
+    check(/kg·km/.test(A.modal()) && /Save ruck/.test(A.modal()), `no check card: "${A.modal().slice(0, 120)}" / "${A.text("#ruckMsg")}"`);
+    // the check card is the ruck report: rank, the rank test, heart rate, steps, pace, the lines and km bars, feats
+    const card = A.modal();
+    check(/Rank test\s*pack 17\.9% of your 70 kg · test pace \d+:\d\d min\/km\s*\d+ h \d+ min from start to end \(breaks too\) for [67](\.\d+)? km \+ 1(\.\d)? km for 1\d\d m up/.test(card) && /Rank [A-E] needs/.test(card), `the rank test: "${card.slice(0, 600)}"`);
+    check(/Rank\s*[DEF]/.test(card) && /Heart\s*115 avg/.test(card) && /Steps\s*about [\d,]+ · 124 a minute/.test(card) && /Pace\s*1[12]:\d\d min\/km/.test(card) && /Long haul/i.test(card) === false,
+      `the report: "${card.slice(0, 400)}"`);
+    check(A.d.querySelectorAll("#modal .hud-line").length >= 1 && A.d.querySelectorAll("#modal .hud-splits rect").length === 7, "the report has no heart rate line or km bars");
+    await A.saveRuck();
+    const s = saved(), r = s.ruck, e = r && r.log[0];
+    check(r && r.count === 1 && r.log.length === 1, `the ruck wasn't saved: ${JSON.stringify(r)}`);
+    check(Math.abs(e.km - 7) <= 0.2 && e.kg === 12.5 && e.src === "gpx" && e.xp === Math.round(e.kgkm * 0.5) && e.bw === 70, `log entry: ${JSON.stringify(e)}`);
+    check(Math.abs(e.kgkm - e.kg * e.km) < 0.1, `effort ${e.kgkm} isn't ${e.kg} × ${e.km}`);
+    check(s.xp === BASE.xp + e.xp && r.xp === e.xp, `XP ${s.xp}, ruck XP ${r.xp}, expected ${BASE.xp} + ${e.xp}`);
+    check(!/"lat"|"lon"/.test(JSON.stringify(s)), "map points were saved");
+    check(/Ruck logged/.test(A.modal()), `no result: "${A.modal().slice(0, 80)}"`);
+    A.closeModal(); await wait(100);
+    check(/7\.\d km/.test(A.text("#ruckLog")), `the log shows: "${A.text("#ruckLog")}"`);
+    // the same file again
+    await A.ruckFile(gpx);
+    check(!A.modal() && /already logged/.test(A.text("#ruckMsg")), `the same file twice: "${A.modal().slice(0, 80)}" / "${A.text("#ruckMsg")}"`);
+    check(saved().ruck.count === 1, "the same ruck was saved twice");
+    // a ruck in the log opens its report
+    A.d.querySelector('#ruckLog [data-action="ruckReport"]').click(); await wait(150);
+    check(/Ruck report/.test(A.modal()) && /Heart\s*115 avg/.test(A.modal()) && A.d.querySelectorAll("#modal .hud-splits rect").length === 7, `the log's report: "${A.modal().slice(0, 200)}"`);
+    A.closeModal(); await wait(100);
+    // three more rucks: only the newest 3 keep their lines and km bars, the oldest keeps its numbers
+    for (const daysAgo of [1, 2, 2.5]) {
+      await A.ruckFile(makeGpx([[1800, 5]], { hr: 120, cad: 60, start: Date.now() - daysAgo * 86400e3 }));
+      await A.saveRuck(); A.closeModal(); await wait(100);
+    }
+    const log = saved().ruck.log;
+    check(log.length === 4 && log.slice(0, 3).every(x => x.chart) && !log[3].chart && log[3].hrAvg === 115 && log[3].steps > 0, `charts kept: ${JSON.stringify(log.map(x => [!!x.chart, x.hrAvg]))}`);
+    // its report still works, without the lines
+    A.d.querySelectorAll('#ruckLog [data-action="ruckReport"]')[3].click(); await wait(150);
+    check(/Heart\s*115 avg/.test(A.modal()) && !A.d.querySelector("#modal .hud-chart"), `an older ruck's report: "${A.modal().slice(0, 200)}"`);
+    A.closeModal(); await wait(100);
+    // Records shows it
+    await A.goto("records");
+    check(/Km rucked\s*\d+\.\d/.test(A.text("#recTiles")) && /kg·km/.test(A.text("#recTiles")), `Records: "${A.text("#recTiles")}"`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+    return `logged ${e.km} km × ${e.kg} kg = ${e.kgkm} kg·km, +${e.xp} XP, heart ${e.hrAvg}, ${e.steps} steps`;
+  }],
+  ["Ruck 4 Typing a ruck in by hand; a GPX file with no times asks for them; overlaps are refused; a full log keeps the last 40", async () => {
+    const { RULES } = await import("../app/data.js");
+    const R = await import("../app/ruck.js");
+    const H = 3600e3, day = 24 * H;
+    // a full log: 40 rucks, one a day, the newest 10 days ago
+    const base = new Date(); base.setHours(9, 0, 0, 0);
+    const log = Array.from({ length: RULES.ruckLogMax }, (_, i) => R.ruckEntry({ t: +base - (10 + i) * day, end: +base - (10 + i) * day + H, km: 5, kg: 15, mins: 60 }, "hand"));
+    const sum = k => log.reduce((a, x) => a + x[k], 0);
+    const ruck = { count: 40, km: sum("km"), kgkm: sum("kgkm"), xp: sum("xp"), mins: sum("mins"), climb: 0, best: { km: 5, kgkm: 75, kg: 15 }, log };
+    await reset({ ...BASE, xp: BASE.xp + ruck.xp, ruck, settings: { ...BASE.settings, ruckKg: 15 } });
+    const A = await open("A");
+    await A.goto("ruck");
+    // older than the whole log
+    await A.ruckHand({ start: new Date(+base - 60 * day), km: 6, h: 1, min: 10 });
+    check(!A.modal() && /older than all/.test(A.text("#ruckMsg")), `an old ruck: "${A.modal().slice(0, 80)}" / "${A.text("#ruckMsg")}"`);
+    // overlapping a logged one
+    await A.ruckHand({ start: new Date(+base - 10 * day + 30 * 60000), km: 6, h: 1 });
+    check(!A.modal() && /already logged/.test(A.text("#ruckMsg")), `an overlapping ruck: "${A.text("#ruckMsg")}"`);
+    // a new one by hand: it pushes the oldest out of the log, the totals keep counting
+    const xp0 = saved().xp;
+    await A.ruckHand({ start: new Date(+base - 2 * day), km: 8, h: 1, min: 40, climb: 250 });
+    await A.saveRuck();
+    let s = saved();
+    check(s.ruck.count === 41 && s.ruck.log.length === 40 && s.ruck.log[0].km === 8 && s.ruck.log[0].src === "hand" && s.ruck.log[0].climb === 250,
+      `after a hand ruck: count ${s.ruck.count}, log ${s.ruck.log.length}, newest ${JSON.stringify(s.ruck.log[0])}`);
+    check(s.ruck.log[0].kgkm === 120 && s.xp === xp0 + 60, `8 km × 15 kg: ${s.ruck.log[0].kgkm} kg·km, XP +${s.xp - xp0}`);
+    check(!s.ruck.log.some(x => x.t === log[39].t), "the oldest ruck stayed in the log");
+    check(A.d.querySelector("#ruckHand").hidden, "the form stayed open after saving");
+    // a ruck typed in by hand has a report too, without heart rate, steps or lines
+    check(/Ruck logged/.test(A.modal()) && /Climb\s*250 m up/.test(A.modal()) && !/Heart|Steps/.test(A.modal()) && !A.d.querySelector("#modal .hud-chart"), `a hand ruck's report: "${A.modal().slice(0, 300)}"`);
+    A.closeModal(); await wait(100);
+    // a GPX file with no times: the form opens with its km, you fill in the rest
+    await A.ruckFile(makeGpx([[3600, 5]], { times: false }));
+    check(!A.d.querySelector("#ruckHand").hidden && /no times/i.test(A.text("#ruckHandNote")), `a file with no times: form hidden ${A.d.querySelector("#ruckHand").hidden}, note "${A.text("#ruckHandNote")}"`);
+    check(Math.abs(Number(A.d.querySelector("#rhKm").value) - 5) <= 0.15, `km filled in: ${A.d.querySelector("#rhKm").value}`);
+    await A.ruckHand({ start: new Date(+base - day), km: A.d.querySelector("#rhKm").value, h: 1 });
+    await A.saveRuck();
+    s = saved();
+    check(s.ruck.count === 42 && s.ruck.log[0].src === "gpx", `the file with no times: ${JSON.stringify(s.ruck.log[0])}`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+  }],
+  ["Ruck 5 Backups keep rucks; ruck XP changed by hand is refused; an old save without rucks works; Reset clears rucks but keeps the pack weight", async () => {
+    const R = await import("../app/ruck.js");
+    const H = 3600e3, now = Date.now();
+    const e = R.ruckEntry({ t: now - 30 * H, end: now - 29 * H, km: 5, kg: 15, mins: 60 }, "hand"); // 75 kg·km = 38 XP
+    const ruck = { count: 1, km: 5, kgkm: 75, xp: e.xp, mins: 60, climb: 0, best: { km: 5, kgkm: 75, kg: 15 }, log: [e] };
+    // 1. a backup with a ruck restores, rucks and all
+    await reset(NEWBIE);
+    const A = await open("A");
+    let msg = await A.restoreCode(oldCode({ ...GOOD, xp: GOOD.xp + e.xp, ruck }));
+    check(/restored/i.test(msg), `a good backup with a ruck was refused: "${msg}"`);
+    let s = saved();
+    check(s.ruck.count === 1 && s.ruck.log[0].kgkm === 75 && s.xp === GOOD.xp + e.xp, `restored: ${JSON.stringify(s.ruck)}, XP ${s.xp}`);
+    // 1b. a ruck with the report's numbers and lines comes back whole; lines that aren't lists of numbers are dropped
+    const R2 = { ...e, hrAvg: 118, hrMax: 131, spm: 122, steps: 7300, chart: { hr: [110, null, 120], ele: [200, 210, 205], splits: [700, 690, 710, 705, 699] } };
+    msg = await A.restoreCode(oldCode({ ...GOOD, xp: GOOD.xp + e.xp, ruck: { ...ruck, log: [R2] } }));
+    check(/restored/i.test(msg) && JSON.stringify(saved().ruck.log[0].chart) === JSON.stringify(R2.chart) && saved().ruck.log[0].hrAvg === 118, `a ruck with a report: "${msg}" ${JSON.stringify(saved().ruck.log[0])}`);
+    const R3 = { ...e, hrAvg: 999, chart: { hr: ["<b>", 1], ele: "x", splits: [1, 2] } };
+    msg = await A.restoreCode(oldCode({ ...GOOD, xp: GOOD.xp + e.xp, ruck: { ...ruck, log: [R3] } }));
+    const back = saved().ruck.log[0];
+    check(/restored/i.test(msg) && back.hrAvg === undefined && back.chart && back.chart.hr === null && back.chart.ele === null && back.chart.splits.length === 2, `bad report numbers: ${JSON.stringify(back)}`);
+    // 2. a backup made by this version (a sealed code) restores too
+    msg = await A.restoreCode(oldCode({ ...GOOD, xp: GOOD.xp + e.xp, ruck }));
+    const code = await A.backupText("#btnShareBackup");
+    check(/km rucked/.test(code.split("\n")[0]), `the backup's first line: "${code.split("\n")[0]}"`);
+    await reset(NEWBIE);
+    const B = await open("B");
+    msg = await B.restoreCode(code);
+    check(/restored/i.test(msg) && saved().ruck.count === 1, `this version's backup: "${msg}"`);
+    // 3. more XP than the rucks could give, or broken rucks: refused
+    for (const [what, bad] of [
+      ["ruck XP raised", { ...GOOD, xp: GOOD.xp + 500, ruck: { ...ruck, xp: 500 } }],
+      ["XP raised, ruck XP not", { ...GOOD, xp: GOOD.xp + e.xp + 100, ruck }],
+      ["impossible kg·km", { ...GOOD, xp: GOOD.xp + 5000, ruck: { ...ruck, kgkm: 10000, xp: 5000 } }],
+      ["a broken ruck part", { ...GOOD, ruck: [1, 2] }],
+      ["more rucks listed than counted", { ...GOOD, xp: GOOD.xp + e.xp, ruck: { ...ruck, log: [e, e] } }],
+    ]) {
+      msg = await B.restoreCode(oldCode(bad));
+      check(/doesn't add up/i.test(msg), `${what}: "${msg}"`);
+    }
+    // 4. an old save with no rucks and no pack weight: every screen works, Rucking too
+    await reset(BASE);
+    const C = await open("A");
+    const { errors } = await C.openScreens();
+    await C.goto("ruck");
+    check(!errors.length && C.errors.length === 0, `old save: ${[...errors, ...C.errors].join(" | ")}`);
+    check(/No rucks yet/.test(C.text("#ruckLog")) && Number(C.d.querySelector("#ruckKg").value) > 0, `old save's Rucking screen: "${C.text("#ruckLog")}", pack ${C.d.querySelector("#ruckKg").value}`);
+    // 5. Reset all progress: rucks gone, pack weight kept
+    await reset({ ...GOOD, xp: GOOD.xp + e.xp, ruck, settings: { ...BASE.settings, ruckKg: 22.5, bodyKg: 81.5 } });
+    const D = await open("A");
+    await D.goto("settings");
+    const wipe = D.d.querySelector("#btnWipe"); wipe.click(); await wait(80); wipe.click(); await wait(300);
+    s = saved();
+    check(s.ruck.count === 0 && s.ruck.log.length === 0 && s.xp === 0 && s.settings.ruckKg === 22.5 && s.settings.bodyKg === 81.5 && s.ruck.best.rank === 0,
+      `after Reset: ${JSON.stringify(s.ruck)}, XP ${s.xp}, pack ${s.settings.ruckKg}, body ${s.settings.bodyKg}`);
+    check(D.errors.length === 0, "errors: " + D.errors.join(" | "));
+  }],
+  ["Ruck 6 Two windows: a ruck saved in one counts in the other, so the same walk can't count twice there; both windows' rucks add up", async () => {
+    await reset();
+    const A = await open("A");
+    const B = await open("B");
+    await A.goto("ruck");
+    await B.goto("ruck");
+    const start = new Date(Date.now() - 50 * 3600e3);
+    await A.ruckHand({ start, km: 6, h: 1, min: 10 }); // 15 kg (the default) × 6 km = 90 kg·km = 45 XP
+    await A.saveRuck();
+    // B was open all along: the same walk entered there is refused
+    await B.ruckHand({ start: new Date(+start + 20 * 60000), km: 6, h: 1 });
+    check(!B.modal() && /already logged/.test(B.text("#ruckMsg")), `the same walk in B: "${B.modal().slice(0, 80)}" / "${B.text("#ruckMsg")}"`);
+    // another walk in B: both count
+    await B.ruckHand({ start: new Date(+start + 24 * 3600e3), km: 4, h: 1 }); // 60 kg·km = 30 XP
+    await B.saveRuck();
+    const s = saved();
+    check(s.ruck.count === 2 && s.ruck.xp === 75 && s.xp === BASE.xp + 75 && s.ruck.log.length === 2, `after both: count ${s.ruck.count}, ruck XP ${s.ruck.xp}, XP ${s.xp}`);
+    check(A.errors.length === 0 && B.errors.length === 0, "errors: " + [...A.errors, ...B.errors].join(" | "));
+  }],
+  ["Ruck 7 A real Zepp problem: GPS lost for 21 min and heart rate stopped at minute 16; noisy height; the best rank follows a new body weight", async () => {
+    const R = await import("../app/ruck.js");
+    // like the real file of 2026-11-23: 16 min walking, 21 min with nothing recorded (still walking), then 60 min
+    // more, with heart rate and cadence only in the first 16 min
+    const holeGpx = makeGpx([[960, 5], { hole: 1260, kmh: 5 }, [3600, 5]], { hr: 110, cad: 60, sensorSecs: 960 });
+    const s = R.summarizeTrack(R.parseGpx(holeGpx));
+    check(s.holes.length === 1 && Math.abs(s.holes[0].mins - 21) <= 1 && Math.abs(s.holes[0].km - 1.75) <= 0.1 && Math.abs(s.holes[0].at - 960e3) <= 30e3, `the hole: ${JSON.stringify(s.holes)}`);
+    check(Math.abs(s.km - 8.08) <= 0.25, `km ${s.km}, expected about 8.08 (the hole as a straight line)`);
+    check(s.hrAvg === null && s.hrMax === null && s.spm === null && s.steps === null && Math.abs(s.hrOnlyMins - 16) <= 1 && Math.abs(s.cadOnlyMins - 16) <= 1,
+      `too little heart rate counted: ${JSON.stringify({ hr: s.hrAvg, spm: s.spm, steps: s.steps, hrOnly: s.hrOnlyMins, cadOnly: s.cadOnlyMins })}`);
+    check(s.chart && s.chart.hr === null && s.chart.ele, `the heart line: ${JSON.stringify(s.chart && s.chart.hr)}`);
+    // km 2 to 4 have part of the hole: no time; the others do
+    check(s.splits[0] > 0 && s.splits[1] === null && s.splits[2] === null && s.splits[3] === null && s.splits[4] > 0, `splits: ${JSON.stringify(s.splits)}`);
+    // heart rate written only every 5 seconds still counts; a watch paused for a break is no hole
+    const sparse = R.summarizeTrack(R.parseGpx(makeGpx([[3600, 5]], { hr: 120, cad: 60, sensorEvery: 5 })));
+    check(sparse.hrAvg === 120 && sparse.spm === 120 && sparse.hrOnlyMins === null, `heart rate every 5 s: ${JSON.stringify({ hr: sparse.hrAvg, spm: sparse.spm })}`);
+    const paused = R.summarizeTrack(R.parseGpx(makeGpx([[1800, 5], { hole: 1200, kmh: 0 }, [1800, 5]])));
+    check(paused.holes.length === 0 && Math.abs(paused.mins - 60) <= 2, `a paused watch: holes ${JSON.stringify(paused.holes)}, ${paused.mins} min moving`);
+    // a normal break just over 2 minutes, standing still with the watch still recording, is no hole either
+    for (const [pause, kmh] of [[121, 8], [125, 8], [130, 6.5], [140, 7], [300, 8]]) {
+      const b = R.summarizeTrack(R.parseGpx(makeGpx([[1800, kmh], { pause }, [1800, kmh]])));
+      check(b.holes.length === 0, `a ${pause} s break at ${kmh} km/h was taken for a hole: ${JSON.stringify(b.holes)}`);
+    }
+    // noisy GPS height: a flat walk has (almost) no climb, a 200 m hill stays about 200 m
+    const flat = R.summarizeTrack(R.parseGpx(makeGpx([[3600, 5]], { eleNoise: 3 })));
+    const hill = R.summarizeTrack(R.parseGpx(makeGpx([[3600, 5, 200], [1800, 5]], { eleNoise: 3 })));
+    check(flat.climb <= 15 && Math.abs(hill.climb - 200) <= 20, `climb with noisy height: flat ${flat.climb} m, hill ${hill.climb} m`);
+
+    // the check card: it says what went wrong, and the km can be fixed
+    await reset();
+    const A = await open("A");
+    await A.goto("ruck");
+    await A.ruckFile(holeGpx);
+    let card = A.modal();
+    check(/recorded nothing for 21 min/.test(card) && /straight line of 1\.\d km/.test(card) && /Heart rate was recorded for only 16 min/.test(card) && /Steps were recorded for only 16 min/.test(card) && !/Heart\s*\d+ avg/.test(card),
+      `the notes: "${card.slice(0, 900)}"`);
+    check(A.d.querySelectorAll("#modal .hud-splits rect.none").length === 3, "the km with the hole aren't shown as missing");
+    const box = A.d.querySelector("#ruckFixKm");
+    check(box && Number(box.value) === s.km, `the km box: ${box && box.value}`);
+    box.value = "30"; A.d.querySelector('[data-action="ruckFixKm"]').click(); await wait(150);
+    check(/must be/.test(A.text("#ruckFixMsg")), `30 km wasn't refused: "${A.text("#ruckFixMsg")}"`);
+    A.d.querySelector("#ruckFixKm").value = "8.6"; A.d.querySelector('[data-action="ruckFixKm"]').click(); await wait(150);
+    card = A.modal();
+    check(/8\.6\s*km/.test(card) && /Distance fixed by you: 8\.6 km/.test(card), `the fixed km: "${card.slice(0, 300)}"`);
+    await A.saveRuck();
+    let e = saved().ruck.log[0];
+    check(e.km === 8.6 && e.src === "gpx" && e.hrAvg === undefined && e.steps === undefined && e.chart.splits.filter(x => x === null).length === 3, `saved: ${JSON.stringify(e)}`);
+    A.closeModal(); await wait(100);
+    // its report from the log still works
+    A.d.querySelector('#ruckLog [data-action="ruckReport"]').click(); await wait(150);
+    check(/Ruck report/.test(A.modal()) && A.d.querySelectorAll("#modal .hud-splits rect.none").length === 3, `the log's report: "${A.modal().slice(0, 200)}"`);
+    A.closeModal(); await wait(100);
+
+    // the best rank: B with the guessed 80 kg body weight (15 kg is 18.8%), C once the real 90 kg is given
+    await reset();
+    const B = await open("B");
+    await B.goto("ruck");
+    await B.ruckHand({ start: new Date(Date.now() - 30 * 3600e3), km: 12, h: 2 });
+    await B.saveRuck(); B.closeModal(); await wait(100);
+    check(saved().ruck.best.rank === 4, `best rank after the ruck: ${saved().ruck.best.rank} (expected 4, B)`);
+    const body = B.d.querySelector("#ruckBody");
+    body.value = "90"; body.dispatchEvent(new B.w.Event("change", { bubbles: true })); await wait(800);
+    check(saved().ruck.best.rank === 3 && /^\s*C\b/.test(B.text("#ruckLog")), `best rank at 90 kg: ${saved().ruck.best.rank}, log "${B.text("#ruckLog").slice(0, 40)}"`);
+    check(A.errors.length === 0 && B.errors.length === 0, "errors: " + [...A.errors, ...B.errors].join(" | "));
+    return `hole: ${s.km} km read, fixed to ${e.km} km; noisy height: flat ${flat.climb} m, hill ${hill.climb} m`;
+  }],
+  ["Ruck 8 Deleting a ruck (a typo: 51 kg instead of 15): its XP, km and records come off, the walk can be logged again, backups still restore", async () => {
+    await reset(GOOD);
+    const A = await open("A");
+    await A.goto("ruck");
+    const day = 86400e3, kg = A.d.querySelector("#ruckKg");
+    const setKg = async v => { kg.value = String(v); kg.dispatchEvent(new A.w.Event("change", { bubbles: true })); await wait(300); };
+    const log = async (daysAgo, km, h) => { await A.ruckHand({ start: new Date(Date.now() - daysAgo * day), km, h }); await A.saveRuck(); A.closeModal(); await wait(100); };
+    await log(3, 5, 1);                                     // 75 kg·km = 38 XP
+    await setKg(51); await log(2, 10, 2); await setKg(15);  // the typo: 510 kg·km = 255 XP
+    await log(1, 6, 1);                                     // 90 kg·km = 45 XP
+    let s = saved();
+    check(s.ruck.count === 3 && s.ruck.best.kg === 51 && s.xp === GOOD.xp + 338, `before: ${JSON.stringify({ count: s.ruck.count, best: s.ruck.best, xp: s.xp })}`);
+    // the typo's report has Delete; "Keep it" goes back to the report
+    A.d.querySelectorAll('#ruckLog [data-action="ruckReport"]')[1].click(); await wait(150);
+    A.d.querySelector('#modal [data-action="ruckDelete"]').click(); await wait(150);
+    check(/Delete this ruck\?/.test(A.modal()) && /10\.0 km with 51 kg/.test(A.modal()) && /255 XP/.test(A.modal()), `the question: "${A.modal().slice(0, 300)}"`);
+    A.d.querySelector('#modal [data-action="ruckReport"]').click(); await wait(150);
+    check(/Ruck report/.test(A.modal()) && saved().ruck.count === 3, `"Keep it": "${A.modal().slice(0, 80)}"`);
+    A.d.querySelector('#modal [data-action="ruckDelete"]').click(); await wait(150);
+    A.d.querySelector('#modal [data-action="ruckDeleteYes"]').click(); await wait(300);
+    s = saved();
+    const r = s.ruck;
+    check(!A.modal() && /Ruck deleted/.test(A.text("#ruckMsg")), `after delete: "${A.modal().slice(0, 80)}" / "${A.text("#ruckMsg")}"`);
+    check(r.count === 2 && r.log.length === 2 && r.km === 11 && r.kgkm === 165 && r.xp === 83 && r.mins === 120 && s.xp === GOOD.xp + 83, `totals: ${JSON.stringify({ ...r, log: r.log.length })}, XP ${s.xp}`);
+    check(r.best.kg === 15 && r.best.km === 6 && r.best.kgkm === 90, `records: ${JSON.stringify(r.best)}`);
+    check(!/51 kg/.test(A.text("#ruckLog")), `the log: "${A.text("#ruckLog")}"`);
+    // the same walk again, now right
+    await log(2, 10, 2);
+    s = saved();
+    check(s.ruck.count === 3 && s.ruck.best.kgkm === 150 && s.xp === GOOD.xp + 83 + 75, `logged again: ${JSON.stringify({ count: s.ruck.count, best: s.ruck.best, xp: s.xp })}`);
+    // a backup after a delete restores
+    const code = await A.backupText("#btnShareBackup");
+    await reset(NEWBIE);
+    const B = await open("B");
+    const msg = await B.restoreCode(code);
+    check(/restored/i.test(msg) && saved().ruck.count === 3, `restore after a delete: "${msg}"`);
+    check(A.errors.length === 0 && B.errors.length === 0, "errors: " + [...A.errors, ...B.errors].join(" | "));
+  }],
+  // ------------------------------------------------- the System: status window, stats and ranks (SYSTEM_PLAN.md)
+  ["System 1 Stats and ranks: ladders, category and overall ranks round down, ruck ranks are march tests, HEART compares alike rucks", async () => {
+    const D = await import("../app/data.js");
+    const { RANKS, SYSTEM, systemStatus, systemChanges, heartOf, rankOf, ruckGrade, ruckTestText, RUCK_TESTS, findMonster } = D;
+    check(RANKS.join("") === "FEDCBAS", `ranks: ${RANKS.join("")}`);
+    // every ladder has 6 steps (E to S), each higher than the one before; STR's are boss HP
+    for (const c of SYSTEM) for (const st of c.stats) {
+      const at = st.steps().map(x => x.at);
+      check(at.length === 6 && at.every((v, i) => i === 0 || v > at[i - 1]), `${st.name}'s ladder: ${at}`);
+    }
+    const str = SYSTEM[0].stats[0].steps();
+    check(str.map(x => x.at).join() === "8,14,20,36,52,60" && str[5].what === "The Elder Dragon" && findMonster("elder-dragon").m.hp === 60, `STR's ladder: ${JSON.stringify(str)}`);
+    check(rankOf(7, str) === 0 && rankOf(8, str) === 1 && rankOf(59, str) === 5 && rankOf(60, str) === 6, "rankOf");
+    // a ruck's rank: the hardest march test it passes (km, pack as % of body weight, pace from start to end)
+    const H = 3600e3, mk = (km, kg, hours, o = {}) => ({ t: 0, end: hours * H, km, kg, mins: Math.round(hours * 60), climb: 0, ...o });
+    const grade = (e, body = null) => ruckGrade(e, body).rank;
+    check(RUCK_TESTS.map(t => t.rank).join("") === "SABCDE", "the tests' ranks");
+    check(grade(mk(20, 20, 3)) === "S" && grade(mk(19.3, 16, 3)) === "A" && grade(mk(12, 15, 2)) === "B" && grade(mk(8, 10, 88 / 60)) === "C" && grade(mk(5, 5, 1)) === "D" && grade(mk(3, 1, 0.75)) === "E" && grade(mk(2, 1, 0.3)) === "F",
+      `S A B C D E F: ${[mk(20, 20, 3), mk(19.3, 16, 3), mk(12, 15, 2), mk(8, 10, 88 / 60), mk(5, 5, 1), mk(3, 1, 0.75), mk(2, 1, 0.3)].map(e => grade(e)).join("")}`);
+    // a slow full day: 300 kg·km, but 12:00 min/km = F
+    check(grade(mk(30, 10, 10)) === "F", `a slow day: ${grade(mk(30, 10, 10))}`);
+    // breaks count: 12 km in 100 min moving would be B, but 3 h from start to end is 15:00 min/km = E
+    const breaks = mk(12, 15, 3, { mins: 100 }), gb = ruckGrade(breaks);
+    check(gb.rank === "E" && gb.pace === 900 && gb.mins === 180, `with breaks: ${JSON.stringify(gb)}`);
+    // hills: 200 m up counts as 2 km more, so 12 km in 2 h 20 is 10:00 min/km (B); flat it is 11:40 (D)
+    check(grade(mk(12, 15, 140 / 60, { climb: 200 })) === "B" && grade(mk(12, 15, 140 / 60)) === "D", "the climb doesn't count for pace");
+    // the pack as a share of body weight: the ruck's own body weight first, then the setting, then 80 kg
+    const eib = mk(19.3, 16, 3), g80 = ruckGrade(eib);
+    check(g80.pct === 20 && g80.bw === 80 && g80.guessed && g80.pace === 560, `80 kg: ${JSON.stringify(g80)}`);
+    check(grade(eib, 100) === "C" && grade({ ...eib, bw: 80 }, 100) === "A" && grade(eib, 64) === "A" && grade(mk(20, 16, 3), 64) === "S" && !ruckGrade(eib, 64).guessed, "body weight");
+    check(ruckGrade(mk(19.3, 16, 3)).next.rank === "S" && ruckGrade(mk(20, 20, 3)).next === null && ruckGrade(mk(2, 1, 1)).next.rank === "E", "the next rank");
+    check(ruckTestText(RUCK_TESTS[0]) === "20 km+, pack 25% of your body weight (20 kg), 9:00 min/km or faster" && ruckTestText(RUCK_TESTS[0], 90) === "20 km+, pack 25% of your body weight (22.5 kg), 9:00 min/km or faster"
+      && ruckTestText(RUCK_TESTS[5]) === "3 km+, any pack, 15:00 min/km or faster", `tests in words: ${ruckTestText(RUCK_TESTS[0], 90)}`);
+    // CARRY: the best rank ever (kept in ruck.best.rank) or the best ruck still in the log
+    const carry = s => SYSTEM[1].stats[0].value(s);
+    check(carry({ ruck: { best: { rank: 4 }, log: [mk(5, 5, 1)] } }) === 4 && carry({ ruck: { best: { rank: 1 }, log: [mk(5, 5, 1)] } }) === 2 && carry({}) === 0
+      && carry({ ruck: { best: {}, log: [eib] }, settings: { bodyKg: 100 } }) === 3, "CARRY");
+    const save = (bestSet, deepestFloor, carryRank, km, log = []) => ({ stats: { ...BASE.stats, bestSet, deepestFloor }, ruck: { km, kgkm: km * 15, best: { km, kgkm: km * 15, kg: 15, rank: carryRank }, log } });
+    // nothing done: all F
+    let st = systemStatus(save(0, 0, 0, 0));
+    check(st.overall === 0 && st.cats.every(c => c.rank === 0), "a new player isn't all F");
+    // the plan's example: STR 42 (B) + END 6 (C) = C (3.5 down); CARRY C + ROAD 14 (E) = D; overall (3 + 2) / 2 = D
+    st = systemStatus(save(42, 6, 3, 14));
+    const r = st.cats.flatMap(c => [c.rank, ...c.stats.map(x => x.rank)]).map(i => RANKS[i]).join("");
+    check(r === "CBCDCE" && RANKS[st.overall] === "D", `ranks: ${r}, overall ${RANKS[st.overall]}`);
+    const s0 = st.cats[0].stats[0];
+    check(s0.next.rank === 5 && s0.next.text === "52 in one set (The Burnt King)" && s0.next.togo === "10 more" && Math.abs(s0.share - 6 / 16) < 1e-9, `STR's next: ${JSON.stringify(s0.next)}, bar ${s0.share}`);
+    check(st.cats[1].stats[1].next.togo === "36 km more", `ROAD's next: ${JSON.stringify(st.cats[1].stats[1].next)}`);
+    // a weak category pulls the overall rank down: S pushups, F rucking = C
+    st = systemStatus(save(60, 10, 0, 0));
+    check(RANKS[st.cats[0].rank] === "S" && RANKS[st.cats[1].rank] === "F" && RANKS[st.overall] === "C" && st.cats[0].stats[0].next === null, `S + F: ${st.cats.map(c => RANKS[c.rank])}, overall ${RANKS[st.overall]}`);
+    // an old save without rucks works
+    check(systemStatus({ stats: BASE.stats }).cats[1].rank === 0, "a save without rucks");
+    // HEART: locked under 5 rucks with heart rate; hand rucks (no heart rate) don't count
+    const day = 86400e3, t0 = Date.now() - 30 * day;
+    const ruck = (i, hr, o = {}) => ({ t: t0 + i * day, end: t0 + i * day + 3600e3, km: 6, kg: 15, kgkm: 90, mins: 70, climb: 60, xp: 45, src: "gpx", ...(hr ? { hrAvg: hr } : {}), ...o });
+    const hand = [10, 11, 12].map(i => ruck(i, 0, { src: "hand" }));
+    let h = heartOf([ruck(0, 130), ruck(1, 128), ruck(2, 126), ruck(3, 124), ...hand]);
+    check(h.locked && h.have === 4, `4 rucks with heart rate: ${JSON.stringify(h)}`);
+    // 5 alike rucks, each a little lower: each beats the older ones' average by 2, 3, 4, 5 beats = +3.5, rounded +4
+    const five = [ruck(4, 122), ruck(3, 124), ruck(2, 126), ruck(1, 128), ruck(0, 130), ...hand]; // newest first, like the log
+    h = heartOf(five);
+    check(!h.locked && h.have === 5 && h.value === 4, `5 alike rucks: ${JSON.stringify(h)}`);
+    // rucks that aren't alike aren't compared: a much heavier pack, a much faster pace, much more climb, twice as far
+    h = heartOf([ruck(0, 130), ruck(1, 120, { kg: 25 }), ruck(2, 120, { mins: 50 }), ruck(3, 120, { climb: 400 }), ruck(4, 120, { km: 13 })]);
+    check(!h.locked && h.value === null, `rucks not alike: ${JSON.stringify(h)}`);
+    // the same work costing more beats is shown as minus
+    check(heartOf([ruck(0, 120), ruck(1, 121), ruck(2, 122), ruck(3, 123), ruck(4, 124)]).value === -2, "a higher heart rate isn't minus");
+    // what changed: values, ranks, categories, overall, HEART
+    // (the five rucks: 6 km with 15 kg, 6:00 min/km... with breaks and hills 10:36 = rank D)
+    const ch = systemChanges(systemStatus(save(19, 1, 0, 0)), systemStatus(save(20, 1, 0, 6, five)));
+    check(ch.stats.map(x => `${x.name}:${x.was}>${x.value}`).join() === "STR:19>20,CARRY:0>2,ROAD:0>6", `changed stats: ${ch.stats.map(x => x.name)}`);
+    check(ch.cats.map(c => `${c.name}:${RANKS[c.was]}>${RANKS[c.rank]}`).join() === "Pushups:E>D,Rucking:F>E" && RANKS[ch.overall.was] === "F" && RANKS[ch.overall.rank] === "E" && ch.heart.now.value === 4,
+      `changes: ${JSON.stringify(ch.cats)}, overall ${JSON.stringify(ch.overall)}, heart ${JSON.stringify(ch.heart)}`);
+    check(JSON.stringify(systemChanges(st, systemStatus(save(60, 10, 0, 0)))) === JSON.stringify({ stats: [], cats: [], overall: null, heart: null }), "no change still reported changes");
+  }],
+  ["System 2 The Status screen: Camp's rank opens it; stats, ranks, next-rank hints, HEART locked, later workouts; nothing new is saved", async () => {
+    const ruck = { count: 2, km: 14, kgkm: 160, xp: 80, mins: 180, climb: 0, best: { km: 8, kgkm: 87, kg: 15, rank: 3 }, log: [] };
+    await reset({ ...BASE, stats: { ...BASE.stats, bestSet: 42, deepestFloor: 6 }, dungeonFloor: 7, ruck });
+    const A = await open("A");
+    check(/^Rank\s*D$/.test(A.text("#campRank")) && A.d.querySelector("#campRank").classList.contains("rank-d"), `Camp's rank: "${A.text("#campRank")}"`);
+    const before = localStorage.getItem(SAVE);
+    A.d.querySelector("#campRank").click(); await wait(200);
+    check(A.screen() === "status", `Camp's rank didn't open the Status screen (${A.screen()})`);
+    const head = A.text("#stHead"), cats = A.text("#stCats");
+    check(/Overall\s*D/.test(head) && /Pushups C · Rucking D/.test(head) && /To reach overall C: 1 more rank-up in/.test(head) && /weakest is Rucking \(D\)/.test(head), `the head: "${head}"`);
+    check(/STR\s*42\s*best set\s*B/.test(cats) && /Rank A: 52 in one set \(The Burnt King\) · 10 more/.test(cats), `STR: "${cats.slice(0, 200)}"`);
+    check(/END\s*6/.test(cats) && /Rank B: clear floor 7 · 1 more floor\b/.test(cats), `END: "${cats}"`);
+    check(/CARRY\s*C\s*your best ruck's rank\s*C/.test(cats) && /Rank B: one ruck of 12 km\+, pack 18% of your body weight \(14\.4 kg\), 10:00 min\/km or faster · pass it once/.test(cats) && /ROAD\s*14\.0/.test(cats) && /Rank D: 50 km in all · 36 km more/.test(cats), `rucking: "${cats}"`);
+    const bar = A.d.querySelector('[data-stat="str"] .sys-bar > div').style.width;
+    check(bar === "37.5%", `STR's bar: ${bar}`);
+    check(/HEART\s*\?\?\?/.test(A.text("#stHeart")) && /needs 5 rucks with heart rate.*You have 0/.test(A.text("#stHeart")), `HEART: "${A.text("#stHeart")}"`);
+    check(/RUNNING\s*\?\?\?\s*PULLUPS\s*\?\?\?/.test(A.text("#stLater")), `later workouts: "${A.text("#stLater")}"`);
+    check(localStorage.getItem(SAVE) === before, "opening the Status screen changed the save");
+    // the Camp menu button opens it too, and Back goes to Camp
+    await A.goto("camp");
+    A.d.querySelector('#camp .menu [data-to="status"]').click(); await wait(200);
+    check(A.screen() === "status", `the Status button didn't open it (${A.screen()})`);
+    A.d.querySelector('#status .back').click(); await wait(200);
+    check(A.screen() === "camp", `Back went to ${A.screen()}`);
+    check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
+  }],
+  ["System 3 The System's messages: a mine floor and a ruck show what went up ([END 0 → 1], rank ups, overall rank)", async () => {
+    // STR 20 (C) and END 0 (F) = Pushups E; no rucks = Rucking F; overall F
+    await reset({ ...BASE, stats: { ...BASE.stats, bestSet: 20, pushups: 20 } });
+    const A = await open("A");
+    check(/^Rank\s*F$/.test(A.text("#campRank")), `Camp's rank before: "${A.text("#campRank")}"`);
+    await A.clearFloor();
+    let m = A.modal();
+    check(/floor 1 cleared/i.test(m), `no safe room: "${m.slice(0, 100)}"`);
+    check(/\[END 0 → 1 · rank F → E\]/.test(m) && /\[Rank up! PUSHUPS E → D\]/.test(m) && /\[Overall rank F → E\]/.test(m), `the System's lines: "${m}"`);
+    check(!/\[STR/.test(m), `STR didn't change but has a line: "${m}"`);
+    A.closeModal(); await wait(150);
+    await A.goto("camp");
+    check(/^Rank\s*E$/.test(A.text("#campRank")), `Camp's rank after the floor: "${A.text("#campRank")}"`);
+    // a ruck by hand: 6 km with 15 kg in 1 h 10 (11:40 min/km) = rank D. CARRY D + ROAD F = Rucking E; overall (D + E) / 2 = E (no change)
+    await A.goto("ruck");
+    await A.ruckHand({ start: new Date(Date.now() - 50 * 3600e3), km: 6, h: 1, min: 10 });
+    await A.saveRuck();
+    m = A.modal();
+    check(/\[CARRY: best ruck rank F → D\]/.test(m) && saved().ruck.best.rank === 2 && /\[ROAD 0\.0 km → 6\.0 km\]/.test(m) && /\[Rank up! RUCKING F → E\]/.test(m) && !/Overall rank/.test(m), `the ruck's System lines: "${m}"`);
+    check(!/HEART/.test(m), `a ruck typed in by hand has no heart rate, but HEART has a line: "${m}"`);
     check(A.errors.length === 0, "errors: " + A.errors.join(" | "));
   }],
   // ------------------------------------------------------------ earlier fixes keep working

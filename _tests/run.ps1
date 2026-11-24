@@ -11,7 +11,8 @@ $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $root = Join-Path $env:TEMP ("pushup-rpg-tests\run-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Force "$root\app", "$root\_tests" | Out-Null
 Get-ChildItem "$repo\app" -File | Copy-Item -Destination "$root\app"
-Copy-Item "$repo\_tests\*" "$root\_tests" -Recurse   # test page, tests and recorded-fight fixtures
+# test page, tests and recorded-fight fixtures; never _tests\private (your real GPX files show where you walk)
+Get-ChildItem "$repo\_tests" | Where-Object { $_.Name -ne 'private' } | Copy-Item -Destination "$root\_tests" -Recurse
 # The offline helper's (service worker's) own copy for its tests: the whole game with its icons in swapp\, so
 # the helper can install there (app\ has no icons, so it never installs for the other tests). Release "a" or
 # "b": every shell file carries its release mark, and a newer release's sw.js has its shell version raised.
@@ -31,7 +32,7 @@ function WriteRelease([string]$rel, [bool]$bump = $true, [bool]$extra = $false, 
         $t = $t.Replace('<script type="module" src="game.js"></script>', '<script type="module">if (/[?&]hold(&|$)/.test(location.search)) await new Promise(r => { const t = setInterval(() => { if (window.__resume) { clearInterval(t); r(); } }, 20); }); await import("./game.js");</script>')
     }
     [IO.File]::WriteAllText($f, $t, $utf8)
-    foreach ($n in 'game.js', 'core.js', 'data.js') { [IO.File]::AppendAllText("$root\swapp\$n", "`n;(globalThis.__release ||= {})[`"$n`"] = `"$rel`";`n", $utf8) }
+    foreach ($n in 'game.js', 'core.js', 'data.js', 'ruck.js') { [IO.File]::AppendAllText("$root\swapp\$n", "`n;(globalThis.__release ||= {})[`"$n`"] = `"$rel`";`n", $utf8) }
     [IO.File]::AppendAllText("$root\swapp\style.css", "`n:root { --release: `"$rel`"; }`n", $utf8)
     if ($extra) {
         [IO.File]::WriteAllText("$root\swapp\extra.js", ";(globalThis.__release ||= {})[`"extra.js`"] = `"$rel`";`n", $utf8)
@@ -57,7 +58,12 @@ $edge = $null
 try {
     for ($i = 0; $i -lt 40; $i++) { try { Invoke-WebRequest "http://127.0.0.1:$Port/_tests/" -UseBasicParsing -TimeoutSec 2 | Out-Null; break } catch { Start-Sleep -Milliseconds 250 } }
     $block = "MAP cdn.jsdelivr.net 127.0.0.1, MAP storage.googleapis.com 127.0.0.1, MAP fonts.googleapis.com 127.0.0.1, MAP fonts.gstatic.com 127.0.0.1"
-    $edge = Start-Process "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" -PassThru -ArgumentList `
+    # Microsoft Edge, or Google Chrome when this PC has no Edge (both take the same options)
+    $browser = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $browser) { throw "no Microsoft Edge or Google Chrome found to run the tests in" }
+    $edge = Start-Process $browser -PassThru -ArgumentList `
         "--headless=new", "--remote-debugging-port=$DevPort", "--user-data-dir=`"$root\edge`"", "--no-first-run", `
         "--deny-permission-prompts", "--autoplay-policy=no-user-gesture-required", `
         "--host-resolver-rules=`"$block`"", "http://localhost:$Port/_tests/$(if ($Only) { '?only=' + [Uri]::EscapeDataString($Only) })"
@@ -262,7 +268,11 @@ try {
     Write-Output ("{0} passed, {1} failed" -f ($results.Count - $failed), $failed)
     exit $failed
 } finally {
-    Get-CimInstance Win32_Process -Filter "name='msedge.exe'" | Where-Object { $_.CommandLine -like "*$root*" } |
+    Get-CimInstance Win32_Process -Filter "name='msedge.exe' or name='chrome.exe'" | Where-Object { $_.CommandLine -like "*$root*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Stop-Job $server -ErrorAction SilentlyContinue; Remove-Job $server -Force -ErrorAction SilentlyContinue
+    # the temporary copy (and its browser profile) goes too; the browser may take a moment to let go of its files
+    for ($i = 0; $i -lt 10 -and (Test-Path -LiteralPath $root); $i++) {
+        try { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop } catch { Start-Sleep -Milliseconds 500 }
+    }
 }

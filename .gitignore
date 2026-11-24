@@ -1,6 +1,9 @@
 # your game save from the PC server stays private
 save/
 
+# real GPX files of your rucks: they show where you walk, often starting at home
+_tests/private/
+
 # PC-only tools: they stay on the PC but are not published on the website
 counter-test/
 serve.ps1

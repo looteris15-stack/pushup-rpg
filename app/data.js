@@ -22,7 +22,87 @@ export const RULES = {
   wandererXpMult: 2,
   championXpPerRep: 2,
   floorBonusXp: 10,         // times the floor number, for reaching the safe room
+
+  // Rucking (ruck.js): walking with a heavy pack. Effort = pack kg × km ("kg·km"). Rucks give XP for your
+  // level, but never hit monsters or open areas: HP stays real pushups, checked by the camera.
+  ruckXpPerKgKm: 0.5,       // 15 kg × 6 km = 90 kg·km = 45 XP, about a normal day of pushups. Only ever raise it:
+                            // backups are checked with this rate, so a lower one would refuse older backups
+  ruckKg: [1, 60],          // pack weight allowed
+  ruckKm: [0.5, 80],        // one ruck's distance allowed
+  ruckMaxHours: 24,         // one ruck's time allowed
+  ruckMaxKmh: 12,           // faster is a car or a GPS jump: not counted
+  ruckMinKmh: 1,            // slower is a break: no km, no time
+  ruckFastShare: 0.25,      // more than this share of a file too fast = a car ride, refused
+  ruckWindowSec: 20,        // speed is judged over this long, not point to point (GPS points wobble)
+  ruckStepM: 5,             // a GPS point counts once it is this far from the last one that counted (wobble)
+  ruckClimbStepM: 3,        // up-downs smaller than this don't count as climb (GPS height is noisy)
+  ruckClimbSmoothSec: 60,   // the height is averaged over this long (half before, half after) before the climb is counted (noise)
+  ruckHoleSec: 120,         // longer than this with nothing recorded while you moved = a hole (GPS lost)
+  ruckSensorShare: 0.5,     // heart rate and steps count only when recorded for at least this share of the moving time
+  ruckLogMax: 40,           // rucks kept in the log (the totals keep counting all of them)
+  ruckFileMaxMB: 10,        // the biggest GPX file read (a 1-second track of 10 hours is about 6 MB)
+  // the ruck report (heart rate, steps, km splits, lines): shown only, never XP
+  ruckGapSec: 30,           // a gap in the recording longer than this doesn't count for heart rate or steps
+  ruckChartPoints: 32,      // points in the report's heart rate and height lines
+  ruckSplitsMax: 50,        // km splits kept (one per km)
+  ruckChartsKept: 3,        // the newest rucks keep their lines and splits; older ones keep only their numbers
+                            // (so the biggest backup stays under its size limit, test Item 1c)
 };
+
+// A ruck's rank: the hardest test it passes, like a soldier's march test. Each test needs a distance, a pack
+// (as a share of your body weight) and a pace. XP stays pack kg × km; the rank says how hard the ruck was.
+// - Pace = time from start to end, breaks included (like a real test), over the km plus 1 km for every
+//   `climbM` metres up (so a mountain ruck isn't "slow"). Moving time isn't used.
+// - The pack's share: the body weight saved with the ruck (bw), else the one in settings, else `refKg`.
+//   The tests in kg were made for a soldier of about 80 kg: S 20 kg, A 16 kg, B 15 kg, C 10 kg, D 5 kg
+//   (B is 18%, a little under 15 kg, so a 15 kg pack passes it at 80 kg).
+// - Roughly: A = the US Expert Infantry Badge march (19.3 km in 3 h with about 16 kg); S is harder but still
+//   easier than special forces selection. Worked out when shown, so the tests can change any time.
+// The System's CARRY stat is your best ruck rank ever (ruck.best.rank, and the rucks still in the log).
+export const RUCK_TEST = { climbM: 100, refKg: 80, bodyKg: [30, 250] };
+export const RUCK_TESTS = [ // hardest first; pace in seconds a km
+  { rank: "S", km: 20, pct: 25, pace: 540, like: "just below special forces" },
+  { rank: "A", km: 19, pct: 20, pace: 560, like: "above army standard" },
+  { rank: "B", km: 12, pct: 18, pace: 600, like: "army standard" },
+  { rank: "C", km: 8, pct: 12, pace: 660, like: "a fit, trained civilian" },
+  { rank: "D", km: 5, pct: 6, pace: 750, like: "a regular rucker" },
+  { rank: "E", km: 3, pct: 0, pace: 900, like: "you started" },
+];
+const okBody = v => Number.isFinite(v) && v >= RUCK_TEST.bodyKg[0] && v <= RUCK_TEST.bodyKg[1];
+// e: a log entry; bodyKg: the body weight in settings (or null)
+export function ruckGrade(e, bodyKg = null) {
+  const bw = okBody(e.bw) ? e.bw : okBody(bodyKg) ? bodyKg : RUCK_TEST.refKg;
+  const mins = Math.max(e.mins || 0, ((e.end || 0) - (e.t || 0)) / 60000); // start to end, breaks included
+  const flatKm = (e.km || 0) + (e.climb || 0) / RUCK_TEST.climbM;
+  const pct = Math.round(((e.kg || 0) / bw) * 1000) / 10, pace = flatKm > 0 ? Math.round((mins * 60) / flatKm) : Infinity;
+  const passes = t => (e.km || 0) >= t.km && pct >= t.pct && pace <= t.pace;
+  const i = RUCK_TESTS.findIndex(passes);
+  const idx = i < 0 ? 0 : RUCK_TESTS.length - i; // 0 = F ... 6 = S (an index into RANKS)
+  return { rank: i < 0 ? "F" : RUCK_TESTS[i].rank, idx, bw, guessed: !okBody(e.bw) && !okBody(bodyKg), pct, pace, mins: Math.round(mins), flatKm: Math.round(flatKm * 10) / 10,
+    next: idx < RUCK_TESTS.length ? RUCK_TESTS[RUCK_TESTS.length - 1 - idx] : null };
+}
+// a test in words: "20 km+, pack 25% of your body weight (20 kg), 9:00 min/km or faster"
+const paceText = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+export function ruckTestText(t, bodyKg = null) {
+  const bw = okBody(bodyKg) ? bodyKg : RUCK_TEST.refKg;
+  const pack = t.pct ? `pack ${t.pct}% of your body weight (${Math.round((bw * t.pct) / 10) / 10} kg)` : "any pack";
+  return `${t.km} km+, ${pack}, ${paceText(t.pace)} min/km or faster`;
+}
+// the best rank of the rucks in the log (old rucks fall out of it, so ruck.best.rank keeps the best ever)
+export const bestRuckRank = (log, bodyKg = null) => Math.max(0, ...(log || []).map(e => ruckGrade(e, bodyKg).idx));
+
+// Feats a ruck can show in its report (worked out when shown, never saved): name, what it takes, test.
+export const RUCK_FEATS = [
+  ["Long haul", "10 km or more", e => e.km >= 10],
+  ["Marathon mule", "a marathon, 42.2 km or more", e => e.km >= 42.2],
+  ["Heavy hauler", "a pack of 20 kg or more", e => e.kg >= 20],
+  ["Iron back", "300 kg·km or more", e => e.kgkm >= 300],
+  ["Mountain goat", "300 m up or more", e => e.climb >= 300],
+  ["Steady engine", "3 hours or more moving", e => e.mins >= 180],
+  ["Expedition", "6 hours or more from start to end", e => e.end - e.t >= 6 * 3600e3],
+  ["Early boots", "started before 7:00", e => new Date(e.t).getHours() < 7],
+  ["Night march", "still going after 21:00", e => new Date(e.end).getHours() >= 21 || new Date(e.end).getDate() !== new Date(e.t).getDate()],
+];
 
 // slow: seconds each rep must take going down. rounds: several sets with a break between (hp = all rounds together).
 // A new rule shows up on a normal monster first (practice), and only later on a boss (the test).
@@ -261,4 +341,104 @@ export function findMonster(id) {
     if (m) return { m, floor: fi + 1 };
   }
   return null;
+}
+
+// ---------- the System: stats and ranks (SYSTEM_PLAN.md, idea 1) ----------
+// A status window that measures you. Every stat is a real number from your training ("STR 42" = your best set
+// is 42). It is only shown: like levels, it never changes a fight, and there are no points to hand out.
+// Nothing here is saved: it is all worked out from the save when shown, so the ladders can change any time.
+// The stats come from bests and totals that only go up, so ranks never drop. HEART compares heart rates,
+// can go down, and has no rank.
+export const RANKS = ["F", "E", "D", "C", "B", "A", "S"];
+
+// A stat's steps: the least for rank E, D, C, B, A, S (below the first is F). what: shown in the "next rank"
+// hint. STR's steps are boss HP, so they follow the map if HP changes. goal / togo: the hint's words.
+const STR_BOSSES = ["old-badger", "goblin-chief", "bog-troll", "elder-bear", "burnt-king", "elder-dragon"];
+const round1 = v => Math.round(v * 10) / 10;
+const en = n => n.toLocaleString("en-US");
+export const SYSTEM = [
+  { id: "pushups", name: "Pushups", stats: [
+    { id: "str", name: "STR", long: "Strength", what: "best set",
+      value: s => s.stats.bestSet || 0,
+      steps: () => STR_BOSSES.map(id => { const { m } = findMonster(id); return { at: m.hp, what: m.name }; }),
+      goal: (n, what) => `${n} in one set (${what})`, togo: n => `${n} more` },
+    { id: "end", name: "END", long: "Endurance", what: `mine floors cleared, of ${DUNGEON.floors.length}`,
+      value: s => s.stats.deepestFloor || 0,
+      steps: () => [1, 3, 5, 7, 9, DUNGEON.floors.length].map(at => ({ at })),
+      goal: n => `clear floor ${n}`, togo: n => `${n} more floor${n === 1 ? "" : "s"}` },
+  ] },
+  { id: "rucking", name: "Rucking", stats: [
+    // value: a rank (0 = F ... 6 = S), so its steps are 1 to 6; a step's `what` is its test
+    { id: "carry", name: "CARRY", long: "Carry", what: "your best ruck's rank",
+      value: s => { const r = s.ruck || {}, bodyKg = (s.settings || {}).bodyKg; return Math.max((r.best && r.best.rank) || 0, bestRuckRank(r.log, bodyKg)); },
+      steps: s => [...RUCK_TESTS].reverse().map((t, i) => ({ at: i + 1, what: ruckTestText(t, ((s && s.settings) || {}).bodyKg) })),
+      goal: (n, what) => `one ruck of ${what}`, togo: () => "pass it once" },
+    { id: "road", name: "ROAD", long: "Road", what: "km rucked in all",
+      value: s => round1((s.ruck && s.ruck.km) || 0),
+      steps: () => [10, 50, 150, 300, 600, 1000].map(at => ({ at })),
+      goal: n => `${en(n)} km in all`, togo: n => `${en(n)} km more` },
+  ] },
+];
+// workouts the System will measure once the game has them; they don't count in the overall rank before that
+export const SYSTEM_LATER = ["Running", "Pullups"];
+
+// how many steps of a ladder a value has reached: 0 = F ... 6 = S (an index into RANKS)
+export const rankOf = (value, steps) => steps.filter(st => value >= st.at).length;
+const meanDown = rs => Math.floor(rs.reduce((a, b) => a + b, 0) / rs.length + 1e-9);
+
+// Everything the status window shows, from a save. A category's rank is its stats' ranks averaged and rounded
+// down; the overall rank is the categories' ranks averaged and rounded down. A category never done counts as
+// F, so a weak one pulls the overall rank down: S pushups and F rucking = C overall.
+export function systemStatus(s) {
+  const cats = SYSTEM.map(c => {
+    const stats = c.stats.map(st => {
+      const steps = st.steps(s), value = st.value(s), rank = rankOf(value, steps);
+      const from = rank ? steps[rank - 1].at : 0, next = steps[rank] || null;
+      return {
+        id: st.id, name: st.name, long: st.long, what: st.what, value, rank,
+        next: next && { rank: rank + 1, at: next.at, text: st.goal(next.at, next.what), togo: st.togo(round1(next.at - value)) },
+        share: next ? Math.max(0, Math.min(1, (value - from) / (next.at - from))) : 1,
+      };
+    });
+    return { id: c.id, name: c.name, rank: meanDown(stats.map(x => x.rank)), stats };
+  });
+  return { cats, overall: meanDown(cats.map(c => c.rank)), heart: heartOf((s.ruck && s.ruck.log) || []) };
+}
+
+// HEART: does the same work cost your heart less than before? A heart rate alone means little (a heavier
+// pack, hills or a faster pace all raise it), so each ruck with heart rate is only compared with OLDER rucks
+// like it: a pack within `kg`, a pace within `paceSec` a km, hills within `climbPerKm`, and at most `kmTimes`
+// as long or short. HEART = how many beats a minute lower the newest `recent` such rucks were than the older
+// ones like them (+6 = 6 beats less now). Locked until `need` rucks have heart rate (only rucks from a watch's
+// GPX file have it). Every ruck in the log keeps its average heart rate, so nothing new is saved for this.
+export const HEART = { need: 5, kg: 3, paceSec: 60, climbPerKm: 15, kmTimes: 2, recent: 5 };
+export function heartOf(log) {
+  const rucks = log.filter(x => x && x.hrAvg > 0 && x.km > 0 && x.mins > 0).sort((a, b) => a.t - b.t);
+  if (rucks.length < HEART.need) return { locked: true, have: rucks.length, value: null };
+  const pace = x => (x.mins * 60) / x.km, hills = x => (x.climb || 0) / x.km;
+  const alike = (a, b) => Math.abs(a.kg - b.kg) <= HEART.kg && Math.abs(pace(a) - pace(b)) <= HEART.paceSec
+    && Math.abs(hills(a) - hills(b)) <= HEART.climbPerKm && Math.max(a.km, b.km) <= HEART.kmTimes * Math.min(a.km, b.km);
+  const better = [];
+  rucks.forEach((e, i) => {
+    const older = rucks.slice(0, i).filter(o => alike(o, e));
+    if (older.length) better.push(older.reduce((a, o) => a + o.hrAvg, 0) / older.length - e.hrAvg);
+  });
+  const recent = better.slice(-HEART.recent);
+  return { locked: false, have: rucks.length, value: recent.length ? Math.round(recent.reduce((a, b) => a + b, 0) / recent.length) : null };
+}
+
+// what changed between two systemStatus() results (before and after a fight or a ruck), for the System's messages
+export function systemChanges(a, b) {
+  const out = { stats: [], cats: [], overall: null, heart: null };
+  b.cats.forEach((c, ci) => {
+    c.stats.forEach((st, si) => {
+      const was = a.cats[ci].stats[si];
+      if (st.value !== was.value) out.stats.push({ ...st, was: was.value, wasRank: was.rank });
+    });
+    if (c.rank !== a.cats[ci].rank) out.cats.push({ name: c.name, was: a.cats[ci].rank, rank: c.rank });
+  });
+  if (b.overall !== a.overall) out.overall = { was: a.overall, rank: b.overall };
+  const h0 = a.heart, h1 = b.heart;
+  if (h1.have !== h0.have || h1.value !== h0.value || h1.locked !== h0.locked) out.heart = { was: h0, now: h1 };
+  return out;
 }

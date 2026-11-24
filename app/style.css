@@ -13,6 +13,7 @@
   --bad: #ff6a57;
   --warn: #f5c451;
   --hp: #d9443a;
+  --sys: #8fd3ff; /* the System's voice: status stats and its messages */
   --display: "Oxanium", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
   --body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
@@ -50,6 +51,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .primary { background: var(--torch); color: var(--torch-ink); border-color: transparent; }
 .primary:hover { border-color: transparent; filter: brightness(1.08); }
 .danger-btn { color: var(--bad); }
+.primary.danger { background: var(--bad); color: #1a0f0d; }
 /* a file picker that looks like the other buttons */
 .file-btn { position: relative; cursor: pointer; }
 .file-btn input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
@@ -221,6 +223,14 @@ textarea {
   word-break: break-all;
 }
 input[type="range"] { width: 100%; accent-color: var(--torch); }
+/* number, date and time boxes (Rucking) look like the dropdowns */
+input[type="number"], input[type="date"], input[type="time"] {
+  font: 15px var(--body); color: var(--fg); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; width: 100%; min-width: 0; min-height: 42px;
+}
+.field > input[type="number"] { max-width: 220px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.ruck-form { display: flex; flex-direction: column; gap: 12px; padding: 12px; border-radius: 10px; background: var(--tint); }
 output { color: var(--torch); font-family: var(--display); font-weight: 700; font-variant-numeric: tabular-nums; }
 .check { display: flex; gap: 10px; align-items: center; font-weight: 600; }
 .check input { width: 20px; height: 20px; accent-color: var(--torch); }
@@ -258,6 +268,85 @@ output { color: var(--torch); font-family: var(--display); font-weight: 700; fon
 .result.won .eyebrow { color: var(--good); }
 .result.lost .eyebrow { color: var(--bad); }
 .levelup { color: var(--torch); font-weight: 700; }
+
+/* ---------- ruck report: a game-style status window ---------- */
+.hud { display: flex; flex-direction: column; gap: 12px; }
+.hud.won .eyebrow { color: var(--good); }
+.hud-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.hud-title { min-width: 0; }
+.hud-rank {
+  flex: none; width: 64px; height: 64px; border-radius: 12px; border: 2px solid currentColor;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
+}
+.hud-rank span { font: 600 10px/1 var(--display); letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.85; }
+.hud-rank b { font: 800 34px/1 var(--display); }
+.rank-s { color: #ffd76a; box-shadow: 0 0 18px rgba(255, 215, 106, 0.35); }
+.rank-a { color: var(--torch); }
+.rank-b { color: var(--good); }
+.rank-c { color: #a9c4ff; }
+.rank-d { color: var(--muted); }
+.rank-e { color: #7f8d83; }
+.rank-f { color: #66716a; }
+.hud-main { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.hud-main > div { background: var(--tint); border: 1px solid var(--line); border-radius: 10px; padding: 10px; min-width: 0; }
+.hud-main b { display: block; margin-top: 4px; font: 800 clamp(19px, 5.4vw, 26px)/1.05 var(--display); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.hud-main small { color: var(--muted); font-size: 12px; }
+.hud-xp {
+  font: 800 28px/1 var(--display); color: var(--torch); text-align: center; padding: 10px;
+  border-radius: 10px; background: rgba(240, 168, 60, 0.1); border: 1px solid rgba(240, 168, 60, 0.35);
+}
+.hud-rows { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.hud-rows > div { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 8px 10px; border-radius: 8px; background: var(--tint); }
+.hud-rows dt { font: 600 11px/1.2 var(--display); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.hud-rows dd { margin: 0; }
+.hud-rows b { font-family: var(--display); font-variant-numeric: tabular-nums; }
+.hud-rows small { color: var(--muted); }
+.hud-chart, .hud-splits { margin: 0; padding: 10px; border-radius: 10px; background: var(--tint); }
+.hud-chart svg { display: block; width: 100%; height: 96px; }
+.hud-splits svg { display: block; width: 100%; height: 48px; }
+.hud-area { fill: rgba(163, 178, 167, 0.2); stroke: rgba(163, 178, 167, 0.55); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.hud-line { fill: none; stroke: var(--hp); stroke-width: 2; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.hud-splits rect { fill: rgba(111, 224, 138, 0.4); }
+.hud-splits rect.best { fill: var(--good); }
+.hud-splits rect.none { fill: rgba(163, 178, 167, 0.3); }
+.hud .warn { color: var(--warn); margin: 0; }
+.ruck-fix { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.ruck-fix input { width: 7em; }
+.hud figcaption { display: flex; justify-content: space-between; gap: 6px 12px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.k-hr::before, .k-ele::before { content: ""; display: inline-block; width: 12px; vertical-align: middle; margin-right: 5px; }
+.k-hr::before { height: 2px; background: var(--hp); }
+.k-ele::before { height: 8px; background: rgba(163, 178, 167, 0.45); }
+.hud-feats { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.hud-feats .label { width: 100%; }
+.chip.feat { background: rgba(240, 168, 60, 0.16); color: var(--torch); }
+/* a ruck in the log is a button that opens its report */
+.ruck-row {
+  width: 100%; min-height: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left;
+  display: flex; justify-content: space-between; align-items: baseline; gap: 4px 12px; flex-wrap: wrap;
+}
+.ruck-row:hover { border: 0; }
+.rank-mini { display: inline-block; min-width: 20px; text-align: center; font: 800 12px/18px var(--display); border: 1px solid currentColor; border-radius: 5px; }
+
+/* ---------- status: the System's window ---------- */
+/* Camp's overall rank: a button to the status window, sized so it never changes the hero's height (86 px) */
+.camp-rank { padding: 0; min-height: 0; background: rgba(238, 243, 236, 0.04); border-color: currentColor; }
+.camp-rank:hover { border-color: currentColor; filter: brightness(1.15); }
+.hud-rank.small { width: 48px; height: 48px; border-radius: 10px; }
+.hud-rank.small b { font-size: 24px; }
+.sys-cats { display: flex; flex-direction: column; gap: 18px; }
+.sys-head .hud-head { align-items: center; }
+.sys-cat .hud-head { align-items: center; }
+.sys-stat { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: 10px; background: var(--tint); }
+.sys-top { display: flex; align-items: baseline; gap: 6px 10px; flex-wrap: wrap; }
+.sys-top .rank-mini { margin-left: auto; }
+.sys-name { font: 700 12px/1 var(--display); letter-spacing: 0.14em; color: var(--sys); min-width: 52px; }
+.sys-val { font: 800 26px/1 var(--display); font-variant-numeric: tabular-nums; }
+.sys-bar { height: 6px; border-radius: 3px; background: rgba(238, 243, 236, 0.1); overflow: hidden; }
+.sys-bar > div { height: 100%; background: var(--sys); }
+.sys-later .sys-val { color: var(--muted); margin-right: 14px; }
+/* the System's messages in a result: [STR 41 → 42] */
+.sys { font: 600 14px/1.35 var(--display); letter-spacing: 0.03em; color: var(--sys); }
+.sys.up { color: var(--torch); font-weight: 800; }
 
 /* ---------- fight ---------- */
 #fight { position: fixed; inset: 0; background: #000; overflow: hidden; }
@@ -383,3 +472,7 @@ output { color: var(--torch); font-family: var(--display); font-weight: 700; fon
   #fHits.bump, .monster.hit { animation: none; }
   #fHpFill, .xpbar > div { transition: none; }
 }
+
+/* the ruck rank tests (Rucking screen) */
+.ruck-tests { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 8px; }
+.ruck-tests li { line-height: 1.4; }
